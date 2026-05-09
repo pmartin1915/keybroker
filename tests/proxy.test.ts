@@ -1,0 +1,347 @@
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { createServer, type Server } from "node:http";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AddressInfo } from "node:net";
+import type { FastifyInstance } from "fastify";
+import type { BrokerConfig } from "../src/config.js";
+import type { TokenRecord } from "../src/store.js";
+
+// These must be loaded *after* KEYBROKER_ECHO_BASE_URL is set, because
+// providers/index.ts captures the echo baseUrl at module load time.
+let buildServer: typeof import("../src/server.js").buildServer;
+let Store: typeof import("../src/store.js").Store;
+let newTokenId: typeof import("../src/store.js").newTokenId;
+let issueToken: typeof import("../src/tokens.js").issueToken;
+let encrypt: typeof import("../src/crypto.js").encrypt;
+let generateMasterKeyHex: typeof import("../src/crypto.js").generateMasterKeyHex;
+let generateJwtSecret: typeof import("../src/crypto.js").generateJwtSecret;
+
+let upstream: Server;
+let upstreamPort: number;
+let app: FastifyInstance;
+let brokerOrigin: string;
+let config: BrokerConfig;
+let store: InstanceType<typeof Store>;
+let dataDir: string;
+
+function makeUpstream(): Promise<{ server: Server; port: number }> {
+  return new Promise((resolve) => {
+    const s = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        res.setHeader("content-type", "application/json");
+        res.end(
+          JSON.stringify({
+            method: req.method,
+            url: req.url,
+            authorization: req.headers["authorization"] ?? null,
+            body: body || null,
+          }),
+        );
+      });
+    });
+    s.listen(0, "127.0.0.1", () => {
+      const addr = s.address() as AddressInfo;
+      resolve({ server: s, port: addr.port });
+    });
+  });
+}
+
+async function jsonError(res: Response): Promise<string> {
+  const j = (await res.json()) as { error?: unknown };
+  return String(j.error);
+}
+
+async function mintToken(opts: {
+  scopes?: string[];
+  maxCalls?: number;
+  ttlSeconds?: number;
+  provider?: string;
+  revoked?: boolean;
+}): Promise<{ id: string; jwt: string }> {
+  const id = newTokenId();
+  const provider = opts.provider ?? "echo";
+  const scopes = opts.scopes ?? ["*"];
+  const ttl = opts.ttlSeconds ?? 600;
+  const max = opts.maxCalls ?? -1;
+  const rec: TokenRecord = {
+    id,
+    provider,
+    scopes,
+    remaining: max,
+    used: 0,
+    expiresAt: ttl > 0 ? Math.floor(Date.now() / 1000) + ttl : 0,
+    createdAt: new Date().toISOString(),
+    label: "test",
+    revoked: opts.revoked ?? false,
+  };
+  store.putToken(rec);
+  const jwt = await issueToken(config.jwtSecret, {
+    tokenId: id,
+    provider,
+    scopes,
+    label: "test",
+    ttlSeconds: ttl,
+  });
+  return { id, jwt };
+}
+
+beforeAll(async () => {
+  // 1. Boot upstream and pin its URL into KEYBROKER_ECHO_BASE_URL.
+  const u = await makeUpstream();
+  upstream = u.server;
+  upstreamPort = u.port;
+  process.env.KEYBROKER_ECHO_BASE_URL = `http://127.0.0.1:${upstreamPort}`;
+
+  // 2. Now load the broker modules (echo provider's baseUrl freezes on first import).
+  ({ buildServer } = await import("../src/server.js"));
+  ({ Store, newTokenId } = await import("../src/store.js"));
+  ({ issueToken } = await import("../src/tokens.js"));
+  ({ encrypt, generateMasterKeyHex, generateJwtSecret } = await import(
+    "../src/crypto.js"
+  ));
+
+  // 3. Sanity: confirm the override was honored. If the user already had
+  // a process holding the default echo port, we would silently fall back.
+  const providers = await import("../src/providers/index.js");
+  expect(providers.PROVIDERS["echo"]?.baseUrl).toBe(
+    `http://127.0.0.1:${upstreamPort}`,
+  );
+
+  // 4. Build a per-test config in a fresh tmp dir.
+  dataDir = mkdtempSync(join(tmpdir(), "keybroker-test-"));
+  const masterKeyHex = generateMasterKeyHex();
+  const jwtSecret = generateJwtSecret();
+  config = {
+    dataDir,
+    storePath: join(dataDir, "store.json"),
+    logsPath: join(dataDir, "calls.log.jsonl"),
+    configPath: join(dataDir, "config.json"),
+    port: 0,
+    host: "127.0.0.1",
+    masterKeyHex,
+    jwtSecret,
+  };
+  // Touch a config file so anything that re-loads finds it.
+  writeFileSync(
+    config.configPath,
+    JSON.stringify({ masterKeyHex, jwtSecret, port: 0, host: "127.0.0.1" }),
+  );
+
+  // 5. Seed the store with an encrypted echo upstream secret.
+  store = new Store(config.storePath);
+  store.putSecret("echo", {
+    provider: "echo",
+    ciphertext: encrypt("sk-fake-upstream", masterKeyHex),
+    createdAt: new Date().toISOString(),
+  });
+
+  // 6. Start the broker on an ephemeral port.
+  app = await buildServer(config, { logger: false });
+  await app.listen({ port: 0, host: "127.0.0.1" });
+  const addr = app.server.address() as AddressInfo;
+  brokerOrigin = `http://127.0.0.1:${addr.port}`;
+});
+
+afterAll(async () => {
+  await app?.close();
+  await new Promise<void>((r) => upstream?.close(() => r()));
+  if (dataDir) rmSync(dataDir, { recursive: true, force: true });
+});
+
+describe("proxy: happy path", () => {
+  it("forwards a POST and swaps the bearer token", async () => {
+    const { jwt } = await mintToken({
+      scopes: ["POST:/v1/"],
+      maxCalls: 5,
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/hello`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ hi: "there" }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      method: string;
+      url: string;
+      authorization: string | null;
+      body: string | null;
+    };
+    expect(body.method).toBe("POST");
+    expect(body.url).toBe("/v1/hello");
+    expect(body.authorization).toBe("Bearer sk-fake-upstream");
+    expect(body.body).toBe('{"hi":"there"}');
+  });
+});
+
+describe("proxy: token enforcement", () => {
+  it("returns 401 when no token is presented", async () => {
+    const res = await fetch(`${brokerOrigin}/echo/v1/hello`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    expect(res.status).toBe(401);
+    expect(await jsonError(res)).toBe("no_token");
+  });
+
+  it("returns 401 for a revoked token", async () => {
+    const { jwt } = await mintToken({
+      scopes: ["*"],
+      maxCalls: 5,
+      revoked: true,
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/anything`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(res.status).toBe(401);
+    expect(await jsonError(res)).toBe("revoked");
+  });
+
+  it("returns 401 for a tampered token signature", async () => {
+    const { jwt } = await mintToken({ scopes: ["*"] });
+    // Flip one char near the end (signature) to break verification.
+    const idx = jwt.length - 5;
+    const ch = jwt.charAt(idx);
+    const swap = ch === "A" ? "B" : "A";
+    const bad = jwt.slice(0, idx) + swap + jwt.slice(idx + 1);
+    const res = await fetch(`${brokerOrigin}/echo/v1/x`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${bad}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(res.status).toBe(401);
+    expect(await jsonError(res)).toMatch(/^invalid_token:/);
+  });
+
+  it("returns 403 on provider mismatch", async () => {
+    const { jwt } = await mintToken({
+      provider: "openai",
+      scopes: ["*"],
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/hello`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(res.status).toBe(403);
+    expect(await jsonError(res)).toBe("provider_mismatch");
+  });
+
+  it("returns 403 on scope deny", async () => {
+    const { jwt } = await mintToken({
+      scopes: ["GET:/v1/onlyget"],
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/something/else`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(res.status).toBe(403);
+    expect(await jsonError(res)).toBe("scope_denied");
+  });
+
+  it("regression — denies the boundary attack at the proxy layer", async () => {
+    // Pinned: scope `POST:/v1/foo` MUST NOT match `/v1/foobar`.
+    const { jwt } = await mintToken({
+      scopes: ["POST:/v1/foo"],
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/foobar`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(res.status).toBe(403);
+    expect(await jsonError(res)).toBe("scope_denied");
+  });
+
+  it("returns 404 for an unknown provider", async () => {
+    const { jwt } = await mintToken({ scopes: ["*"] });
+    const res = await fetch(`${brokerOrigin}/notreal/v1/anything`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(res.status).toBe(404);
+    expect(await jsonError(res)).toBe("unknown_provider");
+  });
+});
+
+describe("proxy: quota enforcement", () => {
+  it("third call returns 429 after a 2-call budget", async () => {
+    const { jwt } = await mintToken({
+      scopes: ["*"],
+      maxCalls: 2,
+    });
+    const call = () =>
+      fetch(`${brokerOrigin}/echo/v1/q`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+      });
+    const r1 = await call();
+    const r2 = await call();
+    const r3 = await call();
+    expect(r1.status).toBe(200);
+    expect(r2.status).toBe(200);
+    expect(r3.status).toBe(429);
+    expect(await jsonError(r3)).toBe("exhausted");
+  });
+});
+
+describe("proxy: token presentation styles", () => {
+  it("accepts the raw brk_ token in Authorization (no Bearer prefix)", async () => {
+    const { jwt } = await mintToken({ scopes: ["*"] });
+    const res = await fetch(`${brokerOrigin}/echo/v1/x`, {
+      method: "POST",
+      headers: {
+        Authorization: jwt,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts brk_ token in x-api-key header", async () => {
+    const { jwt } = await mintToken({ scopes: ["*"] });
+    const res = await fetch(`${brokerOrigin}/echo/v1/x`, {
+      method: "POST",
+      headers: {
+        "x-api-key": jwt,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(res.status).toBe(200);
+  });
+});

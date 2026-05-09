@@ -7,8 +7,16 @@ import { decrypt } from "./crypto.js";
 import { getProvider } from "./providers/index.js";
 import { appendCall, type CallLogEntry } from "./logging.js";
 
-export async function buildServer(config: BrokerConfig) {
-  const app = Fastify({ logger: { level: "info" } });
+export interface BuildServerOptions {
+  /** Pass `false` to silence fastify's logger (used in tests). */
+  logger?: boolean | { level?: string };
+}
+
+export async function buildServer(
+  config: BrokerConfig,
+  opts: BuildServerOptions = {},
+) {
+  const app = Fastify({ logger: opts.logger ?? { level: "info" } });
   const store = new Store(config.storePath);
 
   app.get("/health", async () => ({ ok: true }));
