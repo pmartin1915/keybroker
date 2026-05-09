@@ -1,15 +1,18 @@
 import Fastify, { type FastifyRequest, type FastifyReply } from "fastify";
 import { request as undiciRequest } from "undici";
 import type { BrokerConfig } from "./config.js";
-import { Store } from "./store.js";
+import { openStore } from "./store.js";
+import type { StoreLike } from "./store-types.js";
 import { scopeAllows, verifyToken } from "./tokens.js";
 import { decrypt } from "./crypto.js";
 import { getProvider } from "./providers/index.js";
-import { appendCall, type CallLogEntry } from "./logging.js";
+import type { CallLogEntry } from "./logging.js";
 
 export interface BuildServerOptions {
   /** Pass `false` to silence fastify's logger (used in tests). */
   logger?: boolean | { level?: string };
+  /** Inject a store. Defaults to `openStore(config)`. */
+  store?: StoreLike;
 }
 
 export async function buildServer(
@@ -17,7 +20,7 @@ export async function buildServer(
   opts: BuildServerOptions = {},
 ) {
   const app = Fastify({ logger: opts.logger ?? { level: "info" } });
-  const store = new Store(config.storePath);
+  const store: StoreLike = opts.store ?? openStore(config);
 
   app.get("/health", async () => ({ ok: true }));
 
@@ -38,7 +41,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
-        }, config.logsPath);
+        }, store);
       }
 
       const presented = extractPresentedToken(req);
@@ -51,7 +54,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
-        }, config.logsPath);
+        }, store);
       }
 
       const verified = await verifyToken(config.jwtSecret, presented);
@@ -64,7 +67,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
-        }, config.logsPath);
+        }, store);
       }
       const { tokenId, claims } = verified;
 
@@ -77,7 +80,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
-        }, config.logsPath);
+        }, store);
       }
 
       if (!scopeAllows(claims.scp, req.method, upstreamPath)) {
@@ -89,7 +92,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
-        }, config.logsPath);
+        }, store);
       }
 
       const consumed = store.consumeToken(tokenId);
@@ -104,7 +107,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
-        }, config.logsPath);
+        }, store);
       }
 
       const secret = store.getSecret(provider);
@@ -117,7 +120,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
-        }, config.logsPath);
+        }, store);
       }
 
       let upstreamKey: string;
@@ -133,7 +136,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
-        }, config.logsPath);
+        }, store);
       }
 
       const headers: Record<string, string> = {};
@@ -173,7 +176,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
-        }, config.logsPath);
+        }, store);
       }
 
       const body = req.method === "GET" || req.method === "HEAD"
@@ -213,7 +216,7 @@ export async function buildServer(
           respBytes: respBuf.byteLength,
           outcome: "ok",
         };
-        appendCall(config.logsPath, log);
+        store.appendCall(log);
         return reply.send(respBuf);
       } catch (e) {
         req.log.error({ err: e }, "upstream_error");
@@ -231,7 +234,7 @@ export async function buildServer(
           outcome: "error",
           reason: (e as Error).message,
         };
-        appendCall(config.logsPath, log);
+        store.appendCall(log);
         return reply.status(502).send({ error: "upstream_error" });
       }
     },
@@ -284,7 +287,7 @@ function denied(
     started: number;
     reqBytes: number;
   },
-  logsPath: string,
+  store: StoreLike,
 ) {
   const entry: CallLogEntry = {
     ts: new Date().toISOString(),
@@ -300,6 +303,6 @@ function denied(
     outcome: "denied",
     reason,
   };
-  appendCall(logsPath, entry);
+  store.appendCall(entry);
   return reply.status(status).send({ error: reason });
 }

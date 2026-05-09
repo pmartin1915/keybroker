@@ -1,13 +1,26 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { writeFileSync, existsSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { ensureDataDir, loadConfig } from "./config.js";
 import { generateJwtSecret, generateMasterKeyHex, encrypt } from "./crypto.js";
-import { Store, newTokenId, type TokenRecord } from "./store.js";
+import {
+  openStore,
+  newTokenId,
+  JsonStore,
+  SqliteStore,
+  type StoreMode,
+  type TokenRecord,
+} from "./store.js";
 import { issueToken } from "./tokens.js";
 import { PROVIDERS, getProvider } from "./providers/index.js";
 import { buildServer } from "./server.js";
+
+function parseStoreMode(s: string | undefined): StoreMode {
+  if (!s) return "auto";
+  if (s === "auto" || s === "sqlite" || s === "json") return s;
+  throw new Error(`invalid --store value: ${s} (expected: auto|sqlite|json)`);
+}
 
 const program = new Command();
 program
@@ -15,7 +28,16 @@ program
   .description(
     "Issue short-lived, scoped, attributable tokens that proxy to upstream API providers.",
   )
-  .version("0.1.0");
+  .version("0.1.0")
+  .option(
+    "--store <mode>",
+    "storage backend: auto (default) | sqlite | json",
+    "auto",
+  );
+
+function storeMode(): StoreMode {
+  return parseStoreMode(program.opts<{ store?: string }>().store);
+}
 
 program
   .command("init")
@@ -82,7 +104,7 @@ secret
       return;
     }
     const cfg = loadConfig();
-    const store = new Store(cfg.storePath);
+    const store = openStore(cfg, { mode: storeMode() });
     store.putSecret(provider, {
       provider,
       ciphertext: encrypt(value, cfg.masterKeyHex),
@@ -96,7 +118,7 @@ secret
   .description("List providers with stored secrets.")
   .action(() => {
     const cfg = loadConfig();
-    const store = new Store(cfg.storePath);
+    const store = openStore(cfg, { mode: storeMode() });
     const rows = store.listSecrets();
     if (rows.length === 0) {
       console.log("(no secrets stored)");
@@ -135,7 +157,7 @@ token
         return;
       }
       const cfg = loadConfig();
-      const store = new Store(cfg.storePath);
+      const store = openStore(cfg, { mode: storeMode() });
       const id = newTokenId();
       const ttl = Number(opts.ttl);
       const max = Number(opts.maxCalls);
@@ -170,7 +192,7 @@ token
   .description("List issued tokens.")
   .action(() => {
     const cfg = loadConfig();
-    const store = new Store(cfg.storePath);
+    const store = openStore(cfg, { mode: storeMode() });
     const rows = store.listTokens();
     if (rows.length === 0) {
       console.log("(no tokens)");
@@ -199,7 +221,7 @@ token
   .argument("<id>")
   .action((id: string) => {
     const cfg = loadConfig();
-    const store = new Store(cfg.storePath);
+    const store = openStore(cfg, { mode: storeMode() });
     if (store.revokeToken(id)) {
       console.log(`revoked ${id}`);
     } else {
@@ -215,26 +237,70 @@ program
   .option("--token <id>", "filter by token id")
   .action((opts: { num: string; token?: string }) => {
     const cfg = loadConfig();
-    if (!existsSync(cfg.logsPath)) {
+    const store = openStore(cfg, { mode: storeMode() });
+    const limit = Number(opts.num);
+    const entries = store.recentCalls(
+      opts.token ? { limit, tokenId: opts.token } : { limit },
+    );
+    if (entries.length === 0) {
       console.log("(no logs yet)");
       return;
     }
-    const lines = readFileSync(cfg.logsPath, "utf8").trim().split("\n").filter(Boolean);
-    const filtered = opts.token
-      ? lines.filter((l) => l.includes(`"tokenId":"${opts.token}"`))
-      : lines;
-    const tail = filtered.slice(-Number(opts.num));
-    for (const l of tail) {
-      try {
-        const e = JSON.parse(l);
-        const tag = e.outcome === "ok" ? "OK" : e.outcome.toUpperCase();
-        console.log(
-          `${e.ts}  ${tag.padEnd(7)}  ${String(e.status).padStart(3)}  ${e.method.padEnd(6)}  ${e.provider}${e.path}  ${e.durationMs}ms  token=${e.tokenId.slice(0, 8)}  ${e.reason ?? ""}`,
-        );
-      } catch {
-        console.log(l);
-      }
+    for (const e of entries) {
+      const tag = e.outcome === "ok" ? "OK" : e.outcome.toUpperCase();
+      console.log(
+        `${e.ts}  ${tag.padEnd(7)}  ${String(e.status).padStart(3)}  ${e.method.padEnd(6)}  ${e.provider}${e.path}  ${e.durationMs}ms  token=${e.tokenId.slice(0, 8)}  ${e.reason ?? ""}`,
+      );
     }
+  });
+
+program
+  .command("migrate")
+  .description(
+    "One-shot migration of the legacy JSON store to SQLite. After this runs the JSON file is renamed to store.json.migrated.",
+  )
+  .option("--dry-run", "show what would be migrated, don't write", false)
+  .action((opts: { dryRun?: boolean }) => {
+    const cfg = loadConfig();
+    if (existsSync(cfg.sqliteStorePath)) {
+      console.error(
+        `SQLite store already exists at ${cfg.sqliteStorePath}. ` +
+          `Refusing to overwrite — delete it first if you really want to redo the migration.`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    if (!existsSync(cfg.jsonStorePath)) {
+      console.error(`no JSON store at ${cfg.jsonStorePath} — nothing to migrate.`);
+      process.exitCode = 1;
+      return;
+    }
+    const json = new JsonStore(cfg.jsonStorePath, cfg.logsPath, true);
+    const secrets = json.listSecrets();
+    const tokens = json.listTokens();
+    const calls = json.recentCalls({ limit: Number.MAX_SAFE_INTEGER });
+    console.log(
+      `migrating: ${secrets.length} secrets, ${tokens.length} tokens, ${calls.length} call log entries`,
+    );
+    if (opts.dryRun) {
+      console.log("(dry-run — no changes written)");
+      return;
+    }
+    const sqlite = new SqliteStore(cfg.sqliteStorePath);
+    try {
+      for (const { provider } of secrets) {
+        const rec = json.getSecret(provider);
+        if (rec) sqlite.putSecret(provider, rec);
+      }
+      for (const t of tokens) sqlite.putToken(t);
+      for (const c of calls) sqlite.appendCall(c);
+    } finally {
+      sqlite.close?.();
+    }
+    const migratedMarker = `${cfg.jsonStorePath}.migrated`;
+    renameSync(cfg.jsonStorePath, migratedMarker);
+    console.log(`done. JSON store moved to ${migratedMarker}`);
+    console.log("future calls will use the SQLite store at " + cfg.sqliteStorePath);
   });
 
 program

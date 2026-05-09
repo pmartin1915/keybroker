@@ -6,12 +6,12 @@ import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import type { FastifyInstance } from "fastify";
 import type { BrokerConfig } from "../src/config.js";
-import type { TokenRecord } from "../src/store.js";
+import type { StoreLike, TokenRecord } from "../src/store.js";
 
 // These must be loaded *after* KEYBROKER_ECHO_BASE_URL is set, because
 // providers/index.ts captures the echo baseUrl at module load time.
 let buildServer: typeof import("../src/server.js").buildServer;
-let Store: typeof import("../src/store.js").Store;
+let SqliteStore: typeof import("../src/store.js").SqliteStore;
 let newTokenId: typeof import("../src/store.js").newTokenId;
 let issueToken: typeof import("../src/tokens.js").issueToken;
 let encrypt: typeof import("../src/crypto.js").encrypt;
@@ -23,7 +23,7 @@ let upstreamPort: number;
 let app: FastifyInstance;
 let brokerOrigin: string;
 let config: BrokerConfig;
-let store: InstanceType<typeof Store>;
+let store: StoreLike;
 let dataDir: string;
 
 function makeUpstream(): Promise<{ server: Server; port: number }> {
@@ -98,7 +98,7 @@ beforeAll(async () => {
 
   // 2. Now load the broker modules (echo provider's baseUrl freezes on first import).
   ({ buildServer } = await import("../src/server.js"));
-  ({ Store, newTokenId } = await import("../src/store.js"));
+  ({ SqliteStore, newTokenId } = await import("../src/store.js"));
   ({ issueToken } = await import("../src/tokens.js"));
   ({ encrypt, generateMasterKeyHex, generateJwtSecret } = await import(
     "../src/crypto.js"
@@ -117,7 +117,8 @@ beforeAll(async () => {
   const jwtSecret = generateJwtSecret();
   config = {
     dataDir,
-    storePath: join(dataDir, "store.json"),
+    jsonStorePath: join(dataDir, "store.json"),
+    sqliteStorePath: join(dataDir, "store.db"),
     logsPath: join(dataDir, "calls.log.jsonl"),
     configPath: join(dataDir, "config.json"),
     port: 0,
@@ -132,15 +133,16 @@ beforeAll(async () => {
   );
 
   // 5. Seed the store with an encrypted echo upstream secret.
-  store = new Store(config.storePath);
+  store = new SqliteStore(config.sqliteStorePath);
   store.putSecret("echo", {
     provider: "echo",
     ciphertext: encrypt("sk-fake-upstream", masterKeyHex),
     createdAt: new Date().toISOString(),
   });
 
-  // 6. Start the broker on an ephemeral port.
-  app = await buildServer(config, { logger: false });
+  // 6. Start the broker on an ephemeral port. Inject the same store instance
+  // so we can both seed it from the test and have the server read from it.
+  app = await buildServer(config, { logger: false, store });
   await app.listen({ port: 0, host: "127.0.0.1" });
   const addr = app.server.address() as AddressInfo;
   brokerOrigin = `http://127.0.0.1:${addr.port}`;
@@ -148,6 +150,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await app?.close();
+  store?.close?.();
   await new Promise<void>((r) => upstream?.close(() => r()));
   if (dataDir) rmSync(dataDir, { recursive: true, force: true });
 });

@@ -1,146 +1,57 @@
-import {
-  existsSync,
-  readFileSync,
-  writeFileSync,
-  renameSync,
-} from "node:fs";
+import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import type { BrokerConfig } from "./config.js";
+import { JsonStore } from "./store-json.js";
+import { SqliteStore } from "./store-sqlite.js";
+import type { StoreLike } from "./store-types.js";
 
-export interface SecretRecord {
-  /** Provider key, e.g. "openai". Must match a registered provider. */
-  provider: string;
-  /** Encrypted upstream API key (base64). */
-  ciphertext: string;
-  createdAt: string;
+export type {
+  StoreLike,
+  SecretRecord,
+  TokenRecord,
+  ConsumeResult,
+  RecentCallsOptions,
+} from "./store-types.js";
+export { JsonStore } from "./store-json.js";
+export { SqliteStore } from "./store-sqlite.js";
+
+export type StoreMode = "auto" | "sqlite" | "json";
+
+export interface OpenStoreOptions {
+  /** Storage backend. Default "auto" (sqlite, but errors if a non-migrated json store exists). */
+  mode?: StoreMode;
+  /** Mark the JSON store read-only (used after migrate). */
+  readOnly?: boolean;
 }
 
-export interface TokenRecord {
-  /** Unique token identifier (jti). */
-  id: string;
-  /** Which provider this token may proxy to. */
-  provider: string;
-  /** Allowed methods + path prefixes, e.g. ["POST:/v1/chat/completions"]. ["*"] = unrestricted. */
-  scopes: string[];
-  /** Remaining allowed calls. -1 = unlimited. */
-  remaining: number;
-  /** Total calls made (for stats only). */
-  used: number;
-  /** Unix epoch seconds. 0 = no expiry. */
-  expiresAt: number;
-  createdAt: string;
-  /** Free-form label so you can find tokens in logs. */
-  label: string;
-  revoked: boolean;
-}
-
-interface StoreShape {
-  version: 1;
-  secrets: Record<string, SecretRecord>;
-  tokens: Record<string, TokenRecord>;
-}
-
-const EMPTY: StoreShape = { version: 1, secrets: {}, tokens: {} };
-
-export class Store {
-  constructor(private readonly path: string) {}
-
-  private read(): StoreShape {
-    if (!existsSync(this.path)) return structuredClone(EMPTY);
-    const raw = readFileSync(this.path, "utf8");
-    if (!raw.trim()) return structuredClone(EMPTY);
-    return JSON.parse(raw) as StoreShape;
+/**
+ * Open the configured store. With mode="auto":
+ * - if store.db exists → SQLite
+ * - else if store.json exists (un-migrated) → throw with migration instructions
+ * - else → SQLite (fresh install)
+ */
+export function openStore(
+  config: BrokerConfig,
+  opts: OpenStoreOptions = {},
+): StoreLike {
+  const mode = opts.mode ?? "auto";
+  if (mode === "json") {
+    return new JsonStore(config.jsonStorePath, config.logsPath, opts.readOnly);
   }
-
-  private write(state: StoreShape): void {
-    const tmp = `${this.path}.tmp`;
-    writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
-    renameSync(tmp, this.path);
+  if (mode === "sqlite") {
+    return new SqliteStore(config.sqliteStorePath);
   }
-
-  /** Apply mutator atomically. NOTE: not safe across processes; single-process locking only. */
-  mutate<T>(fn: (state: StoreShape) => T): T {
-    const state = this.read();
-    const result = fn(state);
-    this.write(state);
-    return result;
+  // auto
+  if (existsSync(config.sqliteStorePath)) {
+    return new SqliteStore(config.sqliteStorePath);
   }
-
-  snapshot(): StoreShape {
-    return this.read();
+  if (existsSync(config.jsonStorePath)) {
+    throw new Error(
+      `legacy JSON store found at ${config.jsonStorePath} but no SQLite store at ${config.sqliteStorePath}.\n` +
+        `run \`keybroker migrate\` to convert, or pass --store=json to keep using JSON.`,
+    );
   }
-
-  putSecret(provider: string, rec: SecretRecord): void {
-    this.mutate((s) => {
-      s.secrets[provider] = rec;
-    });
-  }
-
-  getSecret(provider: string): SecretRecord | undefined {
-    return this.read().secrets[provider];
-  }
-
-  listSecrets(): Array<{ provider: string; createdAt: string }> {
-    const s = this.read();
-    return Object.entries(s.secrets).map(([provider, r]) => ({
-      provider,
-      createdAt: r.createdAt,
-    }));
-  }
-
-  putToken(rec: TokenRecord): void {
-    this.mutate((s) => {
-      s.tokens[rec.id] = rec;
-    });
-  }
-
-  getToken(id: string): TokenRecord | undefined {
-    return this.read().tokens[id];
-  }
-
-  listTokens(): TokenRecord[] {
-    return Object.values(this.read().tokens);
-  }
-
-  /** Atomically check-and-decrement. Returns the updated record on success, or a string error code. */
-  consumeToken(id: string): TokenRecord | "not_found" | "revoked" | "expired" | "exhausted" {
-    let outcome: TokenRecord | "not_found" | "revoked" | "expired" | "exhausted" =
-      "not_found";
-    this.mutate((s) => {
-      const t = s.tokens[id];
-      if (!t) {
-        outcome = "not_found";
-        return;
-      }
-      if (t.revoked) {
-        outcome = "revoked";
-        return;
-      }
-      if (t.expiresAt && Date.now() / 1000 > t.expiresAt) {
-        outcome = "expired";
-        return;
-      }
-      if (t.remaining === 0) {
-        outcome = "exhausted";
-        return;
-      }
-      if (t.remaining > 0) t.remaining -= 1;
-      t.used += 1;
-      outcome = t;
-    });
-    return outcome;
-  }
-
-  revokeToken(id: string): boolean {
-    let found = false;
-    this.mutate((s) => {
-      const t = s.tokens[id];
-      if (t) {
-        t.revoked = true;
-        found = true;
-      }
-    });
-    return found;
-  }
+  return new SqliteStore(config.sqliteStorePath);
 }
 
 export function newTokenId(): string {

@@ -4,7 +4,11 @@ import { mkdirSync, existsSync, readFileSync } from "node:fs";
 
 export interface BrokerConfig {
   dataDir: string;
-  storePath: string;
+  /** Legacy JSON store. Used only when --store=json or during migration. */
+  jsonStorePath: string;
+  /** SQLite store (default backend). */
+  sqliteStorePath: string;
+  /** Append-only call log used by the JSON store. SQLite store keeps calls in-db. */
   logsPath: string;
   configPath: string;
   port: number;
@@ -47,7 +51,8 @@ export function loadConfig(): BrokerConfig {
   const raw = JSON.parse(readFileSync(configPath, "utf8")) as OnDiskConfig;
   return {
     dataDir: dir,
-    storePath: join(dir, "store.json"),
+    jsonStorePath: join(dir, "store.json"),
+    sqliteStorePath: join(dir, "store.db"),
     logsPath: join(dir, "calls.log.jsonl"),
     configPath,
     port: raw.port ?? Number(process.env.KEYBROKER_PORT ?? 8787),

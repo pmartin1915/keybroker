@@ -1,5 +1,3 @@
-import { appendFileSync } from "node:fs";
-
 export interface CallLogEntry {
   ts: string;
   tokenId: string;
@@ -16,8 +14,4 @@ export interface CallLogEntry {
   /** Empty unless an outcome != "ok" occurred. */
   outcome: "ok" | "denied" | "error";
   reason?: string;
-}
-
-export function appendCall(path: string, entry: CallLogEntry): void {
-  appendFileSync(path, JSON.stringify(entry) + "\n");
 }
