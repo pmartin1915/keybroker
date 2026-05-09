@@ -132,8 +132,9 @@ export async function buildServer(config: BrokerConfig) {
       for (const [k, v] of Object.entries(req.headers)) {
         if (v === undefined) continue;
         const lk = k.toLowerCase();
+        if (HOP_BY_HOP.has(lk)) continue;
         if (provSpec.stripHeaders.includes(lk)) continue;
-        if (lk === "authorization") continue; // we set our own
+        if (lk === "authorization" || lk === "x-api-key") continue; // we set our own
         headers[k] = Array.isArray(v) ? v.join(",") : String(v);
       }
       if (provSpec.authStyle === "bearer") {
@@ -142,8 +143,30 @@ export async function buildServer(config: BrokerConfig) {
         headers[provSpec.authHeader ?? "x-api-key"] = upstreamKey;
       }
 
-      const url = provSpec.baseUrl.replace(/\/$/, "") + upstreamPath +
-        (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "");
+      // Build upstream URL via the URL constructor so the path and search are
+      // each properly normalized — avoids any mismatch between the path the
+      // scope check evaluated and what undici actually requests.
+      let url: URL;
+      try {
+        url = new URL(provSpec.baseUrl);
+        url.pathname = joinPaths(url.pathname, upstreamPath);
+        const qIdx = req.url.indexOf("?");
+        if (qIdx >= 0) {
+          // Only the query — drop any fragment a client tried to smuggle in.
+          const qs = req.url.slice(qIdx + 1).split("#")[0] ?? "";
+          url.search = qs ? "?" + qs : "";
+        }
+      } catch {
+        return denied(reply, 502, "bad_upstream_url", {
+          tokenId,
+          label: claims.lbl,
+          provider,
+          method: req.method,
+          path: upstreamPath,
+          started,
+          reqBytes: 0,
+        }, config.logsPath);
+      }
 
       const body = req.method === "GET" || req.method === "HEAD"
         ? undefined
@@ -155,7 +178,7 @@ export async function buildServer(config: BrokerConfig) {
           : Buffer.from(JSON.stringify(body));
 
       try {
-        const upstream = await undiciRequest(url, {
+        const upstream = await undiciRequest(url.toString(), {
           method: req.method as "GET" | "POST" | "PUT" | "DELETE" | "PATCH",
           headers,
           body: bodyBuf,
@@ -165,8 +188,7 @@ export async function buildServer(config: BrokerConfig) {
         reply.status(upstream.statusCode);
         for (const [k, v] of Object.entries(upstream.headers)) {
           if (v === undefined) continue;
-          const lk = k.toLowerCase();
-          if (lk === "transfer-encoding" || lk === "connection") continue;
+          if (HOP_BY_HOP.has(k.toLowerCase())) continue;
           reply.header(k, v as string | string[]);
         }
         const respBuf = Buffer.from(await upstream.body.arrayBuffer());
@@ -208,6 +230,26 @@ export async function buildServer(config: BrokerConfig) {
   );
 
   return app;
+}
+
+const HOP_BY_HOP = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "trailers",
+  "transfer-encoding",
+  "upgrade",
+  "host",
+  "content-length",
+]);
+
+function joinPaths(a: string, b: string): string {
+  const left = a.endsWith("/") ? a.slice(0, -1) : a;
+  const right = b.startsWith("/") ? b : "/" + b;
+  return left + right;
 }
 
 function extractPresentedToken(req: FastifyRequest): string | undefined {

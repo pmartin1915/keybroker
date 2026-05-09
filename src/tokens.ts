@@ -61,21 +61,36 @@ export async function verifyToken(
   }
 }
 
-/** Scope check. Method-prefix ":" path-prefix. "*" = wildcard. */
+/**
+ * Scope check. Format: "<METHOD>:<path-prefix>" or "*" for full wildcard.
+ *
+ * Path matching requires a segment boundary at the prefix end so that
+ * scope `POST:/v1/chat/completions` does NOT match `/v1/chat/completionsEVIL`.
+ * The `path` argument MUST already be normalized — any `..` segments will
+ * cause an immediate deny, since they suggest the caller is trying to slip
+ * past a prefix boundary.
+ */
 export function scopeAllows(
   scopes: string[],
   method: string,
   path: string,
 ): boolean {
+  if (path.split("/").includes("..")) return false;
   if (scopes.includes("*")) return true;
+  const upMethod = method.toUpperCase();
   for (const s of scopes) {
     if (s === "*") return true;
     const idx = s.indexOf(":");
     if (idx < 0) continue;
     const m = s.slice(0, idx).toUpperCase();
     const p = s.slice(idx + 1);
-    if (m !== "*" && m !== method.toUpperCase()) continue;
-    if (p === "*" || path === p || path.startsWith(p)) return true;
+    if (m !== "*" && m !== upMethod) continue;
+    if (p === "*" || path === p) return true;
+    if (path.startsWith(p)) {
+      const next = path.charAt(p.length);
+      // Boundary: prefix ended at a `/`, or scope's prefix already ends in `/`.
+      if (p.endsWith("/") || next === "/") return true;
+    }
   }
   return false;
 }

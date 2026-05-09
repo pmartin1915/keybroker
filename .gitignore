@@ -1,6 +1,8 @@
 node_modules/
 .keybroker/
+.keybroker-test/
 *.log
+*.jsonl
 .env
 .env.local
 .DS_Store

@@ -7,9 +7,6 @@
   "engines": {
     "node": ">=20"
   },
-  "bin": {
-    "keybroker": "src/cli.ts"
-  },
   "scripts": {
     "start": "tsx src/cli.ts",
     "serve": "tsx src/cli.ts serve",

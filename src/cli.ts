@@ -62,7 +62,10 @@ secret
   .command("add")
   .description("Add or replace the upstream API key for a provider.")
   .argument("<provider>", `provider name (one of: ${Object.keys(PROVIDERS).join(", ")})`)
-  .option("-v, --value <value>", "secret value (or read from KEYBROKER_SECRET env var)")
+  .option(
+    "-v, --value <value>",
+    "secret value (visible to `ps` — prefer KEYBROKER_SECRET env var instead)",
+  )
   .action((provider: string, opts: { value?: string }) => {
     if (!getProvider(provider)) {
       console.error(`unknown provider: ${provider}`);
