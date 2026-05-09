@@ -1,5 +1,7 @@
 import Fastify, { type FastifyRequest, type FastifyReply } from "fastify";
 import { request as undiciRequest } from "undici";
+import { Transform } from "node:stream";
+import { finished } from "node:stream/promises";
 import type { BrokerConfig } from "./config.js";
 import { openStore } from "./store.js";
 import type { StoreLike } from "./store-types.js";
@@ -202,22 +204,59 @@ export async function buildServer(
           if (HOP_BY_HOP.has(k.toLowerCase())) continue;
           reply.header(k, v as string | string[]);
         }
-        const respBuf = Buffer.from(await upstream.body.arrayBuffer());
-        const log: CallLogEntry = {
-          ts: new Date().toISOString(),
-          tokenId,
-          label: claims.lbl,
-          provider,
-          method: req.method,
-          path: upstreamPath,
-          status: upstream.statusCode,
-          durationMs: Date.now() - started,
-          reqBytes: bodyBuf?.byteLength ?? 0,
-          respBytes: respBuf.byteLength,
-          outcome: "ok",
-        };
-        store.appendCall(log);
-        return reply.send(respBuf);
+
+        // Stream the upstream body through a byte counter so SSE / streamed
+        // completions arrive at the client incrementally. The audit log is
+        // written from the `finished()` callback so respBytes reflects what
+        // actually made it across — including aborted streams.
+        let respBytes = 0;
+        const counter = new Transform({
+          transform(chunk: Buffer, _enc, cb) {
+            respBytes += chunk.byteLength;
+            cb(null, chunk);
+          },
+        });
+
+        const reqBytes = bodyBuf?.byteLength ?? 0;
+        const upstreamStatus = upstream.statusCode;
+        const upstreamLabel = claims.lbl;
+
+        finished(counter).then(
+          () => {
+            store.appendCall({
+              ts: new Date().toISOString(),
+              tokenId,
+              label: upstreamLabel,
+              provider,
+              method: req.method,
+              path: upstreamPath,
+              status: upstreamStatus,
+              durationMs: Date.now() - started,
+              reqBytes,
+              respBytes,
+              outcome: "ok",
+            });
+          },
+          (err: unknown) => {
+            store.appendCall({
+              ts: new Date().toISOString(),
+              tokenId,
+              label: upstreamLabel,
+              provider,
+              method: req.method,
+              path: upstreamPath,
+              status: upstreamStatus,
+              durationMs: Date.now() - started,
+              reqBytes,
+              respBytes,
+              outcome: "error",
+              reason: (err as Error).message,
+            });
+          },
+        );
+
+        upstream.body.pipe(counter);
+        return reply.send(counter);
       } catch (e) {
         req.log.error({ err: e }, "upstream_error");
         const log: CallLogEntry = {
