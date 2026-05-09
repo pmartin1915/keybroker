@@ -133,18 +133,11 @@ This is a **prototype** that demonstrates the developer experience. It is **not*
 
 If you ship this to production as-is, you will have a bad time.
 
-## Roadmap (the version that's worth money)
+## Roadmap
 
-1. **Streaming pass-through** so SSE/streamed responses work.
-2. **Cost-bound tokens** — `--max-spend $5` enforced via per-provider response parsing.
-3. **Postgres backend** + WAL audit log + per-token rate limits.
-4. **OS keychain integration** for the master key (DPAPI / Keychain / libsecret).
-5. **mTLS / OIDC** on the broker itself so it can run as a network service.
-6. **RS256 signing** with rotating signing keys; verifier-only deployments.
-7. **Web dashboard** for issue/revoke/audit.
-8. **SDK injectors** so libraries auto-pick up `BROKER_URL` (one-line for OpenAI Python SDK, langchain, etc.).
-9. **GitHub OIDC** — issue tokens to GitHub Actions workflows without long-lived keys.
-10. **Just-in-time elevation** — Slack-bot-approved 20-minute scoped tokens for production debugging.
+See [`ROADMAP.md`](./ROADMAP.md) for phased plan: production minimums →
+Money Rule features (model allowlist, dollar spend caps, per-machine
+attribution) → fold into `claude-budget-dispatcher`.
 
 ## Why "prototype broker" and not "buy Vault"?
 
