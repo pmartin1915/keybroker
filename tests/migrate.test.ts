@@ -56,9 +56,13 @@ function tokenRec(id: string, remaining: number): TokenRecord {
 describe("keybroker migrate", () => {
   it("copies secrets, tokens, and call log from JSON to SQLite, then renames JSON", async () => {
     const home = mkdtempSync(join(tmpdir(), "kb-migrate-"));
+    const env = {
+      KEYBROKER_HOME: home,
+      KEYBROKER_KEYCHAIN_PATH: join(home, ".keychain.json"),
+    };
     try {
-      // 1. Init the broker (creates config.json with master key + jwt secret).
-      const init = await runCli(["init"], { KEYBROKER_HOME: home });
+      // 1. Init the broker (creates config.json + keychain entries).
+      const init = await runCli(["init"], env);
       expect(init.code).toBe(0);
 
       // 2. Seed a JSON store directly with secrets, tokens, and a few calls.
@@ -107,7 +111,7 @@ describe("keybroker migrate", () => {
       });
 
       // 3. Run migrate.
-      const migrate = await runCli(["migrate"], { KEYBROKER_HOME: home });
+      const migrate = await runCli(["migrate"], env);
       expect(migrate.code).toBe(0);
       expect(migrate.stdout).toMatch(/2 secrets, 2 tokens, 2 call log entries/);
 
@@ -131,7 +135,7 @@ describe("keybroker migrate", () => {
       }
 
       // 5. A second migrate should refuse (sqlite db now exists).
-      const second = await runCli(["migrate"], { KEYBROKER_HOME: home });
+      const second = await runCli(["migrate"], env);
       expect(second.code).not.toBe(0);
       expect(second.stderr).toMatch(/already exists/);
     } finally {
@@ -141,8 +145,12 @@ describe("keybroker migrate", () => {
 
   it("--dry-run does not write the SQLite db or rename the JSON file", async () => {
     const home = mkdtempSync(join(tmpdir(), "kb-migrate-dry-"));
+    const env = {
+      KEYBROKER_HOME: home,
+      KEYBROKER_KEYCHAIN_PATH: join(home, ".keychain.json"),
+    };
     try {
-      const init = await runCli(["init"], { KEYBROKER_HOME: home });
+      const init = await runCli(["init"], env);
       expect(init.code).toBe(0);
 
       const json = new JsonStore(
@@ -151,9 +159,7 @@ describe("keybroker migrate", () => {
       );
       json.putToken(tokenRec("only", 3));
 
-      const dry = await runCli(["migrate", "--dry-run"], {
-        KEYBROKER_HOME: home,
-      });
+      const dry = await runCli(["migrate", "--dry-run"], env);
       expect(dry.code).toBe(0);
       expect(dry.stdout).toMatch(/dry-run/);
       expect(existsSync(join(home, "store.db"))).toBe(false);

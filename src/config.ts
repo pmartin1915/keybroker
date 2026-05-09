@@ -1,6 +1,12 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdirSync, existsSync, readFileSync } from "node:fs";
+import {
+  getKeychain,
+  KC_JWT_SECRET,
+  KC_MASTER_KEY,
+  type Keychain,
+} from "./keychain.js";
 
 export interface BrokerConfig {
   dataDir: string;
@@ -33,14 +39,31 @@ export function ensureDataDir(): string {
   return DEFAULT_DATA_DIR;
 }
 
+/**
+ * On-disk config. Post-Phase-1.3 secrets live in the OS keychain, so the
+ * config file holds only network settings and a marker. The legacy fields
+ * (`masterKeyHex`/`jwtSecret`) are read for back-compat and trigger an
+ * upgrade hint, but new installs should never write them.
+ */
 interface OnDiskConfig {
-  masterKeyHex: string;
-  jwtSecret: string;
   port?: number;
   host?: string;
+  /** @deprecated stored in OS keychain since Phase 1.3 */
+  masterKeyHex?: string;
+  /** @deprecated stored in OS keychain since Phase 1.3 */
+  jwtSecret?: string;
+  /** Optional: identifies the keychain entry, useful when running multiple brokers on one machine. */
+  keychainService?: string;
 }
 
-export function loadConfig(): BrokerConfig {
+export interface LoadConfigOptions {
+  /** Override the keychain (tests). */
+  keychain?: Keychain;
+}
+
+export async function loadConfig(
+  opts: LoadConfigOptions = {},
+): Promise<BrokerConfig> {
   const dir = ensureDataDir();
   const configPath = join(dir, "config.json");
   if (!existsSync(configPath)) {
@@ -49,6 +72,30 @@ export function loadConfig(): BrokerConfig {
     );
   }
   const raw = JSON.parse(readFileSync(configPath, "utf8")) as OnDiskConfig;
+  const kc = opts.keychain ?? getKeychain();
+
+  let masterKeyHex = await kc.get(KC_MASTER_KEY);
+  let jwtSecret = await kc.get(KC_JWT_SECRET);
+
+  // Back-compat: legacy installs (Phase ≤1.2) kept secrets in config.json.
+  // Read them, warn, and prompt for migration. Don't auto-write to the
+  // keychain — the user should be aware of the move.
+  if ((!masterKeyHex || !jwtSecret) && (raw.masterKeyHex || raw.jwtSecret)) {
+    console.warn(
+      `keybroker: secrets are still in ${configPath}. ` +
+        `Run \`keybroker init --migrate-keys\` to move them into the OS keychain.`,
+    );
+    masterKeyHex = masterKeyHex ?? raw.masterKeyHex ?? null;
+    jwtSecret = jwtSecret ?? raw.jwtSecret ?? null;
+  }
+
+  if (!masterKeyHex || !jwtSecret) {
+    throw new Error(
+      `keybroker secrets missing from the OS keychain. ` +
+        `Run \`keybroker init\` (or \`keybroker init --migrate-keys\` if upgrading from a pre-1.3 install).`,
+    );
+  }
+
   return {
     dataDir: dir,
     jsonStorePath: join(dir, "store.json"),
@@ -57,7 +104,7 @@ export function loadConfig(): BrokerConfig {
     configPath,
     port: raw.port ?? Number(process.env.KEYBROKER_PORT ?? 8787),
     host: raw.host ?? process.env.KEYBROKER_HOST ?? "127.0.0.1",
-    masterKeyHex: raw.masterKeyHex,
-    jwtSecret: raw.jwtSecret,
+    masterKeyHex,
+    jwtSecret,
   };
 }

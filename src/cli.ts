@@ -1,9 +1,14 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { writeFileSync, existsSync, renameSync } from "node:fs";
+import { writeFileSync, existsSync, readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { ensureDataDir, loadConfig } from "./config.js";
-import { generateJwtSecret, generateMasterKeyHex, encrypt } from "./crypto.js";
+import {
+  generateJwtSecret,
+  generateMasterKeyHex,
+  encrypt,
+  decrypt,
+} from "./crypto.js";
 import {
   openStore,
   newTokenId,
@@ -15,6 +20,7 @@ import {
 import { issueToken } from "./tokens.js";
 import { PROVIDERS, getProvider } from "./providers/index.js";
 import { buildServer } from "./server.js";
+import { getKeychain, KC_JWT_SECRET, KC_MASTER_KEY } from "./keychain.js";
 
 function parseStoreMode(s: string | undefined): StoreMode {
   if (!s) return "auto";
@@ -41,42 +47,138 @@ function storeMode(): StoreMode {
 
 program
   .command("init")
-  .description("Initialize the broker (creates config, master key, jwt secret).")
-  .option("--force", "overwrite existing config", false)
-  .action((opts: { force?: boolean }) => {
-    const dir = ensureDataDir();
-    const configPath = join(dir, "config.json");
-    if (existsSync(configPath) && !opts.force) {
-      console.error(`already initialized at ${configPath} (use --force to overwrite)`);
-      process.exitCode = 1;
-      return;
-    }
-    const masterKeyHex = generateMasterKeyHex();
-    const jwtSecret = generateJwtSecret();
-    writeFileSync(
-      configPath,
-      JSON.stringify(
-        {
-          masterKeyHex,
-          jwtSecret,
-          port: 8787,
-          host: "127.0.0.1",
-        },
-        null,
-        2,
-      ),
-      { mode: 0o600 },
+  .description(
+    "Initialize the broker. Stores the master key and JWT secret in the OS keychain; writes only port/host to config.json.",
+  )
+  .option("--force", "overwrite existing config + keychain entries", false)
+  .option(
+    "--migrate-keys",
+    "move secrets from a pre-1.3 config.json into the keychain (keeps the same key, no re-encryption)",
+    false,
+  )
+  .option(
+    "--rotate-keys",
+    "generate a new master key and re-encrypt every stored upstream secret under it",
+    false,
+  )
+  .action(
+    async (opts: {
+      force?: boolean;
+      migrateKeys?: boolean;
+      rotateKeys?: boolean;
+    }) => {
+      if (opts.migrateKeys) {
+        await initMigrateKeys();
+        return;
+      }
+      if (opts.rotateKeys) {
+        await initRotateKeys();
+        return;
+      }
+      const dir = ensureDataDir();
+      const configPath = join(dir, "config.json");
+      const kc = getKeychain();
+      const existingMaster = await kc.get(KC_MASTER_KEY);
+      if ((existsSync(configPath) || existingMaster) && !opts.force) {
+        console.error(
+          `already initialized (config at ${configPath}, keychain entry present). Use --force to overwrite.`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+      const masterKeyHex = generateMasterKeyHex();
+      const jwtSecret = generateJwtSecret();
+      await kc.set(KC_MASTER_KEY, masterKeyHex);
+      await kc.set(KC_JWT_SECRET, jwtSecret);
+      writeFileSync(
+        configPath,
+        JSON.stringify({ port: 8787, host: "127.0.0.1" }, null, 2),
+        { mode: 0o600 },
+      );
+      console.log(`initialized: ${configPath}`);
+      console.log(`data dir:    ${dir}`);
+      console.log(`port:        8787 (override with KEYBROKER_PORT)`);
+      console.log(
+        `secrets:     stored in OS keychain under service "keybroker" (accounts: ${KC_MASTER_KEY}, ${KC_JWT_SECRET}).`,
+      );
+    },
+  );
+
+async function initMigrateKeys(): Promise<void> {
+  const dir = ensureDataDir();
+  const configPath = join(dir, "config.json");
+  if (!existsSync(configPath)) {
+    console.error(`no config at ${configPath} — nothing to migrate.`);
+    process.exitCode = 1;
+    return;
+  }
+  const raw = JSON.parse(readFileSync(configPath, "utf8")) as {
+    masterKeyHex?: string;
+    jwtSecret?: string;
+    port?: number;
+    host?: string;
+  };
+  if (!raw.masterKeyHex || !raw.jwtSecret) {
+    console.error(
+      `config at ${configPath} has no plaintext secrets to migrate — already on the new layout.`,
     );
-    console.log(`initialized: ${configPath}`);
-    console.log(`data dir:    ${dir}`);
-    console.log(`port:        8787 (override with KEYBROKER_PORT)`);
-    console.log(
-      "\nsecurity note: the config file contains the master key and jwt secret in plaintext.",
-    );
-    console.log(
-      "for production, store these in a real KMS or OS keychain — this prototype does not.",
-    );
-  });
+    process.exitCode = 1;
+    return;
+  }
+  const kc = getKeychain();
+  await kc.set(KC_MASTER_KEY, raw.masterKeyHex);
+  await kc.set(KC_JWT_SECRET, raw.jwtSecret);
+  // Strip the secrets from disk; preserve port/host.
+  const stripped = JSON.stringify(
+    { port: raw.port ?? 8787, host: raw.host ?? "127.0.0.1" },
+    null,
+    2,
+  );
+  writeFileSync(configPath, stripped, { mode: 0o600 });
+  console.log(`secrets moved from ${configPath} into the OS keychain.`);
+  console.log(`config.json now contains only port/host.`);
+}
+
+async function initRotateKeys(): Promise<void> {
+  const cfg = await loadConfig();
+  const store = openStore(cfg, { mode: storeMode() });
+  const oldMasterKeyHex = cfg.masterKeyHex;
+  const newMasterKeyHex = generateMasterKeyHex();
+
+  // 1. Decrypt all upstream secrets with the old key, in memory.
+  const secrets = store.listSecrets();
+  const reEncrypted: Array<{ provider: string; ciphertext: string; createdAt: string }> = [];
+  for (const { provider } of secrets) {
+    const rec = store.getSecret(provider);
+    if (!rec) continue;
+    const plain = decrypt(rec.ciphertext, oldMasterKeyHex);
+    reEncrypted.push({
+      provider,
+      ciphertext: encrypt(plain, newMasterKeyHex),
+      createdAt: rec.createdAt,
+    });
+  }
+
+  // 2. Write all re-encrypted secrets. The store is the source of truth for
+  // ciphertext; if we crash between this and the keychain swap below, the
+  // user can recover by re-running with the old keychain entry preserved
+  // elsewhere — but this is a known sharp edge for the prototype.
+  for (const r of reEncrypted) {
+    store.putSecret(r.provider, r);
+  }
+
+  // 3. Atomically swap the master key in the keychain.
+  const kc = getKeychain();
+  await kc.set(KC_MASTER_KEY, newMasterKeyHex);
+
+  store.close?.();
+  console.log(
+    `rotated master key. ${reEncrypted.length} upstream secret(s) re-encrypted.`,
+  );
+  console.log(
+    `JWT secret unchanged — existing tokens still verify. Use --force on \`init\` to rotate the JWT secret separately (this invalidates all live tokens).`,
+  );
+}
 
 const secret = program.command("secret").description("Manage upstream API keys.");
 
@@ -88,7 +190,7 @@ secret
     "-v, --value <value>",
     "secret value (visible to `ps` — prefer KEYBROKER_SECRET env var instead)",
   )
-  .action((provider: string, opts: { value?: string }) => {
+  .action(async (provider: string, opts: { value?: string }) => {
     if (!getProvider(provider)) {
       console.error(`unknown provider: ${provider}`);
       console.error(`known: ${Object.keys(PROVIDERS).join(", ")}`);
@@ -103,7 +205,7 @@ secret
       process.exitCode = 1;
       return;
     }
-    const cfg = loadConfig();
+    const cfg = await loadConfig();
     const store = openStore(cfg, { mode: storeMode() });
     store.putSecret(provider, {
       provider,
@@ -116,8 +218,8 @@ secret
 secret
   .command("list")
   .description("List providers with stored secrets.")
-  .action(() => {
-    const cfg = loadConfig();
+  .action(async () => {
+    const cfg = await loadConfig();
     const store = openStore(cfg, { mode: storeMode() });
     const rows = store.listSecrets();
     if (rows.length === 0) {
@@ -156,7 +258,7 @@ token
         process.exitCode = 1;
         return;
       }
-      const cfg = loadConfig();
+      const cfg = await loadConfig();
       const store = openStore(cfg, { mode: storeMode() });
       const id = newTokenId();
       const ttl = Number(opts.ttl);
@@ -190,8 +292,8 @@ token
 token
   .command("list")
   .description("List issued tokens.")
-  .action(() => {
-    const cfg = loadConfig();
+  .action(async () => {
+    const cfg = await loadConfig();
     const store = openStore(cfg, { mode: storeMode() });
     const rows = store.listTokens();
     if (rows.length === 0) {
@@ -219,8 +321,8 @@ token
   .command("revoke")
   .description("Revoke a token by id.")
   .argument("<id>")
-  .action((id: string) => {
-    const cfg = loadConfig();
+  .action(async (id: string) => {
+    const cfg = await loadConfig();
     const store = openStore(cfg, { mode: storeMode() });
     if (store.revokeToken(id)) {
       console.log(`revoked ${id}`);
@@ -235,8 +337,8 @@ program
   .description("Tail recent call log entries.")
   .option("-n, --num <n>", "number of recent entries", "20")
   .option("--token <id>", "filter by token id")
-  .action((opts: { num: string; token?: string }) => {
-    const cfg = loadConfig();
+  .action(async (opts: { num: string; token?: string }) => {
+    const cfg = await loadConfig();
     const store = openStore(cfg, { mode: storeMode() });
     const limit = Number(opts.num);
     const entries = store.recentCalls(
@@ -260,8 +362,8 @@ program
     "One-shot migration of the legacy JSON store to SQLite. After this runs the JSON file is renamed to store.json.migrated.",
   )
   .option("--dry-run", "show what would be migrated, don't write", false)
-  .action((opts: { dryRun?: boolean }) => {
-    const cfg = loadConfig();
+  .action(async (opts: { dryRun?: boolean }) => {
+    const cfg = await loadConfig();
     if (existsSync(cfg.sqliteStorePath)) {
       console.error(
         `SQLite store already exists at ${cfg.sqliteStorePath}. ` +
@@ -309,7 +411,7 @@ program
   .option("-p, --port <port>", "override port")
   .option("-h, --host <host>", "override host")
   .action(async (opts: { port?: string; host?: string }) => {
-    const cfg = loadConfig();
+    const cfg = await loadConfig();
     const app = await buildServer(cfg);
     const port = opts.port ? Number(opts.port) : cfg.port;
     const host = opts.host ?? cfg.host;
