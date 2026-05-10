@@ -16,6 +16,11 @@ import {
   type Policy,
 } from "./policy.js";
 import { matchesAny } from "./glob-match.js";
+import {
+  estimateOutputCostUsd,
+  actualCostUsd as actualCostUsdFor,
+  parseUsageFromUpstream,
+} from "./pricing.js";
 
 export interface BuildServerOptions {
   /** Pass `false` to silence fastify's logger (used in tests). */
@@ -148,12 +153,39 @@ export async function buildServer(
       // guard — do not delete the runtime check on the assumption it is
       // redundant.
       const hasMdlClaim = !!(claims.mdl && claims.mdl.length > 0);
-      const needsModelInspection = hasMdlClaim || policy.forbiddenModels.length > 0;
+      const hasCapClaim = claims.cap !== undefined;
+      const needsModelInspection =
+        hasMdlClaim || policy.forbiddenModels.length > 0 || hasCapClaim;
+      // Phase 2.2: pre-flight estimate captured here so the post-call
+      // append-call writers (success / error / streaming-finished) can
+      // record it on the audit entry. Stays undefined when there's no
+      // cap to enforce or the model isn't priced.
+      let estimatedCostUsd: number | undefined;
+      // Phase 2.2: model captured at the same point so the post-call
+      // usage parse can convert tokens → dollars without re-running the
+      // body extractor. Stays undefined for non-LLM endpoints (e.g.
+      // GET listings) or providers without extractRequestMetadata.
+      let requestedModelForCost: string | undefined;
       if (needsModelInspection) {
         if (!provSpec.extractRequestMetadata) {
           if (hasMdlClaim) {
             // Token requires a model match but provider can't extract.
             return denied(reply, 403, "model_not_allowed", {
+              tokenId,
+              label: claims.lbl,
+              provider,
+              method: req.method,
+              path: upstreamPath,
+              started,
+              reqBytes: bodyBuf?.byteLength ?? 0,
+              machine,
+            }, store);
+          }
+          if (hasCapClaim) {
+            // A capped token on a provider whose body shape we can't read
+            // means we can't estimate. Fail closed — same posture as
+            // model_not_allowed for an mdl-restricted token.
+            return denied(reply, 403, "cap_unpriced_model", {
               tokenId,
               label: claims.lbl,
               provider,
@@ -188,10 +220,32 @@ export async function buildServer(
                   machine,
                 }, store);
               }
+              if (hasCapClaim) {
+                // Same posture as the mdl deny: a capped token cannot
+                // ride a body the broker can't price. Mirrors the
+                // `model_not_allowed` semantics so a stolen capped token
+                // can't bypass the cap by sending malformed JSON.
+                return denied(reply, 403, "cap_unpriced_model", {
+                  tokenId,
+                  label: claims.lbl,
+                  provider,
+                  method: req.method,
+                  path: upstreamPath,
+                  started,
+                  reqBytes: bodyBuf?.byteLength ?? 0,
+                  machine,
+                }, store);
+              }
               // Policy alone with no extractable model — nothing to forbid.
               break;
             case "ok": {
               const requested = extraction.meta.model;
+              if (requested !== undefined) {
+                // Hoist into the outer scope so the post-call usage
+                // reconciliation (below) can convert tokens → USD without
+                // re-running the extractor on the same body.
+                requestedModelForCost = requested;
+              }
               // Policy `forbidden_models` first (system-wide guardrail).
               if (requested !== undefined && policyDeniesModel(policy, requested)) {
                 return denied(reply, 403, "model_forbidden", {
@@ -221,6 +275,50 @@ export async function buildServer(
                     machine,
                   }, store);
                 }
+              }
+              // Phase 2.2: per-token cap pre-flight. Runs AFTER policy +
+              // mdl checks so the deny reason is the most specific one
+              // (a forbidden model gets `model_forbidden`, not
+              // `cap_exceeded_estimate`). The estimate is conservative:
+              // input tokens default to 0, so the bound is "if the model
+              // emits its full max_tokens of output and zero input, this
+              // is the cost". The cap should be set with that floor in
+              // mind — see ROADMAP for the contract.
+              if (hasCapClaim && requested !== undefined) {
+                const est = estimateOutputCostUsd({
+                  model: requested,
+                  maxTokens: extraction.meta.maxTokens,
+                });
+                if (est === undefined) {
+                  return denied(reply, 403, "cap_unpriced_model", {
+                    tokenId,
+                    label: claims.lbl,
+                    provider,
+                    method: req.method,
+                    path: upstreamPath,
+                    started,
+                    reqBytes: bodyBuf?.byteLength ?? 0,
+                    requestedModel: requested,
+                    machine,
+                  }, store);
+                }
+                const cumulative = store.sumCostUsdByToken(tokenId);
+                // claims.cap is validated > 0 in verifyToken — no need to
+                // re-guard here.
+                if (cumulative + est > claims.cap!) {
+                  return denied(reply, 403, "cap_exceeded_estimate", {
+                    tokenId,
+                    label: claims.lbl,
+                    provider,
+                    method: req.method,
+                    path: upstreamPath,
+                    started,
+                    reqBytes: bodyBuf?.byteLength ?? 0,
+                    requestedModel: requested,
+                    machine,
+                  }, store);
+                }
+                estimatedCostUsd = est;
               }
               break;
             }
@@ -375,10 +473,38 @@ export async function buildServer(
         // completions arrive at the client incrementally. The audit log is
         // written from the `finished()` callback so respBytes reflects what
         // actually made it across — including aborted streams.
+        //
+        // Phase 2.2: also retain a tail buffer of the upstream body so we
+        // can parse `usage` after the stream ends. We hold up to RESP_TAIL_CAP
+        // bytes — enough for a buffered chat-completions JSON response,
+        // and enough to capture the final SSE event(s) that carry usage
+        // for streamed responses.
+        //
+        // PROVIDER CONTRACT (load-bearing): both OpenAI (with
+        // stream_options.include_usage:true) and Anthropic place the
+        // final usage event in the LAST few SSE messages of the stream.
+        // If a future provider emits usage early then continues
+        // streaming >256KB of content, the usage event would be evicted
+        // before stream end. The system fails closed in that case:
+        // `actualCostUsd` stays undefined and cap accounting falls back
+        // to the (output-only) pre-flight estimate. Watch for this when
+        // adding new providers; bump RESP_TAIL_CAP or change to a
+        // dedicated usage scanner if needed.
+        //
+        // The cap is a memory ceiling; we never grow unbounded.
         let respBytes = 0;
+        const RESP_TAIL_CAP = 256 * 1024;
+        const respTail: Buffer[] = [];
+        let respTailBytes = 0;
         const counter = new Transform({
           transform(chunk: Buffer, _enc, cb) {
             respBytes += chunk.byteLength;
+            respTail.push(chunk);
+            respTailBytes += chunk.byteLength;
+            while (respTailBytes > RESP_TAIL_CAP && respTail.length > 1) {
+              const dropped = respTail.shift();
+              respTailBytes -= dropped?.byteLength ?? 0;
+            }
             cb(null, chunk);
           },
         });
@@ -386,43 +512,53 @@ export async function buildServer(
         const reqBytes = bodyBuf?.byteLength ?? 0;
         const upstreamStatus = upstream.statusCode;
         const upstreamLabel = claims.lbl;
+        const finalizeCallEntry = (outcome: "ok" | "error", reason?: string) => {
+          const entry: CallLogEntry = {
+            ts: new Date().toISOString(),
+            tokenId,
+            label: upstreamLabel,
+            provider,
+            method: req.method,
+            path: upstreamPath,
+            status: upstreamStatus,
+            durationMs: Date.now() - started,
+            reqBytes,
+            respBytes,
+            outcome,
+          };
+          if (reason !== undefined) entry.reason = reason;
+          if (machine !== undefined) entry.machine = machine;
+          if (estimatedCostUsd !== undefined) entry.estimatedCostUsd = estimatedCostUsd;
+          // Try to reconcile actual cost from upstream usage. Only
+          // priced models (i.e. those for which we already produced an
+          // estimate, or any model the pricing table knows about) get an
+          // actual; an unpriced model returning usage still can't be
+          // converted to dollars. We re-check via actualCostUsdFor so we
+          // catch the audit-only case where a non-capped token used a
+          // priced model.
+          if (requestedModelForCost !== undefined && respTail.length > 0) {
+            try {
+              const usage = parseUsageFromUpstream(Buffer.concat(respTail, respTailBytes));
+              if (usage) {
+                const actual = actualCostUsdFor({
+                  model: requestedModelForCost,
+                  inputTokens: usage.inputTokens,
+                  outputTokens: usage.outputTokens,
+                });
+                if (actual !== undefined) entry.actualCostUsd = actual;
+              }
+            } catch {
+              // Best-effort: a parse failure leaves actualCostUsd unset
+              // and the cap accounting falls back to the pre-flight
+              // estimate, which already counted toward the cap.
+            }
+          }
+          store.appendCall(entry);
+        };
 
         finished(counter).then(
-          () => {
-            const entry: CallLogEntry = {
-              ts: new Date().toISOString(),
-              tokenId,
-              label: upstreamLabel,
-              provider,
-              method: req.method,
-              path: upstreamPath,
-              status: upstreamStatus,
-              durationMs: Date.now() - started,
-              reqBytes,
-              respBytes,
-              outcome: "ok",
-            };
-            if (machine !== undefined) entry.machine = machine;
-            store.appendCall(entry);
-          },
-          (err: unknown) => {
-            const entry: CallLogEntry = {
-              ts: new Date().toISOString(),
-              tokenId,
-              label: upstreamLabel,
-              provider,
-              method: req.method,
-              path: upstreamPath,
-              status: upstreamStatus,
-              durationMs: Date.now() - started,
-              reqBytes,
-              respBytes,
-              outcome: "error",
-              reason: (err as Error).message,
-            };
-            if (machine !== undefined) entry.machine = machine;
-            store.appendCall(entry);
-          },
+          () => finalizeCallEntry("ok"),
+          (err: unknown) => finalizeCallEntry("error", (err as Error).message),
         );
 
         upstream.body.pipe(counter);
@@ -444,6 +580,12 @@ export async function buildServer(
           reason: (e as Error).message,
         };
         if (machine !== undefined) log.machine = machine;
+        // Phase 2.2: an upstream connect/transport error never produced
+        // usage. Record the estimate so the cap accounting still
+        // counts this attempt — otherwise a stuck upstream + retries
+        // could blow past the cap because each failed attempt looks
+        // free.
+        if (estimatedCostUsd !== undefined) log.estimatedCostUsd = estimatedCostUsd;
         store.appendCall(log);
         return reply.status(502).send({ error: "upstream_error" });
       }

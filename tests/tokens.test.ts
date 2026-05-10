@@ -371,3 +371,156 @@ describe("issueToken / verifyToken: mch claim round-trip (Phase 2.3)", () => {
     expect(result).toEqual({ error: "malformed_claims" });
   });
 });
+
+describe("issueToken / verifyToken: cap claim round-trip (Phase 2.2)", () => {
+  it("round-trips a positive USD cap", async () => {
+    const raw = await issueToken(SECRET, {
+      tokenId: "token-cap-1",
+      provider: "openai",
+      scopes: ["*"],
+      label: "x",
+      ttlSeconds: 60,
+      capUsd: 1.5,
+    });
+    const result = await verifyToken(SECRET, raw);
+    if ("error" in result) throw new Error("unexpected: " + result.error);
+    expect(result.claims.cap).toBe(1.5);
+  });
+
+  it("omits the claim entirely when capUsd is undefined", async () => {
+    const raw = await issueToken(SECRET, {
+      tokenId: "token-cap-2",
+      provider: "openai",
+      scopes: ["*"],
+      label: "x",
+      ttlSeconds: 60,
+    });
+    const result = await verifyToken(SECRET, raw);
+    if ("error" in result) throw new Error("unreachable");
+    expect(result.claims.cap).toBeUndefined();
+  });
+
+  it("omits the claim when capUsd is exactly 0 (no cap = no claim)", async () => {
+    // 0 means "no cap" by contract. Same convention as ttlSeconds=0 and
+    // empty machine string — silent no-op rather than a thrown error.
+    const raw = await issueToken(SECRET, {
+      tokenId: "token-cap-3",
+      provider: "openai",
+      scopes: ["*"],
+      label: "x",
+      ttlSeconds: 60,
+      capUsd: 0,
+    });
+    const result = await verifyToken(SECRET, raw);
+    if ("error" in result) throw new Error("unreachable");
+    expect(result.claims.cap).toBeUndefined();
+  });
+
+  it("issueToken throws on a negative cap", async () => {
+    await expect(
+      issueToken(SECRET, {
+        tokenId: "token-cap-neg",
+        provider: "openai",
+        scopes: ["*"],
+        label: "x",
+        ttlSeconds: 60,
+        capUsd: -1,
+      }),
+    ).rejects.toThrow(/positive finite/);
+  });
+
+  it("issueToken throws on NaN / Infinity cap", async () => {
+    await expect(
+      issueToken(SECRET, {
+        tokenId: "token-cap-nan",
+        provider: "openai",
+        scopes: ["*"],
+        label: "x",
+        ttlSeconds: 60,
+        capUsd: Number.NaN,
+      }),
+    ).rejects.toThrow(/positive finite/);
+    await expect(
+      issueToken(SECRET, {
+        tokenId: "token-cap-inf",
+        provider: "openai",
+        scopes: ["*"],
+        label: "x",
+        ttlSeconds: 60,
+        capUsd: Number.POSITIVE_INFINITY,
+      }),
+    ).rejects.toThrow(/positive finite/);
+  });
+
+  /**
+   * Same forging-via-secret pattern as the mdl/mch validation tests: a
+   * hand-crafted JWT with an invalid cap shape would otherwise sneak past
+   * the cap check (which only fires on `cap > 0`). verifyToken must
+   * reject the token outright.
+   */
+  async function signRawCap(payload: Record<string, unknown>): Promise<string> {
+    const key = new TextEncoder().encode(SECRET);
+    const jwt = await new SignJWT(payload)
+      .setProtectedHeader({ alg: "HS256" })
+      .setIssuer("keybroker")
+      .setSubject("token-cap-malformed")
+      .setJti("token-cap-malformed")
+      .setIssuedAt()
+      .sign(key);
+    return TOKEN_PREFIX + jwt;
+  }
+
+  it("rejects cap that is not a number (string)", async () => {
+    const raw = await signRawCap({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      cap: "1.50",
+    });
+    expect(await verifyToken(SECRET, raw)).toEqual({ error: "malformed_claims" });
+  });
+
+  it("rejects cap = 0 hand-crafted (issueToken won't produce it; reject on verify too)", async () => {
+    // The cap-enforcement branch only fires when cap > 0. A `cap: 0`
+    // token would silently disable the broker's check while looking
+    // capped. Reject it on verify so the only path to "no cap" is to
+    // not have the claim at all.
+    const raw = await signRawCap({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      cap: 0,
+    });
+    expect(await verifyToken(SECRET, raw)).toEqual({ error: "malformed_claims" });
+  });
+
+  it("rejects cap that is negative", async () => {
+    const raw = await signRawCap({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      cap: -5,
+    });
+    expect(await verifyToken(SECRET, raw)).toEqual({ error: "malformed_claims" });
+  });
+
+  it("rejects cap that is NaN / Infinity", async () => {
+    // NaN/Infinity break the comparison `cumulative + est > cap`:
+    // `x > NaN` is always false (would always allow); `x > Infinity` is
+    // always false (also always allow). Either bypasses enforcement.
+    const rawNaN = await signRawCap({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      cap: Number.NaN,
+    });
+    expect(await verifyToken(SECRET, rawNaN)).toEqual({ error: "malformed_claims" });
+    const rawInf = await signRawCap({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      cap: Number.POSITIVE_INFINITY,
+    });
+    expect(await verifyToken(SECRET, rawInf)).toEqual({ error: "malformed_claims" });
+  });
+});

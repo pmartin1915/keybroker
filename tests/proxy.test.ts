@@ -32,6 +32,24 @@ function makeUpstream(): Promise<{ server: Server; port: number }> {
       let body = "";
       req.on("data", (c) => (body += c));
       req.on("end", () => {
+        // Phase 2.2: when the request path contains "/usage", attach an
+        // OpenAI-shaped `usage` object so the broker's post-call parser
+        // has something to reconcile. Token counts come from the JSON
+        // body if present (`upstream_usage: { in, out }`), defaulting to
+        // a small constant so the actual cost is non-zero but tiny.
+        let usage: { prompt_tokens: number; completion_tokens: number } | undefined;
+        if (req.url?.includes("/usage")) {
+          let inTok = 100;
+          let outTok = 50;
+          try {
+            const parsed = body ? (JSON.parse(body) as { upstream_usage?: { in?: number; out?: number } }) : undefined;
+            if (parsed?.upstream_usage?.in !== undefined) inTok = parsed.upstream_usage.in;
+            if (parsed?.upstream_usage?.out !== undefined) outTok = parsed.upstream_usage.out;
+          } catch {
+            // body wasn't JSON; use defaults
+          }
+          usage = { prompt_tokens: inTok, completion_tokens: outTok };
+        }
         res.setHeader("content-type", "application/json");
         res.end(
           JSON.stringify({
@@ -39,6 +57,7 @@ function makeUpstream(): Promise<{ server: Server; port: number }> {
             url: req.url,
             authorization: req.headers["authorization"] ?? null,
             body: body || null,
+            ...(usage ? { usage } : {}),
           }),
         );
       });
@@ -63,6 +82,7 @@ async function mintToken(opts: {
   revoked?: boolean;
   models?: string[];
   machine?: string;
+  capUsd?: number;
 }): Promise<{ id: string; jwt: string }> {
   const id = newTokenId();
   const provider = opts.provider ?? "echo";
@@ -81,6 +101,7 @@ async function mintToken(opts: {
     revoked: opts.revoked ?? false,
   };
   if (opts.machine !== undefined) rec.machine = opts.machine;
+  if (opts.capUsd !== undefined) rec.capUsd = opts.capUsd;
   store.putToken(rec);
   const jwt = await issueToken(config.jwtSecret, {
     tokenId: id,
@@ -90,6 +111,7 @@ async function mintToken(opts: {
     ttlSeconds: ttl,
     models: opts.models,
     machine: opts.machine,
+    capUsd: opts.capUsd,
   });
   return { id, jwt };
 }
@@ -574,6 +596,206 @@ describe("proxy: machine attribution (Phase 2.3)", () => {
     // Beta and gamma are unaffected.
     expect((await callOnce(b.jwt, "still-beta")).status).toBe(200);
     expect((await callOnce(c.jwt, "still-gamma")).status).toBe(200);
+  });
+});
+
+describe("proxy: USD cap enforcement (Phase 2.2)", () => {
+  // Reference price for gpt-4o-mini at the time of writing: $0.15 input /
+  // $0.60 output per 1M tokens. With max_tokens=1000 and our conservative
+  // input=0 default, the pre-flight estimate is 0.001 * 0.6 = $0.0006.
+  // Any cap >= $0.001 lets the call through; a cap below that blocks it.
+  const ESTIMATE_PER_K_OUT_TOKENS = 0.0006;
+
+  it("allows a call whose estimated cost fits under the cap (200 + estimatedCostUsd recorded)", async () => {
+    const { id, jwt } = await mintToken({
+      scopes: ["*"],
+      capUsd: 0.5, // generous
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "gpt-4o-mini", max_tokens: 1000 }),
+    });
+    expect(res.status).toBe(200);
+    const recent = store.recentCalls({ limit: 5, tokenId: id });
+    const ok = recent.find((e) => e.outcome === "ok");
+    expect(ok?.estimatedCostUsd).toBeCloseTo(ESTIMATE_PER_K_OUT_TOKENS, 6);
+  });
+
+  it("denies 403 cap_exceeded_estimate when the pre-flight estimate exceeds the cap", async () => {
+    // gpt-4o output is $10/M; max_tokens=1_000_000 → estimate $10. A cap
+    // of $1 must refuse this call before it reaches upstream.
+    const { id, jwt } = await mintToken({
+      scopes: ["*"],
+      capUsd: 1,
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "gpt-4o", max_tokens: 1_000_000 }),
+    });
+    expect(res.status).toBe(403);
+    expect(await jsonError(res)).toBe("cap_exceeded_estimate");
+    // Acceptance: the audit log records the attempted model (so an
+    // operator can see what the caller tried to spend on).
+    const recent = store.recentCalls({ limit: 5, tokenId: id });
+    const denial = recent.find(
+      (e) => e.outcome === "denied" && e.reason === "cap_exceeded_estimate",
+    );
+    expect(denial?.requestedModel).toBe("gpt-4o");
+  });
+
+  it("does not consume a quota slot when the request is denied for cap", async () => {
+    // Mirror of the Phase 2.1 'denied requests don't burn quota' invariant.
+    const { id, jwt } = await mintToken({
+      scopes: ["*"],
+      capUsd: 0.0001,
+      maxCalls: 1,
+    });
+    const r1 = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "gpt-4o", max_tokens: 1000 }),
+    });
+    expect(r1.status).toBe(403);
+    const tokenRow = store.listTokens().find((t) => t.id === id);
+    // The single quota slot survives the denial.
+    expect(tokenRow?.remaining).toBe(1);
+  });
+
+  it("denies 403 cap_unpriced_model when the model is not in the pricing table", async () => {
+    // A capped token sending a model the broker can't price must be
+    // refused — silently passing through would mean cap accounting
+    // contributes nothing, effectively disabling the cap.
+    const { jwt } = await mintToken({
+      scopes: ["*"],
+      capUsd: 1,
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "totally-fake-model", max_tokens: 100 }),
+    });
+    expect(res.status).toBe(403);
+    expect(await jsonError(res)).toBe("cap_unpriced_model");
+  });
+
+  it("denies 403 cap_unpriced_model when the body has no model field", async () => {
+    const { jwt } = await mintToken({
+      scopes: ["*"],
+      capUsd: 1,
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ max_tokens: 100 }), // no model field
+    });
+    expect(res.status).toBe(403);
+    expect(await jsonError(res)).toBe("cap_unpriced_model");
+  });
+
+  it("token without cap claim is unaffected (back-compat with pre-2.2 tokens)", async () => {
+    const { id, jwt } = await mintToken({ scopes: ["*"] });
+    const res = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "gpt-4o", max_tokens: 1_000_000 }),
+    });
+    expect(res.status).toBe(200);
+    // Audit entry is written; estimatedCostUsd is undefined because no
+    // cap was set (we only compute the estimate when a cap fires).
+    const recent = store.recentCalls({ limit: 5, tokenId: id });
+    const ok = recent.find((e) => e.outcome === "ok");
+    expect(ok?.estimatedCostUsd).toBeUndefined();
+  });
+
+  it("post-call usage parse: actualCostUsd is reconciled when upstream returns usage", async () => {
+    const { id, jwt } = await mintToken({
+      scopes: ["*"],
+      capUsd: 1,
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/chat/completions/usage`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        max_tokens: 1000,
+        upstream_usage: { in: 1_000_000, out: 1_000_000 },
+      }),
+    });
+    expect(res.status).toBe(200);
+    // Wait for the streamed-finish handler to flush its appendCall.
+    // finished(counter) fires asynchronously after reply.send(), so a
+    // tiny tick is needed before recentCalls sees the row.
+    await new Promise((r) => setTimeout(r, 50));
+    const recent = store.recentCalls({ limit: 5, tokenId: id });
+    const ok = recent.find((e) => e.outcome === "ok");
+    expect(ok?.estimatedCostUsd).toBeDefined();
+    // Reconciled actual: 1M input * $0.15 + 1M output * $0.60 = $0.75.
+    expect(ok?.actualCostUsd).toBeCloseTo(0.75, 4);
+  });
+
+  it("acceptance: cap of $0.50, two priced calls — second is denied when cumulative would exceed", async () => {
+    // Roadmap acceptance criterion for Phase 2.2: caps decrement across
+    // calls. We use the post-call actual ($0.30 each via the upstream
+    // usage stub) so both calls land. After two calls cumulative = $0.60
+    // which exceeds $0.50; the third call's pre-flight ($0.0006) plus
+    // cumulative ($0.60) > cap ($0.50), so it's denied.
+    const { id, jwt } = await mintToken({
+      scopes: ["*"],
+      capUsd: 0.5,
+    });
+    const callOnce = () =>
+      fetch(`${brokerOrigin}/echo/v1/chat/completions/usage`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          max_tokens: 100,
+          // 1M input * $0.15 + 250k output * $0.60 = $0.30
+          upstream_usage: { in: 1_000_000, out: 250_000 },
+        }),
+      });
+
+    const r1 = await callOnce();
+    expect(r1.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 50));
+    const r2 = await callOnce();
+    expect(r2.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 50));
+    // Cumulative is now ~$0.60 from the two reconciled actuals. A third
+    // call's pre-flight estimate plus cumulative exceeds the $0.50 cap.
+    const r3 = await callOnce();
+    expect(r3.status).toBe(403);
+    expect(await jsonError(r3)).toBe("cap_exceeded_estimate");
+
+    // The third (denied) call did not contribute to spend.
+    const spend = store.sumCostUsdByToken(id);
+    expect(spend).toBeCloseTo(0.6, 4);
   });
 });
 

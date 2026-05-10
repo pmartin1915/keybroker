@@ -55,6 +55,7 @@ function tokenRec(overrides: Partial<TokenRecord> = {}): TokenRecord {
     label: overrides.label ?? "test",
     revoked: overrides.revoked ?? false,
     ...(overrides.machine !== undefined ? { machine: overrides.machine } : {}),
+    ...(overrides.capUsd !== undefined ? { capUsd: overrides.capUsd } : {}),
   };
 }
 
@@ -73,6 +74,12 @@ function callRec(overrides: Partial<CallLogEntry> = {}): CallLogEntry {
     outcome: overrides.outcome ?? "ok",
     ...(overrides.reason !== undefined ? { reason: overrides.reason } : {}),
     ...(overrides.machine !== undefined ? { machine: overrides.machine } : {}),
+    ...(overrides.estimatedCostUsd !== undefined
+      ? { estimatedCostUsd: overrides.estimatedCostUsd }
+      : {}),
+    ...(overrides.actualCostUsd !== undefined
+      ? { actualCostUsd: overrides.actualCostUsd }
+      : {}),
   };
 }
 
@@ -298,6 +305,83 @@ for (const { name, make } of STORES) {
         expect(r.map((c) => c.path)).toEqual(["/a"]);
       });
     });
+
+    describe("USD cost accounting (Phase 2.2)", () => {
+      it("putToken + getToken preserves the optional capUsd field", () => {
+        store.putToken(tokenRec({ id: "with-cap", capUsd: 2.5 }));
+        expect(store.getToken("with-cap")?.capUsd).toBe(2.5);
+      });
+
+      it("putToken + getToken keeps capUsd undefined when absent", () => {
+        store.putToken(tokenRec({ id: "no-cap" }));
+        expect(store.getToken("no-cap")?.capUsd).toBeUndefined();
+      });
+
+      it("appendCall + recentCalls round-trip both cost columns", () => {
+        store.appendCall(
+          callRec({
+            tokenId: "t",
+            estimatedCostUsd: 0.12,
+            actualCostUsd: 0.15,
+          }),
+        );
+        const [only] = store.recentCalls({ limit: 1 });
+        expect(only?.estimatedCostUsd).toBeCloseTo(0.12, 6);
+        expect(only?.actualCostUsd).toBeCloseTo(0.15, 6);
+      });
+
+      it("appendCall + recentCalls keeps cost columns undefined when absent", () => {
+        // Round-trip parity with logging.ts: optional columns must not
+        // get coerced to 0. A missing actualCostUsd means "we never got
+        // upstream usage" — distinct from "the call was free".
+        store.appendCall(callRec({ tokenId: "t" }));
+        const [only] = store.recentCalls({ limit: 1 });
+        expect(only?.estimatedCostUsd).toBeUndefined();
+        expect(only?.actualCostUsd).toBeUndefined();
+      });
+
+      it("sumCostUsdByToken returns 0 for a token with no calls", () => {
+        expect(store.sumCostUsdByToken("nope")).toBe(0);
+      });
+
+      it("sumCostUsdByToken prefers actualCostUsd over estimatedCostUsd", () => {
+        // The 'ok' call's actual ($0.30) wins over its estimate ($0.50).
+        // The 'error' call has no actual so its estimate ($0.10) is used.
+        // Cumulative = 0.30 + 0.10 = 0.40.
+        store.appendCall(
+          callRec({ tokenId: "t", outcome: "ok", estimatedCostUsd: 0.5, actualCostUsd: 0.3 }),
+        );
+        store.appendCall(
+          callRec({ tokenId: "t", outcome: "error", estimatedCostUsd: 0.1 }),
+        );
+        expect(store.sumCostUsdByToken("t")).toBeCloseTo(0.4, 6);
+      });
+
+      it("sumCostUsdByToken excludes denied calls (they never hit upstream)", () => {
+        // A capped token that's denied for cap_exceeded_estimate must NOT
+        // accumulate spend — otherwise the deny itself would push the
+        // token closer to the cap, locking it out permanently.
+        store.appendCall(
+          callRec({ tokenId: "t", outcome: "ok", estimatedCostUsd: 0.2, actualCostUsd: 0.2 }),
+        );
+        store.appendCall(
+          callRec({
+            tokenId: "t",
+            outcome: "denied",
+            reason: "cap_exceeded_estimate",
+            estimatedCostUsd: 0.5,
+          }),
+        );
+        expect(store.sumCostUsdByToken("t")).toBeCloseTo(0.2, 6);
+      });
+
+      it("sumCostUsdByToken filters by tokenId", () => {
+        store.appendCall(callRec({ tokenId: "a", actualCostUsd: 0.1 }));
+        store.appendCall(callRec({ tokenId: "b", actualCostUsd: 0.9 }));
+        expect(store.sumCostUsdByToken("a")).toBeCloseTo(0.1, 6);
+        expect(store.sumCostUsdByToken("b")).toBeCloseTo(0.9, 6);
+      });
+    });
   });
 }
 
@@ -424,6 +508,101 @@ describe("SqliteStore: idempotent machine-column migration (Phase 2.3)", () => {
       const again = new SqliteStore(dbPath);
       try {
         expect(again.getToken("new-t")?.machine).toBe("perrypc");
+      } finally {
+        again.close?.();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("SqliteStore: idempotent cost-column migration (Phase 2.2)", () => {
+  it("adds the cost columns to a pre-2.2 schema without data loss", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const dir = mkdtempSync(join(tmpdir(), "kb-mig22-"));
+    const dbPath = join(dir, "store.db");
+    try {
+      // Hand-craft a Phase 2.3 schema (machine columns present, cost
+      // columns absent) and seed each table.
+      const old = new DatabaseSync(dbPath);
+      old.exec(`
+        CREATE TABLE tokens (
+          id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          scopes TEXT NOT NULL,
+          remaining INTEGER NOT NULL,
+          used INTEGER NOT NULL DEFAULT 0,
+          expires_at INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          label TEXT NOT NULL DEFAULT 'unlabeled',
+          revoked INTEGER NOT NULL DEFAULT 0,
+          machine TEXT
+        ) WITHOUT ROWID;
+        CREATE TABLE calls (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL,
+          token_id TEXT NOT NULL,
+          label TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          method TEXT NOT NULL,
+          path TEXT NOT NULL,
+          status INTEGER NOT NULL,
+          duration_ms INTEGER NOT NULL,
+          req_bytes INTEGER NOT NULL,
+          resp_bytes INTEGER NOT NULL,
+          outcome TEXT NOT NULL,
+          reason TEXT,
+          requested_model TEXT,
+          machine TEXT
+        );
+      `);
+      old
+        .prepare(
+          `INSERT INTO tokens (id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("legacy-t", "echo", '["*"]', 5, 0, 0, "2026-01-01T00:00:00.000Z", "old", 0, "perrypc");
+      old
+        .prepare(
+          `INSERT INTO calls (ts, token_id, label, provider, method, path, status, duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("2026-01-01T00:00:00.000Z", "legacy-t", "old", "echo", "POST", "/v1/x", 200, 1, 0, 0, "ok", null, null, "perrypc");
+      old.close();
+
+      const s = new SqliteStore(dbPath);
+      try {
+        // Existing data survived; new columns are null on legacy rows.
+        const t = s.getToken("legacy-t");
+        expect(t?.machine).toBe("perrypc");
+        expect(t?.capUsd).toBeUndefined();
+        const calls = s.recentCalls({ limit: 10 });
+        expect(calls.length).toBe(1);
+        expect(calls[0]?.estimatedCostUsd).toBeUndefined();
+        expect(calls[0]?.actualCostUsd).toBeUndefined();
+
+        // sumCostUsdByToken on a legacy-only token returns 0 (NULL costs
+        // contribute nothing) — the cap accounting still works after the
+        // migration even before any post-2.2 calls land.
+        expect(s.sumCostUsdByToken("legacy-t")).toBe(0);
+
+        // New writes can use the new fields.
+        s.putToken(tokenRec({ id: "new-t", capUsd: 1.5 }));
+        s.appendCall(
+          callRec({ tokenId: "new-t", estimatedCostUsd: 0.04, actualCostUsd: 0.05 }),
+        );
+        expect(s.getToken("new-t")?.capUsd).toBe(1.5);
+        expect(s.sumCostUsdByToken("new-t")).toBeCloseTo(0.05, 6);
+      } finally {
+        s.close?.();
+      }
+
+      // Re-open: migrate() must be a no-op on an already-migrated DB.
+      const again = new SqliteStore(dbPath);
+      try {
+        expect(again.getToken("new-t")?.capUsd).toBe(1.5);
+        expect(again.sumCostUsdByToken("new-t")).toBeCloseTo(0.05, 6);
       } finally {
         again.close?.();
       }

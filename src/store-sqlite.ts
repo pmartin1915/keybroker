@@ -20,6 +20,7 @@ interface TokenRow {
   label: string;
   revoked: number;
   machine: string | null;
+  cap_usd: number | null;
 }
 
 interface SecretRow {
@@ -43,6 +44,8 @@ interface CallRow {
   reason: string | null;
   requested_model: string | null;
   machine: string | null;
+  estimated_cost_usd: number | null;
+  actual_cost_usd: number | null;
 }
 
 const SCHEMA = `
@@ -62,7 +65,8 @@ CREATE TABLE IF NOT EXISTS tokens (
   created_at TEXT NOT NULL,
   label TEXT NOT NULL DEFAULT 'unlabeled',
   revoked INTEGER NOT NULL DEFAULT 0,
-  machine TEXT
+  machine TEXT,
+  cap_usd REAL
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS calls (
@@ -80,7 +84,9 @@ CREATE TABLE IF NOT EXISTS calls (
   outcome TEXT NOT NULL,
   reason TEXT,
   requested_model TEXT,
-  machine TEXT
+  machine TEXT,
+  estimated_cost_usd REAL,
+  actual_cost_usd REAL
 );
 
 CREATE INDEX IF NOT EXISTS calls_token_id_idx ON calls(token_id);
@@ -108,6 +114,7 @@ export class SqliteStore implements StoreLike {
     selectCallsByToken: StatementSync;
     selectCallsByMachine: StatementSync;
     selectCallsByTokenAndMachine: StatementSync;
+    sumCostByToken: StatementSync;
   };
 
   constructor(path: string) {
@@ -147,8 +154,8 @@ export class SqliteStore implements StoreLike {
         `SELECT provider, created_at FROM secrets ORDER BY provider`,
       ),
       putToken: this.db.prepare(
-        `INSERT INTO tokens (id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO tokens (id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            provider = excluded.provider,
            scopes = excluded.scopes,
@@ -158,18 +165,19 @@ export class SqliteStore implements StoreLike {
            created_at = excluded.created_at,
            label = excluded.label,
            revoked = excluded.revoked,
-           machine = excluded.machine`,
+           machine = excluded.machine,
+           cap_usd = excluded.cap_usd`,
       ),
       getToken: this.db.prepare(
-        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine
+        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd
          FROM tokens WHERE id = ?`,
       ),
       listTokens: this.db.prepare(
-        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine
+        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd
          FROM tokens ORDER BY created_at`,
       ),
       listTokensByMachine: this.db.prepare(
-        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine
+        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd
          FROM tokens WHERE machine = ? ORDER BY created_at`,
       ),
       // Single-statement atomic check-and-decrement. Returns 1 row updated
@@ -188,19 +196,21 @@ export class SqliteStore implements StoreLike {
       revoke: this.db.prepare(`UPDATE tokens SET revoked = 1 WHERE id = ?`),
       insertCall: this.db.prepare(
         `INSERT INTO calls
-           (ts, token_id, label, provider, method, path, status, duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (ts, token_id, label, provider, method, path, status, duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine, estimated_cost_usd, actual_cost_usd)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       selectCalls: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
-                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine
+                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
+                estimated_cost_usd, actual_cost_usd
          FROM calls
          ORDER BY id DESC
          LIMIT ?`,
       ),
       selectCallsByToken: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
-                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine
+                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
+                estimated_cost_usd, actual_cost_usd
          FROM calls
          WHERE token_id = ?
          ORDER BY id DESC
@@ -208,7 +218,8 @@ export class SqliteStore implements StoreLike {
       ),
       selectCallsByMachine: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
-                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine
+                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
+                estimated_cost_usd, actual_cost_usd
          FROM calls
          WHERE machine = ?
          ORDER BY id DESC
@@ -216,11 +227,27 @@ export class SqliteStore implements StoreLike {
       ),
       selectCallsByTokenAndMachine: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
-                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine
+                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
+                estimated_cost_usd, actual_cost_usd
          FROM calls
          WHERE token_id = ? AND machine = ?
          ORDER BY id DESC
          LIMIT ?`,
+      ),
+      // Phase 2.2: cumulative spend per token. SUM treats rows whose cost
+      // columns are both NULL as 0, which matches "unpriced model → contributes
+      // nothing". COALESCE picks the actual cost first, falling back to the
+      // estimate so an in-flight call with no upstream usage yet still
+      // counts against the cap. Outcomes are explicitly allowlisted so a
+      // future "did-not-reach-upstream" outcome (e.g. a hypothetical
+      // `rate_limited`) doesn't silently get billed — adding such an
+      // outcome would force whoever does it to update this query
+      // deliberately, instead of relying on a string deny-list match
+      // that would coerce them to zero billing.
+      sumCostByToken: this.db.prepare(
+        `SELECT COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd)), 0) AS total
+         FROM calls
+         WHERE token_id = ? AND outcome IN ('ok', 'error')`,
       ),
     };
   }
@@ -259,6 +286,7 @@ export class SqliteStore implements StoreLike {
       rec.label,
       rec.revoked ? 1 : 0,
       rec.machine ?? null,
+      rec.capUsd ?? null,
     );
   }
 
@@ -319,7 +347,16 @@ export class SqliteStore implements StoreLike {
       entry.reason ?? null,
       entry.requestedModel ?? null,
       entry.machine ?? null,
+      entry.estimatedCostUsd ?? null,
+      entry.actualCostUsd ?? null,
     );
+  }
+
+  sumCostUsdByToken(tokenId: string): number {
+    const row = this.stmts.sumCostByToken.get(tokenId) as
+      | { total: number | null }
+      | undefined;
+    return row?.total ?? 0;
   }
 
   private migrate(db: DatabaseSync): void {
@@ -330,6 +367,11 @@ export class SqliteStore implements StoreLike {
     addColumnIfMissing(db, "calls", "requested_model", "TEXT");
     addColumnIfMissing(db, "calls", "machine", "TEXT");
     addColumnIfMissing(db, "tokens", "machine", "TEXT");
+    // Phase 2.2: USD cost columns. REAL because dollar amounts have decimals
+    // and SUM() over INTEGER would lose cents on multi-call accounting.
+    addColumnIfMissing(db, "calls", "estimated_cost_usd", "REAL");
+    addColumnIfMissing(db, "calls", "actual_cost_usd", "REAL");
+    addColumnIfMissing(db, "tokens", "cap_usd", "REAL");
     // Indexes for the Phase 2.3 filters. Created post-ALTER so the
     // referenced columns are guaranteed to exist on pre-2.3 DBs that
     // have just been migrated.
@@ -386,6 +428,7 @@ function rowToToken(row: TokenRow): TokenRecord {
     revoked: row.revoked === 1,
   };
   if (row.machine !== null) rec.machine = row.machine;
+  if (row.cap_usd !== null) rec.capUsd = row.cap_usd;
   return rec;
 }
 
@@ -406,6 +449,8 @@ function rowToCall(row: CallRow): CallLogEntry {
   if (row.reason !== null) entry.reason = row.reason;
   if (row.requested_model !== null) entry.requestedModel = row.requested_model;
   if (row.machine !== null) entry.machine = row.machine;
+  if (row.estimated_cost_usd !== null) entry.estimatedCostUsd = row.estimated_cost_usd;
+  if (row.actual_cost_usd !== null) entry.actualCostUsd = row.actual_cost_usd;
   return entry;
 }
 

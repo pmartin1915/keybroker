@@ -21,6 +21,16 @@ export interface BrokerClaims extends JWTPayload {
    * pre-2.3 tokens still verify; the broker NEVER enforces presence.
    */
   mch?: string;
+  /**
+   * Phase 2.2: per-token absolute USD cap. Optional; when set the broker
+   * estimates each call's cost from `model + max_tokens` and refuses any
+   * request that would push the token's cumulative spend above this value.
+   * Spend is computed on demand from the audit log. `cap` is dollars (with
+   * decimals); 0 / missing = no cap. issueToken refuses non-positive caps
+   * and verifyToken rejects malformed claims (non-number / non-finite /
+   * negative / zero) so a hand-crafted JWT cannot disable enforcement.
+   */
+  cap?: number;
 }
 
 export const TOKEN_PREFIX = "brk_";
@@ -38,6 +48,8 @@ export async function issueToken(
     models?: string[];
     /** Optional machine identifier (typically os.hostname()). Empty/undefined → no claim. */
     machine?: string;
+    /** Optional per-token USD cap. Must be > 0 and finite; 0/undefined → no cap. */
+    capUsd?: number;
   },
 ): Promise<string> {
   const key = new TextEncoder().encode(secret);
@@ -51,6 +63,22 @@ export async function issueToken(
   }
   if (args.machine && args.machine.length > 0) {
     payload.mch = args.machine;
+  }
+  if (args.capUsd !== undefined && args.capUsd !== 0) {
+    if (
+      typeof args.capUsd !== "number" ||
+      !Number.isFinite(args.capUsd) ||
+      args.capUsd < 0
+    ) {
+      // Issue-time guard: a negative / non-finite cap would either
+      // disable enforcement (negative shifts every comparison true) or
+      // break the comparison (NaN/Infinity). 0 and undefined both mean
+      // "no cap" by contract — let those through silently as a no-op.
+      throw new Error(
+        `issueToken: capUsd must be a positive finite number (got ${String(args.capUsd)})`,
+      );
+    }
+    payload.cap = args.capUsd;
   }
   const builder = new SignJWT(payload)
     .setProtectedHeader({ alg: "HS256" })
@@ -89,6 +117,17 @@ export async function verifyToken(
       claims.mch !== undefined &&
       (typeof claims.mch !== "string" || claims.mch.length === 0)
     ) {
+      return { error: "malformed_claims" };
+    }
+    if (
+      claims.cap !== undefined &&
+      (typeof claims.cap !== "number" ||
+        !Number.isFinite(claims.cap) ||
+        claims.cap <= 0)
+    ) {
+      // Symmetry with the issue-time guard. A hand-crafted JWT with
+      // `cap: 0` or `cap: -1` could otherwise sneak past the cap check
+      // (which only fires on `cap !== undefined && cap > 0`).
       return { error: "malformed_claims" };
     }
     return { tokenId: claims.jti, claims };

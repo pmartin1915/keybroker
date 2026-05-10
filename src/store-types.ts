@@ -32,6 +32,14 @@ export interface TokenRecord {
    * filter without decoding every JWT.
    */
   machine?: string;
+  /**
+   * Phase 2.2: USD cap recorded at issue time. Optional. The broker enforces
+   * caps from the JWT `cap` claim, NOT from this column — this is purely for
+   * `keybroker token list` display. Keeping the truth in the JWT means a
+   * stale TokenRecord (e.g. from a partial restore) cannot loosen
+   * enforcement, only mis-display.
+   */
+  capUsd?: number;
 }
 
 export type ConsumeResult =
@@ -73,6 +81,15 @@ export interface StoreLike {
   // calls (audit trail)
   appendCall(entry: CallLogEntry): void;
   recentCalls(opts: RecentCallsOptions): CallLogEntry[];
+  /**
+   * Phase 2.2: return the cumulative USD spend attributable to this token,
+   * computed as `actualCostUsd ?? estimatedCostUsd` summed over every
+   * audit entry whose outcome is not `denied` (denied calls did not reach
+   * upstream, so they have no spend). Returns 0 when no priced calls
+   * exist. Used to evaluate per-token caps on the request hot path —
+   * keep it cheap (an indexed sum, not a full table scan).
+   */
+  sumCostUsdByToken(tokenId: string): number;
   /** Optional close hook (SQLite handle, etc.). */
   close?(): void;
 }

@@ -27,4 +27,18 @@ export interface CallLogEntry {
    * Absent on calls made with pre-2.3 tokens that have no claim.
    */
   machine?: string;
+  /**
+   * Phase 2.2: pre-flight USD cost estimate for this call (when the token has
+   * a cap, OR when the model is priced and the operator wants visibility).
+   * Computed from `pricing.estimateCostUsd(model, maxTokens)`. Absent for
+   * unpriced models or for calls denied before the cap branch fires.
+   */
+  estimatedCostUsd?: number;
+  /**
+   * Phase 2.2: actual USD cost reconciled from upstream `usage`. Absent when
+   * the upstream did not return usage (e.g. SSE without
+   * `stream_options.include_usage`, or the echo provider in tests). When
+   * absent, treat `estimatedCostUsd` as the spend for cap accounting.
+   */
+  actualCostUsd?: number;
 }

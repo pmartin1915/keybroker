@@ -98,25 +98,47 @@ nothing else." Right now scope only constrains method+path.
   `model_not_allowed` for any other model, with the attempted model in
   the audit log.
 
-### 2.2 Dollar spend caps
+### 2.2 Dollar spend caps  ✅ shipped 2026-05-09
 
-The `gemini-3-pro-preview` $900 incident is exactly what this prevents.
+Shipped form differs from the original sketch — see HANDOFF-2026-05-09-phase-2-2.md.
 
-- New token claim `spd: { limit_usd: 5.00, used_usd: 0 }`.
-- After the upstream response returns, parse `usage` (OpenAI/Anthropic both
-  return token counts), look up per-model pricing from a config file, add
-  to `used_usd` in a single atomic update.
-- Streaming responses: parse usage from the *final* SSE event (OpenAI
-  emits `[DONE]` preceded by a usage event when `stream_options.include_usage:
-  true` is set; broker can inject that flag).
-- Hard limit: refuse to start a request that would push `used_usd` over
-  `limit_usd` even with the *minimum* possible response cost (estimate from
-  `max_tokens`).
-- Soft limit: warn at 80%, log at 100%.
-- Pricing source: hardcoded `src/pricing.ts` table, updated by hand. (A
-  remote price feed is a "real product" feature, not a guardrail feature.)
-- **Done when:** a `--max-spend 0.50` token can make many cheap calls but
-  is rejected the moment a single call would push it past the cap.
+**As shipped:**
+- Token claim is a flat `cap?: number` (USD) on `BrokerClaims`. Spend is
+  computed *on demand* from the audit log (`SUM(actual ?? estimate)` over
+  `outcome IN ('ok', 'error')`) rather than denormalized onto the token row,
+  so the same claim shape works across machines without a token-row sync.
+- Per-call audit gains `estimated_cost_usd` and `actual_cost_usd` REAL columns.
+- Pre-flight: `pricing.estimateOutputCostUsd(model, max_tokens)` — explicitly
+  output-only because the broker has no tokenizer. With a cap set, an
+  unpriced model is denied `cap_unpriced_model` and a deny on the
+  cumulative+estimate comparison is `cap_exceeded_estimate`.
+- Post-call: 256KB tail buffer + `pricing.parseUsageFromUpstream` handles
+  buffered JSON and SSE for both OpenAI and Anthropic shapes.
+- Soft limits (warn at 80% / log at 100%) **not shipped** — neither was
+  actually called for in the original brief once we had the structured
+  `estimated_cost_usd` / `actual_cost_usd` columns. Operators can pull
+  spend from the audit log directly.
+- `stream_options.include_usage: true` injection **not shipped**. The proxy
+  is content-agnostic; injecting client-visible fields would change request
+  semantics. If a client wants reconciled actuals on streamed calls, they
+  request usage themselves.
+
+**Known limitations (Phase 4 hardening):**
+- **TOCTOU on the cap check.** `sumCostUsdByToken(tokenId)` and the
+  subsequent `appendCall` are not wrapped in a transaction, so two
+  parallel requests can both pass the cap check before either's spend
+  lands. Overrun bound: `inflight × per-call estimate`. SQLite WAL +
+  busy_timeout gives concurrency without the lock chain that would
+  serialize the cap check. Acceptable for personal-fleet posture; a
+  serializable transaction wrapping check + initial appendCall would
+  close it cleanly when needed.
+- **Pre-flight is output-only.** `inputTokens=0` default means the cap
+  fires only on the `max_tokens × output_price` ceiling. Operators
+  must pad caps for input-heavy calls; reconciliation post-call uses
+  real input/output counts. A future Phase that brings in a tokenizer
+  can flip the default and rename `estimateOutputCostUsd` →
+  `estimateCostUsd`.
+- **Mid-stream kill on overrun** explicitly deferred (Phase 4).
 
 ### 2.3 Per-machine attribution
 

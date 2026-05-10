@@ -259,6 +259,14 @@ token
     "--machine <name>",
     "machine to attribute the token to (defaults to os.hostname()). Pass --machine '' to omit the claim.",
   )
+  .option(
+    "--cap-usd <n>",
+    "absolute USD spend cap for this token. The broker's pre-flight estimate is " +
+      "OUTPUT-ONLY (model + max_tokens) — the broker has no tokenizer so input cost " +
+      "is reconciled only post-call from upstream usage. Long-context or input-heavy " +
+      "calls can exceed the cap before the broker notices; pad the cap accordingly. " +
+      "Decimals allowed (e.g. 0.50). Omit / 0 = no cap.",
+  )
   .action(
     async (opts: {
       provider: string;
@@ -268,6 +276,7 @@ token
       label: string;
       model?: string[];
       machine?: string;
+      capUsd?: string;
     }) => {
       const provSpec = getProvider(opts.provider);
       if (!provSpec) {
@@ -299,6 +308,21 @@ token
           : opts.machine === ""
             ? undefined
             : opts.machine;
+      // Phase 2.2: validate up front so a typo'd --cap-usd doesn't yield
+      // a token with no cap silently. Empty / 0 / missing = no cap (the
+      // broker treats `cap` as absent in all three cases).
+      let capUsd: number | undefined;
+      if (opts.capUsd !== undefined && opts.capUsd !== "") {
+        const n = Number(opts.capUsd);
+        if (!Number.isFinite(n) || n < 0) {
+          console.error(
+            `invalid --cap-usd value: ${opts.capUsd} (expected a non-negative finite number)`,
+          );
+          process.exitCode = 1;
+          return;
+        }
+        if (n > 0) capUsd = n;
+      }
       const rec: TokenRecord = {
         id,
         provider: opts.provider,
@@ -311,6 +335,7 @@ token
         revoked: false,
       };
       if (machine !== undefined) rec.machine = machine;
+      if (capUsd !== undefined) rec.capUsd = capUsd;
       store.putToken(rec);
       const jwt = await issueToken(cfg.jwtSecret, {
         tokenId: id,
@@ -320,12 +345,14 @@ token
         ttlSeconds: ttl,
         models,
         machine,
+        capUsd,
       });
       console.log(jwt);
       const modelSummary = models ? `, models: ${models.join(", ")}` : "";
       const machineSummary = machine ? `, machine: ${machine}` : "";
+      const capSummary = capUsd !== undefined ? `, cap: $${capUsd.toFixed(2)}` : "";
       console.error(
-        `\nissued token ${id} for ${opts.provider} (scope: ${opts.scope.join(", ")}, max-calls: ${max}, ttl: ${ttl}s${modelSummary}${machineSummary})`,
+        `\nissued token ${id} for ${opts.provider} (scope: ${opts.scope.join(", ")}, max-calls: ${max}, ttl: ${ttl}s${modelSummary}${machineSummary}${capSummary})`,
       );
     },
   );
@@ -356,8 +383,14 @@ token
             ? "EXHAUSTED"
             : "active";
       const mach = t.machine ? `  machine=${t.machine}` : "";
+      // Phase 2.2: when a cap is set, display "spent=$X / cap=$Y" so the
+      // operator can eyeball remaining budget without hitting the audit
+      // log. Spend is the same on-demand sum the cap check uses.
+      const cap = t.capUsd !== undefined
+        ? `  spent=$${store.sumCostUsdByToken(t.id).toFixed(4)}/cap=$${t.capUsd.toFixed(2)}`
+        : "";
       console.log(
-        `${t.id}  ${t.provider.padEnd(10)}  ${status.padEnd(9)}  used=${t.used}  remaining=${t.remaining}  expires=${exp}  label=${t.label}${mach}`,
+        `${t.id}  ${t.provider.padEnd(10)}  ${status.padEnd(9)}  used=${t.used}  remaining=${t.remaining}  expires=${exp}  label=${t.label}${mach}${cap}`,
       );
     }
   });
