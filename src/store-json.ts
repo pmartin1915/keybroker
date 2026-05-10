@@ -154,11 +154,6 @@ export class JsonStore implements StoreLike {
       try {
         const e = JSON.parse(l) as CallLogEntry;
         if (e.tokenId !== tokenId) continue;
-        // Allowlist (mirrors the SqliteStore SUM query): only outcomes
-        // that actually consumed upstream resources count toward spend.
-        // A future "did-not-reach-upstream" outcome would NOT get
-        // silently billed — it would simply not contribute, forcing the
-        // person who adds it to update this list deliberately.
         if (e.outcome !== "ok" && e.outcome !== "error") continue;
         const cost = e.actualCostUsd ?? e.estimatedCostUsd;
         if (typeof cost === "number" && Number.isFinite(cost)) total += cost;
@@ -167,6 +162,45 @@ export class JsonStore implements StoreLike {
       }
     }
     return total;
+  }
+
+  sumCostUsdSince(ts: string): number {
+    if (!existsSync(this.logsPath)) return 0;
+    const lines = readFileSync(this.logsPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    let total = 0;
+    for (const l of lines) {
+      try {
+        const e = JSON.parse(l) as CallLogEntry;
+        if (e.ts < ts) continue;
+        if (e.outcome !== "ok" && e.outcome !== "error") continue;
+        const cost = e.actualCostUsd ?? e.estimatedCostUsd;
+        if (typeof cost === "number" && Number.isFinite(cost)) total += cost;
+      } catch {
+        // skip malformed lines
+      }
+    }
+    return total;
+  }
+
+  countCallsSince(ts: string): number {
+    if (!existsSync(this.logsPath)) return 0;
+    const lines = readFileSync(this.logsPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    let count = 0;
+    for (const l of lines) {
+      try {
+        const e = JSON.parse(l) as CallLogEntry;
+        if (e.ts >= ts) count++;
+      } catch {
+        // skip malformed lines
+      }
+    }
+    return count;
   }
 
   recentCalls(opts: RecentCallsOptions): CallLogEntry[] {

@@ -90,6 +90,16 @@ export interface StoreLike {
    * keep it cheap (an indexed sum, not a full table scan).
    */
   sumCostUsdByToken(tokenId: string): number;
+  /**
+   * Phase 3.2: return total USD spend across all tokens since ISO timestamp.
+   * Used by the health endpoint for dispatcher integration.
+   */
+  sumCostUsdSince(ts: string): number;
+  /**
+   * Phase 3.2: return total call count across all tokens since ISO timestamp.
+   * Used by the health endpoint for dispatcher integration.
+   */
+  countCallsSince(ts: string): number;
   /** Optional close hook (SQLite handle, etc.). */
   close?(): void;
 }

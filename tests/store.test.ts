@@ -381,6 +381,38 @@ for (const { name, make } of STORES) {
         expect(store.sumCostUsdByToken("a")).toBeCloseTo(0.1, 6);
         expect(store.sumCostUsdByToken("b")).toBeCloseTo(0.9, 6);
       });
+
+      it("sumCostUsdSince returns 0 when no calls in window", () => {
+        expect(store.sumCostUsdSince(new Date().toISOString())).toBe(0);
+      });
+
+      it("sumCostUsdSince sums only calls at or after the timestamp", () => {
+        const oldTs = new Date(Date.now() - 86400000).toISOString();
+        const newTs = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", outcome: "ok", actualCostUsd: 0.1, ts: oldTs }));
+        store.appendCall(callRec({ tokenId: "t", outcome: "ok", actualCostUsd: 0.2, ts: newTs }));
+        expect(store.sumCostUsdSince(newTs)).toBeCloseTo(0.2, 6);
+        expect(store.sumCostUsdSince(oldTs)).toBeCloseTo(0.3, 6);
+      });
+
+      it("sumCostUsdSince excludes denied calls", () => {
+        const ts = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", outcome: "ok", actualCostUsd: 0.1, ts }));
+        store.appendCall(callRec({ tokenId: "t", outcome: "denied", estimatedCostUsd: 0.5, ts }));
+        expect(store.sumCostUsdSince(ts)).toBeCloseTo(0.1, 6);
+      });
+
+      it("countCallsSince returns 0 when no calls in window", () => {
+        expect(store.countCallsSince(new Date().toISOString())).toBe(0);
+      });
+
+      it("countCallsSince counts all calls regardless of outcome", () => {
+        const ts = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", outcome: "ok", ts }));
+        store.appendCall(callRec({ tokenId: "t", outcome: "denied", ts }));
+        store.appendCall(callRec({ tokenId: "t", outcome: "error", ts }));
+        expect(store.countCallsSince(ts)).toBe(3);
+      });
     });
   });
 }

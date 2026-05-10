@@ -36,7 +36,21 @@ export async function buildServer(
   const app = Fastify({ logger: opts.logger ?? { level: "info" } });
   const store: StoreLike = opts.store ?? openStore(config);
 
-  app.get("/health", async () => ({ ok: true }));
+  app.get("/health", async () => {
+    const now = new Date();
+    const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+    const tokens = store.listTokens();
+    const active = tokens.filter((t) => !t.revoked).length;
+    return {
+      ok: true,
+      version: "0.1.0",
+      tokens: { active, revoked: tokens.length - active, total: tokens.length },
+      calls: {
+        last24h: store.countCallsSince(dayAgo),
+        last24hSpendUsd: store.sumCostUsdSince(dayAgo),
+      },
+    };
+  });
 
   app.all<{ Params: { provider: string; "*": string } }>(
     "/:provider/*",

@@ -83,24 +83,41 @@ The echo upstream's response will show you exactly what the broker forwarded, in
 | ----------------- | ------------------------------------------------------------------ |
 | Provider          | Token claims `prv: "openai"` — calling `/anthropic/*` returns 403. |
 | Scope (method+path) | `--scope 'POST:/v1/chat/completions'`. Repeat for multiple. `*` = unrestricted. |
+| Model allowlist   | `--model 'gpt-4o-mini'`. Glob patterns (`gpt-4o*`) supported. 403 if the request body asks for a non-allowed model. |
 | Quota             | `--max-calls N`. Atomic decrement on every call. 0 → 429.          |
+| Spend cap         | `--cap 50` (USD). Pre-flight estimate + post-call reconciliation from the audit log. Denies `cap_exceeded_estimate` or `cap_exceeded`. |
 | Expiry            | `--ttl <seconds>`. JWT `exp` + server-side check.                  |
-| Revocation        | `keybroker token revoke <id>` — server-side flag, takes effect immediately. |
-| Audit             | Every call (allowed or denied) appended to `~/.keybroker/calls.log.jsonl` with token id, label, status, latency, byte counts. |
+| Revocation        | `keybroker token revoke <id>` — server-side flag, takes effect immediately. `revoke-all --machine <name>` for bulk rotation. |
+| Machine           | `--machine` (default `os.hostname()`). Every audit entry carries `mch`. Filter tokens and logs by machine. |
+| Fleet policy      | `~/.keybroker/policy.json`: `forbidden_models` (glob deny-list) + `allowed_providers`. Hot-reloads without restart. |
+| Audit             | Every call (allowed or denied) appended to SQLite `calls` table with token id, label, status, latency, requested model, machine, estimated and actual cost. |
 
 ## Architecture
 
 ```
 your app  ──Authorization: Bearer brk_xxx──►  keybroker  ──Authorization: Bearer sk-real──►  OpenAI
                                                   │
-                                                  ├─ store: ~/.keybroker/store.json
+                                                  ├─ store: ~/.keybroker/store.sqlite
                                                   │   secrets: AES-256-GCM @ master key
-                                                  │   tokens: scopes, quota, expiry, revoked-flag
+                                                  │   tokens: scopes, quota, spend, expiry, revoked-flag, machine
                                                   │
-                                                  └─ audit: ~/.keybroker/calls.log.jsonl
+                                                  └─ audit: SQLite `calls` table (JSONL export available)
 ```
 
-Tokens are HS256 JWTs (`jose`). The broker verifies the signature, then re-checks the server-side record (allowing revocation and atomic quota decrement that JWT alone can't provide).
+Tokens are HS256 JWTs (`jose`). The broker verifies the signature, then re-checks the server-side record (allowing revocation and atomic quota / spend decrement that JWT alone can't provide).
+
+## Control plane prototype
+
+A single-file browser prototype ships in `Prototype.html` (React 18, no build step, localStorage persistence). It demonstrates the FinOps + security narrative with:
+
+- Dashboard with cost attribution by team/project and behavioral anomaly cards
+- Token management with tag-based filtering, issue/revoke, and bulk rotation
+- Audit log with per-call replay (prompt + completion)
+- Fleet policy editor with diff preview
+- Shadow AI scan with secret-leak detection simulation
+- Forecast / burn report showing which tokens and teams hit cap first
+
+Open `Prototype.html` in any modern browser to try it. Data is synthetic and clearly labeled as such.
 
 ## Adding a provider
 
@@ -121,17 +138,23 @@ Then `keybroker secret add mistral` and `keybroker token issue --provider mistra
 
 This is a **prototype** that demonstrates the developer experience. It is **not** production-ready. Specifically:
 
-- **JSON-file storage.** Single-process, no concurrent writers, no WAL, no replication. Fine for a single dev box. Swap for Postgres/SQLite/Redis for anything real.
-- **Master key in plaintext on disk** at `~/.keybroker/config.json`. A real product would use OS keychain (macOS Keychain / Windows DPAPI / `libsecret`) or a KMS.
+- **Master key in plaintext on disk** at `~/.keybroker/config.json`. A real product would use OS keychain (macOS Keychain / Windows DPAPI / `libsecret`) or a KMS. (Phase 1.3)
 - **No authentication on the broker itself.** Anyone who can hit the loopback port can call `secret add` via the CLI (because it reads the same config file). Bind only to `127.0.0.1` (the default), or put the broker behind mTLS.
-- **No streaming proxy.** Responses are buffered in memory before being returned. Streaming completions, file uploads, and large payloads will not work well.
-- **HS256 JWTs.** Symmetric — the same secret signs and verifies. Real deployments should use RS256/EdDSA so verifier-only services can't forge tokens.
-- **No rate limiting beyond `--max-calls`.** No per-second/per-minute limits, no spend caps in dollars, no cost attribution.
-- **No web UI.** CLI only.
-- **Single tenant.** No orgs, no users, no RBAC.
-- **No tests.** Smoke-tested by hand. There is no CI.
+- **No streaming proxy.** Responses are buffered in memory before being returned. Streaming completions, file uploads, and large payloads will not work well. (Phase 1.1 — not yet started)
+- **HS256 JWTs.** Symmetric — the same secret signs and verifies. Real deployments should use RS256/EdDSA so verifier-only services can't forge tokens. (Phase 4)
+- **No per-second rate limiting.** `--max-calls` is a lifetime counter, not a rate limit. No burst protection. (Phase 4)
+- **Single tenant.** No orgs, no users, no RBAC. (Phase 4)
 
 If you ship this to production as-is, you will have a bad time.
+
+**What is already solid:**
+- SQLite backend with atomic transactions (Phase 1.2 ✅)
+- 236 tests, typecheck clean, GitHub Actions CI on Node 22 / Ubuntu + Windows (Phase 1.4 ✅)
+- Per-token model allowlists with glob matching (Phase 2.1 ✅)
+- Dollar spend caps with pre-flight estimates and post-call reconciliation (Phase 2.2 ✅)
+- Per-machine token attribution and bulk revoke-by-machine (Phase 2.3 ✅)
+- Fleet policy with hot reload (Phase 2.4 ✅)
+- Machine-identity normalization contract (`normalizeMachine`) (Phase 3.0 ✅)
 
 ## Roadmap
 

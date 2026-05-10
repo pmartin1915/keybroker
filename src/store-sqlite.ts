@@ -115,6 +115,8 @@ export class SqliteStore implements StoreLike {
     selectCallsByMachine: StatementSync;
     selectCallsByTokenAndMachine: StatementSync;
     sumCostByToken: StatementSync;
+    sumCostSince: StatementSync;
+    countCallsSince: StatementSync;
   };
 
   constructor(path: string) {
@@ -249,6 +251,16 @@ export class SqliteStore implements StoreLike {
          FROM calls
          WHERE token_id = ? AND outcome IN ('ok', 'error')`,
       ),
+      sumCostSince: this.db.prepare(
+        `SELECT COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd)), 0) AS total
+         FROM calls
+         WHERE ts >= ? AND outcome IN ('ok', 'error')`,
+      ),
+      countCallsSince: this.db.prepare(
+        `SELECT COUNT(*) AS total
+         FROM calls
+         WHERE ts >= ?`,
+      ),
     };
   }
 
@@ -354,6 +366,20 @@ export class SqliteStore implements StoreLike {
 
   sumCostUsdByToken(tokenId: string): number {
     const row = this.stmts.sumCostByToken.get(tokenId) as
+      | { total: number | null }
+      | undefined;
+    return row?.total ?? 0;
+  }
+
+  sumCostUsdSince(ts: string): number {
+    const row = this.stmts.sumCostSince.get(ts) as
+      | { total: number | null }
+      | undefined;
+    return row?.total ?? 0;
+  }
+
+  countCallsSince(ts: string): number {
+    const row = this.stmts.countCallsSince.get(ts) as
       | { total: number | null }
       | undefined;
     return row?.total ?? 0;
