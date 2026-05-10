@@ -662,6 +662,97 @@ for (const { name, make } of STORES) {
         expect(env.map((r) => r.key)).toEqual(["dev", "prod"]);
       });
     });
+
+    describe("daily-cumulative spend (Phase 3.5)", () => {
+      // Anchor on a fixed UTC midday timestamp so substr(ts,1,10) and
+      // ts.slice(0,10) both map to the same `YYYY-MM-DD`. Use ISO
+      // strings the store actually writes (`new Date().toISOString()`
+      // is always UTC).
+      const day = (d: string, h = 12) => `${d}T${String(h).padStart(2, "0")}:00:00.000Z`;
+      const windowStart = day("2026-05-01", 0);
+
+      it("dailySpendByTokenSince returns empty when no calls", () => {
+        expect(store.dailySpendByTokenSince("t", windowStart)).toEqual([]);
+      });
+
+      it("dailySpendByTokenSince groups by UTC day and excludes denied", () => {
+        store.appendCall(callRec({ tokenId: "t", outcome: "ok", actualCostUsd: 0.10, ts: day("2026-05-01") }));
+        store.appendCall(callRec({ tokenId: "t", outcome: "ok", actualCostUsd: 0.20, ts: day("2026-05-01", 22) }));
+        store.appendCall(callRec({ tokenId: "t", outcome: "ok", actualCostUsd: 0.30, ts: day("2026-05-03") }));
+        // Denied on the same day must not contribute.
+        store.appendCall(callRec({ tokenId: "t", outcome: "denied", estimatedCostUsd: 9.99, ts: day("2026-05-03", 18) }));
+        const rows = store.dailySpendByTokenSince("t", windowStart);
+        expect(rows).toEqual([
+          { day: "2026-05-01", usd: expect.closeTo(0.30, 6) },
+          { day: "2026-05-03", usd: expect.closeTo(0.30, 6) },
+        ]);
+      });
+
+      it("dailySpendByTokenSince filters by the requested token", () => {
+        // Two tokens, same day. Only the requested one should appear.
+        store.appendCall(callRec({ tokenId: "t-a", outcome: "ok", actualCostUsd: 0.10, ts: day("2026-05-01") }));
+        store.appendCall(callRec({ tokenId: "t-b", outcome: "ok", actualCostUsd: 0.50, ts: day("2026-05-01") }));
+        const rowsA = store.dailySpendByTokenSince("t-a", windowStart);
+        const rowsB = store.dailySpendByTokenSince("t-b", windowStart);
+        expect(rowsA).toEqual([{ day: "2026-05-01", usd: expect.closeTo(0.10, 6) }]);
+        expect(rowsB).toEqual([{ day: "2026-05-01", usd: expect.closeTo(0.50, 6) }]);
+      });
+
+      it("dailySpendByTokenSince respects the timestamp window", () => {
+        store.appendCall(callRec({ tokenId: "t", outcome: "ok", actualCostUsd: 0.10, ts: day("2026-04-29") }));
+        store.appendCall(callRec({ tokenId: "t", outcome: "ok", actualCostUsd: 0.20, ts: day("2026-05-02") }));
+        const rows = store.dailySpendByTokenSince("t", windowStart);
+        expect(rows).toEqual([{ day: "2026-05-02", usd: expect.closeTo(0.20, 6) }]);
+      });
+
+      it("dailySpendByTokenSince counts unpriced rows as 0 and skips them", () => {
+        // A tagged call with no priced cost contributes no `usd` —
+        // matches the SUM(COALESCE(actual, estimated))=NULL → 0
+        // posture, and the `cost is finite` guard in the JSON store.
+        store.appendCall(callRec({ tokenId: "t", outcome: "ok", ts: day("2026-05-01") }));
+        store.appendCall(callRec({ tokenId: "t", outcome: "ok", actualCostUsd: 0.10, ts: day("2026-05-02") }));
+        const rows = store.dailySpendByTokenSince("t", windowStart);
+        // Only 2026-05-02 (the priced day) shows up.
+        expect(rows).toEqual([{ day: "2026-05-02", usd: expect.closeTo(0.10, 6) }]);
+      });
+
+      it("dailySpendByTagSince groups by (day, tag) and excludes untagged", () => {
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", actualCostUsd: 0.10, ts: day("2026-05-01") }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", actualCostUsd: 0.20, ts: day("2026-05-01", 22) }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "research", outcome: "ok", actualCostUsd: 0.05, ts: day("2026-05-01") }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", actualCostUsd: 0.30, ts: day("2026-05-03") }));
+        // Untagged — must be excluded.
+        store.appendCall(callRec({ tokenId: "t", outcome: "ok", actualCostUsd: 0.99, ts: day("2026-05-01") }));
+        const rows = store.dailySpendByTagSince("team", windowStart);
+        expect(rows).toEqual([
+          { day: "2026-05-01", key: "platform", usd: expect.closeTo(0.30, 6) },
+          { day: "2026-05-01", key: "research", usd: expect.closeTo(0.05, 6) },
+          { day: "2026-05-03", key: "platform", usd: expect.closeTo(0.30, 6) },
+        ]);
+      });
+
+      it("dailySpendByTagSince respects the bucket — project tags do not pollute team", () => {
+        store.appendCall(callRec({ tokenId: "t", tagProject: "broker", outcome: "ok", actualCostUsd: 0.10, ts: day("2026-05-01") }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", actualCostUsd: 0.20, ts: day("2026-05-01") }));
+        const team = store.dailySpendByTagSince("team", windowStart);
+        const project = store.dailySpendByTagSince("project", windowStart);
+        expect(team).toEqual([
+          { day: "2026-05-01", key: "platform", usd: expect.closeTo(0.20, 6) },
+        ]);
+        expect(project).toEqual([
+          { day: "2026-05-01", key: "broker", usd: expect.closeTo(0.10, 6) },
+        ]);
+      });
+
+      it("dailySpendByTagSince excludes denied calls", () => {
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", actualCostUsd: 0.10, ts: day("2026-05-01") }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "denied", estimatedCostUsd: 9.99, ts: day("2026-05-01", 22) }));
+        const rows = store.dailySpendByTagSince("team", windowStart);
+        expect(rows).toEqual([
+          { day: "2026-05-01", key: "platform", usd: expect.closeTo(0.10, 6) },
+        ]);
+      });
+    });
   });
 }
 

@@ -95,6 +95,29 @@ export interface TagSpendRow {
 }
 
 /**
+ * Phase 3.5: one row of daily spend for a single token. `day` is a
+ * `YYYY-MM-DD` UTC date (extracted from `ts`'s ISO prefix). `usd` is
+ * the day's incremental priced spend — the forecast layer cumsums to
+ * get the regression series. Sparse: only days with priced ok/error
+ * spend appear.
+ */
+export interface DailySpendRow {
+  day: string;
+  usd: number;
+}
+
+/**
+ * Phase 3.5: one row of daily spend for a single (tag, day) pair.
+ * Same UTC-date convention as `DailySpendRow`. Sparse — untagged
+ * calls and zero-spend days are omitted.
+ */
+export interface TagDailySpendRow {
+  day: string;
+  key: string;
+  usd: number;
+}
+
+/**
  * Storage interface implemented by JsonStore (legacy) and SqliteStore (default).
  * `consumeToken` MUST be atomic across concurrent processes.
  */
@@ -161,6 +184,22 @@ export interface StoreLike {
     since: string,
     limit: number,
   ): TagSpendRow[];
+  /**
+   * Phase 3.5: per-day priced spend for a single token since `ts`.
+   * Returns sparse `{day, usd}` ordered by day ascending. Only `ok` /
+   * `error` outcomes contribute (denied calls never reached upstream
+   * — same posture as `sumCostUsdSince`). Days with zero priced spend
+   * are absent; the forecast layer densifies via
+   * `buildDenseCumulativeSeries`.
+   */
+  dailySpendByTokenSince(tokenId: string, ts: string): DailySpendRow[];
+  /**
+   * Phase 3.5: per-day priced spend per tag value, for a single bucket
+   * since `ts`. Returns sparse `{day, key, usd}` ordered by day asc,
+   * key asc. Untagged calls excluded for the same reason as
+   * `sumCostUsdByTagSince` (a phantom "" bucket would dominate).
+   */
+  dailySpendByTagSince(bucket: TagBucket, ts: string): TagDailySpendRow[];
   /** Optional close hook (SQLite handle, etc.). */
   close?(): void;
 }

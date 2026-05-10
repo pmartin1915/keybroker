@@ -1055,3 +1055,188 @@ describe("/metrics/spend (Phase 3.4)", () => {
     expect(rows.length).toBe(1);
   });
 });
+
+describe("/forecast (Phase 3.5)", () => {
+  // The forecast routes share the same audit log every other test in
+  // this file populates. Seeding tagged audit rows directly via
+  // store.appendCall keeps these tests fast and independent of
+  // upstream availability — same posture as the /metrics/spend tests.
+
+  it("rejects an invalid since on /forecast/tokens", async () => {
+    const res = await fetch(`${brokerOrigin}/forecast/tokens?since=yesterday`);
+    expect(res.status).toBe(400);
+    expect(await jsonError(res)).toBe("invalid_since");
+  });
+
+  it("rejects an invalid top on /forecast/tokens", async () => {
+    const res = await fetch(`${brokerOrigin}/forecast/tokens?top=0`);
+    expect(res.status).toBe(400);
+    expect(await jsonError(res)).toBe("invalid_top");
+  });
+
+  it("defaults to since=14d when omitted", async () => {
+    // No `since` query — should not 400 (defaulted server-side).
+    const res = await fetch(`${brokerOrigin}/forecast/tokens?top=5`);
+    expect(res.status).toBe(200);
+    const rows = (await res.json()) as Array<unknown>;
+    expect(Array.isArray(rows)).toBe(true);
+  });
+
+  it("rejects an invalid bucket on /forecast/tags", async () => {
+    const res = await fetch(`${brokerOrigin}/forecast/tags?bucket=region`);
+    expect(res.status).toBe(400);
+    expect(await jsonError(res)).toBe("invalid_bucket");
+  });
+
+  it("rejects an invalid since on /forecast/tags", async () => {
+    const res = await fetch(
+      `${brokerOrigin}/forecast/tags?bucket=team&since=tomorrow`,
+    );
+    expect(res.status).toBe(400);
+    expect(await jsonError(res)).toBe("invalid_since");
+  });
+
+  it("rejects an invalid top on /forecast/tags", async () => {
+    const res = await fetch(
+      `${brokerOrigin}/forecast/tags?bucket=team&top=9999`,
+    );
+    expect(res.status).toBe(400);
+    expect(await jsonError(res)).toBe("invalid_top");
+  });
+
+  it("forecasts per-token burn and computes daysUntilCap from a clean series", async () => {
+    // Mint a token with cap=$20 and seed 14 days of $1/day priced
+    // spend. Slope should land near $1/day, current = $14, daysUntilCap
+    // ≈ 6. We isolate this token from the rest of the audit log by
+    // its unique label (`f35-burn`) and tokenId.
+    const { id } = await mintToken({ capUsd: 20 });
+    // Re-stamp the token's label so the response is filterable.
+    const t = store.getToken(id);
+    if (!t) throw new Error("token vanished");
+    t.label = "f35-burn";
+    store.putToken(t);
+    const today = new Date();
+    for (let i = 0; i < 14; i++) {
+      const ts = new Date(today.getTime() - (13 - i) * 86_400_000).toISOString();
+      store.appendCall({
+        ts,
+        tokenId: id,
+        label: "f35-burn",
+        provider: "echo",
+        method: "POST",
+        path: "/v1/x",
+        status: 200,
+        durationMs: 5,
+        reqBytes: 0,
+        respBytes: 0,
+        outcome: "ok",
+        actualCostUsd: 1.0,
+      });
+    }
+    // Ask for a generous top so our seeded token is included even with
+    // many unrelated tokens already in the store.
+    const res = await fetch(
+      `${brokerOrigin}/forecast/tokens?since=14d&top=1000`,
+    );
+    expect(res.status).toBe(200);
+    const rows = (await res.json()) as Array<{
+      tokenId: string;
+      label: string;
+      slopeUsdPerDay: number;
+      currentUsd: number;
+      capUsd?: number;
+      daysUntilCap?: number;
+      projectedCapBreachDate?: string;
+    }>;
+    const ours = rows.find((r) => r.tokenId === id);
+    expect(ours).toBeDefined();
+    expect(ours!.label).toBe("f35-burn");
+    expect(ours!.capUsd).toBe(20);
+    expect(ours!.currentUsd).toBeCloseTo(14, 6);
+    expect(ours!.slopeUsdPerDay).toBeGreaterThan(0.9);
+    expect(ours!.slopeUsdPerDay).toBeLessThan(1.1);
+    expect(ours!.daysUntilCap).toBeGreaterThan(5);
+    expect(ours!.daysUntilCap).toBeLessThan(7);
+    expect(ours!.projectedCapBreachDate).toBeDefined();
+  });
+
+  it("ranks tags by slopeUsdPerDay descending with alphabetic tiebreak", async () => {
+    // Two team tags burning at the same rate — alphabetic ordering
+    // pins them. Use a unique prefix so other tests' tagged rows don't
+    // bleed in.
+    const tag = (s: string) => `f35-${s}`;
+    const today = new Date();
+    for (let i = 0; i < 14; i++) {
+      const ts = new Date(today.getTime() - (13 - i) * 86_400_000).toISOString();
+      // alpha and bravo each get $1/day; charlie gets $5/day.
+      store.appendCall({
+        ts,
+        tokenId: "f35-tag-test",
+        label: "f35-tag",
+        provider: "echo",
+        method: "POST",
+        path: "/v1/x",
+        status: 200,
+        durationMs: 5,
+        reqBytes: 0,
+        respBytes: 0,
+        outcome: "ok",
+        tagTeam: tag("alpha"),
+        actualCostUsd: 1.0,
+      });
+      store.appendCall({
+        ts,
+        tokenId: "f35-tag-test",
+        label: "f35-tag",
+        provider: "echo",
+        method: "POST",
+        path: "/v1/x",
+        status: 200,
+        durationMs: 5,
+        reqBytes: 0,
+        respBytes: 0,
+        outcome: "ok",
+        tagTeam: tag("bravo"),
+        actualCostUsd: 1.0,
+      });
+      store.appendCall({
+        ts,
+        tokenId: "f35-tag-test",
+        label: "f35-tag",
+        provider: "echo",
+        method: "POST",
+        path: "/v1/x",
+        status: 200,
+        durationMs: 5,
+        reqBytes: 0,
+        respBytes: 0,
+        outcome: "ok",
+        tagTeam: tag("charlie"),
+        actualCostUsd: 5.0,
+      });
+    }
+    const res = await fetch(
+      `${brokerOrigin}/forecast/tags?bucket=team&since=14d&top=1000`,
+    );
+    expect(res.status).toBe(200);
+    const rows = (await res.json()) as Array<{
+      bucket: string;
+      key: string;
+      slopeUsdPerDay: number;
+      currentUsd: number;
+      daysUntilCap?: number;
+    }>;
+    const ours = rows.filter((r) => r.key.startsWith("f35-"));
+    // charlie burns 5x; alpha and bravo are tied — alphabetic tiebreak.
+    expect(ours.map((r) => r.key)).toEqual([
+      tag("charlie"),
+      tag("alpha"),
+      tag("bravo"),
+    ]);
+    expect(ours[0]!.slopeUsdPerDay).toBeGreaterThan(ours[1]!.slopeUsdPerDay);
+    // Tag forecast never has a cap → no daysUntilCap.
+    for (const r of ours) {
+      expect(r.daysUntilCap).toBeUndefined();
+    }
+  });
+});

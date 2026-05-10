@@ -93,6 +93,7 @@ The echo upstream's response will show you exactly what the broker forwarded, in
 | Fleet policy      | `~/.keybroker/policy.json`: `forbidden_models` (glob deny-list) + `allowed_providers` + `tag_allowlist` (per-tag allow-list). Hot-reloads without restart. |
 | Audit             | Every call (allowed or denied) appended to SQLite `calls` table with token id, label, status, latency, requested model, machine, tags, estimated and actual cost. |
 | Spend rollups     | `GET /metrics/spend?bucket=team\|project\|env&since=24h` and `keybroker metrics spend --by team --since 24h` aggregate the audit log by tag for FinOps dashboards. |
+| Burn forecast     | `GET /forecast/tokens` and `GET /forecast/tags?bucket=team` (and `keybroker forecast`) least-squares-fit recent daily spend to project days-until-cap per token and burn-rate-ranked tag leaderboards. |
 
 ## Architecture
 
@@ -159,6 +160,7 @@ If you ship this to production as-is, you will have a bad time.
 - Machine-identity normalization contract (`normalizeMachine`) (Phase 3.0 ✅)
 - Token tag attribution end-to-end (team / project / env) (Phase 3.3 ✅)
 - Tag-bucketed spend aggregation (`/metrics/spend`, `keybroker metrics spend`) (Phase 3.4 ✅)
+- Linear-regression burn forecast (`/forecast/tokens`, `/forecast/tags`, `keybroker forecast`) (Phase 3.5 ✅)
 
 ## Roadmap
 

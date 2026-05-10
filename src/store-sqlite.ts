@@ -2,11 +2,13 @@ import { DatabaseSync, type StatementSync } from "node:sqlite";
 import type { CallLogEntry } from "./logging.js";
 import type {
   ConsumeResult,
+  DailySpendRow,
   ListTokensOptions,
   RecentCallsOptions,
   SecretRecord,
   StoreLike,
   TagBucket,
+  TagDailySpendRow,
   TagSpendRow,
   TokenRecord,
 } from "./store-types.js";
@@ -145,6 +147,10 @@ export class SqliteStore implements StoreLike {
     topTagTeamBySpend: StatementSync;
     topTagProjectBySpend: StatementSync;
     topTagEnvBySpend: StatementSync;
+    dailySpendByTokenSince: StatementSync;
+    dailySpendByTagTeamSince: StatementSync;
+    dailySpendByTagProjectSince: StatementSync;
+    dailySpendByTagEnvSince: StatementSync;
   };
 
   constructor(path: string) {
@@ -367,6 +373,61 @@ export class SqliteStore implements StoreLike {
          ORDER BY usd DESC, key ASC
          LIMIT ?`,
       ),
+      // Phase 3.5: per-day spend for a single token. substr(ts, 1, 10)
+      // pulls the YYYY-MM-DD prefix off the ISO timestamp — every
+      // appendCall stores `new Date().toISOString()` so the prefix is
+      // a stable UTC date. Sparse output: the row-level
+      // `cost IS NOT NULL` filter drops days that contain only
+      // unpriced calls, matching the JSON store's `cost is finite`
+      // check (so both backends emit the same sparse series). The
+      // forecast layer cumsums and densifies via
+      // `buildDenseCumulativeSeries`; days dropped here just become
+      // 0-increment cells in the dense series. Same outcome filter as
+      // sumCostByToken — denied calls are never billed.
+      dailySpendByTokenSince: this.db.prepare(
+        `SELECT substr(ts, 1, 10) AS day,
+                SUM(COALESCE(actual_cost_usd, estimated_cost_usd)) AS usd
+         FROM calls
+         WHERE token_id = ? AND ts >= ? AND outcome IN ('ok', 'error')
+           AND COALESCE(actual_cost_usd, estimated_cost_usd) IS NOT NULL
+         GROUP BY day
+         ORDER BY day ASC`,
+      ),
+      // Phase 3.5: per-day spend per tag value, one row per (day, tag).
+      // Same `IS NOT NULL` posture as the bucket aggregations — untagged
+      // calls don't pollute the per-tag forecast. Ordered by day asc
+      // then key asc so the JSON store can mirror SQLite output exactly.
+      // Row-level cost-not-null filter mirrors dailySpendByTokenSince.
+      dailySpendByTagTeamSince: this.db.prepare(
+        `SELECT substr(ts, 1, 10) AS day,
+                tag_team AS key,
+                SUM(COALESCE(actual_cost_usd, estimated_cost_usd)) AS usd
+         FROM calls
+         WHERE ts >= ? AND outcome IN ('ok', 'error') AND tag_team IS NOT NULL
+           AND COALESCE(actual_cost_usd, estimated_cost_usd) IS NOT NULL
+         GROUP BY day, tag_team
+         ORDER BY day ASC, key ASC`,
+      ),
+      dailySpendByTagProjectSince: this.db.prepare(
+        `SELECT substr(ts, 1, 10) AS day,
+                tag_project AS key,
+                SUM(COALESCE(actual_cost_usd, estimated_cost_usd)) AS usd
+         FROM calls
+         WHERE ts >= ? AND outcome IN ('ok', 'error') AND tag_project IS NOT NULL
+           AND COALESCE(actual_cost_usd, estimated_cost_usd) IS NOT NULL
+         GROUP BY day, tag_project
+         ORDER BY day ASC, key ASC`,
+      ),
+      dailySpendByTagEnvSince: this.db.prepare(
+        `SELECT substr(ts, 1, 10) AS day,
+                tag_env AS key,
+                SUM(COALESCE(actual_cost_usd, estimated_cost_usd)) AS usd
+         FROM calls
+         WHERE ts >= ? AND outcome IN ('ok', 'error') AND tag_env IS NOT NULL
+           AND COALESCE(actual_cost_usd, estimated_cost_usd) IS NOT NULL
+         GROUP BY day, tag_env
+         ORDER BY day ASC, key ASC`,
+      ),
     };
   }
 
@@ -534,6 +595,35 @@ export class SqliteStore implements StoreLike {
       usd: r.usd ?? 0,
       callCount: r.call_count,
     }));
+  }
+
+  dailySpendByTokenSince(tokenId: string, ts: string): DailySpendRow[] {
+    const rows = this.stmts.dailySpendByTokenSince.all(tokenId, ts) as Array<{
+      day: string;
+      usd: number | null;
+    }>;
+    return rows.map((r) => ({ day: r.day, usd: r.usd ?? 0 }));
+  }
+
+  dailySpendByTagSince(bucket: TagBucket, ts: string): TagDailySpendRow[] {
+    const stmt = this.tagDailyStmt(bucket);
+    const rows = stmt.all(ts) as Array<{
+      day: string;
+      key: string;
+      usd: number | null;
+    }>;
+    return rows.map((r) => ({ day: r.day, key: r.key, usd: r.usd ?? 0 }));
+  }
+
+  private tagDailyStmt(bucket: TagBucket): StatementSync {
+    switch (bucket) {
+      case "team":
+        return this.stmts.dailySpendByTagTeamSince;
+      case "project":
+        return this.stmts.dailySpendByTagProjectSince;
+      case "env":
+        return this.stmts.dailySpendByTagEnvSince;
+    }
   }
 
   private tagSumStmt(bucket: TagBucket): StatementSync {

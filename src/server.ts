@@ -21,6 +21,12 @@ import {
   actualCostUsd as actualCostUsdFor,
   parseUsageFromUpstream,
 } from "./pricing.js";
+import {
+  buildDenseCumulativeSeries,
+  forecastBurn,
+  utcDayOf,
+  type BurnForecast,
+} from "./forecast.js";
 
 export interface BuildServerOptions {
   /** Pass `false` to silence fastify's logger (used in tests). */
@@ -100,6 +106,58 @@ export async function buildServer(
       limit = n;
     }
     return store.topTagsBySpend(bucket as TagBucket, sinceTs, limit);
+  });
+
+  // Phase 3.5: linear-regression burn forecast. Two routes — per-token
+  // (with cap projection) and per-tag (slope-only leaderboard). Same
+  // trust posture as /health and /metrics/spend: open on 127.0.0.1.
+  // The regression window is `since` (default 14d) and the response is
+  // capped by `top` (default 10). Both clamp to sane bounds for the
+  // same reason /metrics/spend does — `since` is parser-validated to
+  // shorthand only, `top` is integer 1..1000.
+  app.get<{
+    Querystring: { since?: string; top?: string };
+  }>("/forecast/tokens", async (req, reply) => {
+    const since = parseForecastSince(req.query.since);
+    if (since === undefined) {
+      return reply.status(400).send({
+        error: "invalid_since",
+        hint: "pass since=<n>(s|m|h|d), e.g. since=14d (default)",
+      });
+    }
+    const top = parseTopParam(req.query.top);
+    if (top === undefined) {
+      return reply
+        .status(400)
+        .send({ error: "invalid_top", hint: "top must be integer 1..1000" });
+    }
+    return forecastTokens(store, since, top);
+  });
+
+  app.get<{
+    Querystring: { bucket?: string; since?: string; top?: string };
+  }>("/forecast/tags", async (req, reply) => {
+    const bucket = req.query.bucket;
+    if (bucket !== "team" && bucket !== "project" && bucket !== "env") {
+      return reply.status(400).send({
+        error: "invalid_bucket",
+        hint: "bucket must be one of: team, project, env",
+      });
+    }
+    const since = parseForecastSince(req.query.since);
+    if (since === undefined) {
+      return reply.status(400).send({
+        error: "invalid_since",
+        hint: "pass since=<n>(s|m|h|d), e.g. since=14d (default)",
+      });
+    }
+    const top = parseTopParam(req.query.top);
+    if (top === undefined) {
+      return reply
+        .status(400)
+        .send({ error: "invalid_top", hint: "top must be integer 1..1000" });
+    }
+    return forecastTags(store, bucket as TagBucket, since, top);
   });
 
   app.all<{ Params: { provider: string; "*": string } }>(
@@ -793,4 +851,149 @@ function applyTagAttribution(
   if (tag.t !== undefined) entry.tagTeam = tag.t;
   if (tag.p !== undefined) entry.tagProject = tag.p;
   if (tag.e !== undefined) entry.tagEnv = tag.e;
+}
+
+/**
+ * Phase 3.5: parse the `since=` query parameter for /forecast/*.
+ * Defaults to 14d when absent — the standard FinOps regression window
+ * (long enough to absorb day-of-week traffic patterns, short enough to
+ * stay reactive to a runaway integration). Returns the ISO timestamp
+ * at `now - duration`, or undefined on parse failure.
+ */
+function parseForecastSince(s: string | undefined): string | undefined {
+  if (s === undefined) {
+    return new Date(Date.now() - 14 * 86_400_000).toISOString();
+  }
+  return parseSinceShorthand(s);
+}
+
+/**
+ * Phase 3.5: parse the `top=` query parameter for /forecast/*.
+ * Defaults to 10. Same 1..1000 bounds as /metrics/spend's `limit`.
+ * Returns undefined on invalid input so the caller can 400.
+ */
+function parseTopParam(s: string | undefined): number | undefined {
+  if (s === undefined) return 10;
+  const n = Number(s);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0 || n > 1000) {
+    return undefined;
+  }
+  return n;
+}
+
+/**
+ * Phase 3.5: per-token forecast. One regression per non-revoked token
+ * over the window starting at `sinceTs`. Tokens with no priced spend
+ * get a flat 0-slope forecast (still useful as a "this token has been
+ * idle" signal in the dashboard). Sort posture: tokens projected to
+ * breach soonest come first; tokens with no projection (no cap, no
+ * burn) are bucketed at the end in label-asc order so the UI is
+ * stable.
+ */
+export interface TokenForecastRow extends BurnForecast {
+  tokenId: string;
+  label: string;
+  provider: string;
+  capUsd?: number;
+  machine?: string;
+  tagTeam?: string;
+  tagProject?: string;
+  tagEnv?: string;
+}
+
+export function forecastTokens(
+  store: StoreLike,
+  sinceTs: string,
+  top: number,
+): TokenForecastRow[] {
+  const tokens = store.listTokens().filter((t) => !t.revoked);
+  const startDay = sinceTs.slice(0, 10);
+  const endDay = utcDayOf(new Date());
+  const rows: TokenForecastRow[] = tokens.map((t) => {
+    const sparse = store.dailySpendByTokenSince(t.id, sinceTs);
+    const dense = buildDenseCumulativeSeries({ sparse, startDay, endDay });
+    const f = forecastBurn({ series: dense, capUsd: t.capUsd });
+    const row: TokenForecastRow = {
+      tokenId: t.id,
+      label: t.label,
+      provider: t.provider,
+      ...f,
+    };
+    if (t.capUsd !== undefined) row.capUsd = t.capUsd;
+    if (t.machine !== undefined) row.machine = t.machine;
+    if (t.tagTeam !== undefined) row.tagTeam = t.tagTeam;
+    if (t.tagProject !== undefined) row.tagProject = t.tagProject;
+    if (t.tagEnv !== undefined) row.tagEnv = t.tagEnv;
+    return row;
+  });
+  rows.sort(compareForecastRows);
+  return rows.slice(0, top);
+}
+
+/**
+ * Stable sort: rows with a defined `daysUntilCap` come first in
+ * ascending order (soonest breach wins). Rows without a projection
+ * (no cap, or zero/negative slope) fall to the end and are
+ * tiebroken by `label` so successive calls render identically.
+ */
+function compareForecastRows(
+  a: TokenForecastRow,
+  b: TokenForecastRow,
+): number {
+  const aHas = a.daysUntilCap !== undefined;
+  const bHas = b.daysUntilCap !== undefined;
+  if (aHas && bHas) {
+    const diff = a.daysUntilCap! - b.daysUntilCap!;
+    if (diff !== 0) return diff;
+    return a.label.localeCompare(b.label);
+  }
+  if (aHas) return -1;
+  if (bHas) return 1;
+  return a.label.localeCompare(b.label);
+}
+
+/**
+ * Phase 3.5: per-tag forecast. One regression per tag value (within
+ * the chosen bucket). No cap → no `daysUntilCap`; the route exposes
+ * the slope leaderboard, which the dashboard renders as "fastest-
+ * burning teams/projects/envs". Sort by slope descending, ties by
+ * key ascending — same alphabetic-tiebreak posture as /metrics/spend.
+ */
+export interface TagForecastRow extends BurnForecast {
+  bucket: TagBucket;
+  key: string;
+}
+
+export function forecastTags(
+  store: StoreLike,
+  bucket: TagBucket,
+  sinceTs: string,
+  top: number,
+): TagForecastRow[] {
+  const sparseAll = store.dailySpendByTagSince(bucket, sinceTs);
+  // Group sparse rows by tag key. We don't know the full set of keys
+  // ahead of time, so this map is the discovery step.
+  const perKey = new Map<string, Array<{ day: string; usd: number }>>();
+  for (const r of sparseAll) {
+    let arr = perKey.get(r.key);
+    if (!arr) {
+      arr = [];
+      perKey.set(r.key, arr);
+    }
+    arr.push({ day: r.day, usd: r.usd });
+  }
+  const startDay = sinceTs.slice(0, 10);
+  const endDay = utcDayOf(new Date());
+  const rows: TagForecastRow[] = [];
+  for (const [key, sparse] of perKey.entries()) {
+    const dense = buildDenseCumulativeSeries({ sparse, startDay, endDay });
+    const f = forecastBurn({ series: dense });
+    rows.push({ bucket, key, ...f });
+  }
+  rows.sort((a, b) => {
+    const diff = b.slopeUsdPerDay - a.slopeUsdPerDay;
+    if (diff !== 0) return diff;
+    return a.key.localeCompare(b.key);
+  });
+  return rows.slice(0, top);
 }

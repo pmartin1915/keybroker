@@ -21,7 +21,14 @@ import {
 } from "./store.js";
 import { issueToken, MAX_TAG_VALUE_LEN } from "./tokens.js";
 import { PROVIDERS, getProvider } from "./providers/index.js";
-import { buildServer, parseSinceShorthand } from "./server.js";
+import {
+  buildServer,
+  forecastTokens,
+  forecastTags,
+  parseSinceShorthand,
+  type TokenForecastRow,
+  type TagForecastRow,
+} from "./server.js";
 import type { TagBucket } from "./store-types.js";
 import { getKeychain, KC_JWT_SECRET, KC_MASTER_KEY } from "./keychain.js";
 import { normalizeMachine } from "./hostname.js";
@@ -708,6 +715,141 @@ metrics
       }
     },
   );
+
+// Phase 3.5: linear-regression burn forecast. Store-direct (broker
+// does not need to be running), same as `metrics spend`. Without
+// `--by`, ranks tokens by projected breach date. With `--by team|
+// project|env`, ranks tag values by burn rate.
+program
+  .command("forecast")
+  .description(
+    "Linear-regression burn forecast over the audit log. Without --by ranks tokens by projected cap-breach date; with --by ranks tag values by burn rate.",
+  )
+  .option(
+    "--by <bucket>",
+    "tag bucket to forecast: team | project | env (omit for per-token forecast)",
+  )
+  .option(
+    "--since <duration>",
+    'regression window: "30s" | "10m" | "24h" | "14d"',
+    "14d",
+  )
+  .option("--top <n>", "maximum rows to return (1..1000)", "10")
+  .option("--json", "emit JSON instead of a table (machine-parseable)", false)
+  .action(
+    async (opts: {
+      by?: string;
+      since: string;
+      top: string;
+      json: boolean;
+    }) => {
+      const sinceTs = parseSinceShorthand(opts.since);
+      if (sinceTs === undefined) {
+        console.error(
+          `--since must be shorthand like 30s|10m|24h|14d (got "${opts.since}")`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+      const top = Number(opts.top);
+      if (!Number.isFinite(top) || !Number.isInteger(top) || top <= 0 || top > 1000) {
+        console.error(`--top must be an integer in 1..1000 (got "${opts.top}")`);
+        process.exitCode = 1;
+        return;
+      }
+      if (
+        opts.by !== undefined &&
+        opts.by !== "team" &&
+        opts.by !== "project" &&
+        opts.by !== "env"
+      ) {
+        console.error(
+          `--by must be one of: team, project, env (got "${opts.by}")`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+      const cfg = await loadConfig();
+      const store = openStore(cfg, { mode: storeMode() });
+      if (opts.by !== undefined) {
+        const rows = forecastTags(store, opts.by as TagBucket, sinceTs, top);
+        renderTagForecast(rows, opts.by, opts.json);
+      } else {
+        const rows = forecastTokens(store, sinceTs, top);
+        renderTokenForecast(rows, opts.json);
+      }
+    },
+  );
+
+function renderTokenForecast(rows: TokenForecastRow[], asJson: boolean): void {
+  if (asJson) {
+    console.log(JSON.stringify(rows, null, 2));
+    return;
+  }
+  if (rows.length === 0) {
+    console.log("(no active tokens to forecast)");
+    return;
+  }
+  // Right-align numeric columns; days-until-cap formatted as one
+  // decimal because the precision matters most near the breach
+  // (1.5 days vs 2 days is the actionable distinction).
+  const header = ["LABEL", "PROVIDER", "USD/DAY", "CURRENT", "CAP", "DAYS", "BREACH"];
+  const formatted = rows.map((r) => [
+    r.label,
+    r.provider,
+    `$${r.slopeUsdPerDay.toFixed(4)}`,
+    `$${r.currentUsd.toFixed(4)}`,
+    r.capUsd !== undefined ? `$${r.capUsd.toFixed(2)}` : "-",
+    r.daysUntilCap !== undefined ? r.daysUntilCap.toFixed(1) : "-",
+    r.projectedCapBreachDate !== undefined
+      ? r.projectedCapBreachDate.slice(0, 10)
+      : "-",
+  ]);
+  printTable(header, formatted, ["L", "L", "R", "R", "R", "R", "L"]);
+}
+
+function renderTagForecast(
+  rows: TagForecastRow[],
+  bucket: string,
+  asJson: boolean,
+): void {
+  if (asJson) {
+    console.log(JSON.stringify(rows, null, 2));
+    return;
+  }
+  if (rows.length === 0) {
+    console.log(`(no tagged spend for bucket=${bucket})`);
+    return;
+  }
+  const header = [bucket.toUpperCase(), "USD/DAY", "CURRENT"];
+  const formatted = rows.map((r) => [
+    r.key,
+    `$${r.slopeUsdPerDay.toFixed(4)}`,
+    `$${r.currentUsd.toFixed(4)}`,
+  ]);
+  printTable(header, formatted, ["L", "R", "R"]);
+}
+
+/**
+ * Render a fixed-width table. `align[i]` is "L" (pad-end) or "R"
+ * (pad-start) per column. Same posture as the `metrics spend` table —
+ * widths are derived from the longest cell, header included.
+ */
+function printTable(
+  header: string[],
+  rows: string[][],
+  align: Array<"L" | "R">,
+): void {
+  const widths = header.map((h, i) =>
+    Math.max(h.length, ...rows.map((r) => r[i]!.length)),
+  );
+  const pad = (s: string, w: number, a: "L" | "R") =>
+    a === "L" ? s.padEnd(w) : s.padStart(w);
+  const line = (cells: string[]) =>
+    cells.map((c, i) => pad(c, widths[i]!, align[i]!)).join("  ");
+  console.log(line(header));
+  for (const r of rows) console.log(line(r));
+}
 
 program
   .command("serve")

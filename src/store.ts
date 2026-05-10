@@ -13,6 +13,8 @@ export type {
   RecentCallsOptions,
   TagBucket,
   TagSpendRow,
+  DailySpendRow,
+  TagDailySpendRow,
 } from "./store-types.js";
 export { JsonStore } from "./store-json.js";
 export { SqliteStore } from "./store-sqlite.js";

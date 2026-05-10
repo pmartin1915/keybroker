@@ -8,11 +8,13 @@ import {
 import type { CallLogEntry } from "./logging.js";
 import type {
   ConsumeResult,
+  DailySpendRow,
   ListTokensOptions,
   RecentCallsOptions,
   SecretRecord,
   StoreLike,
   TagBucket,
+  TagDailySpendRow,
   TagSpendRow,
   TokenRecord,
 } from "./store-types.js";
@@ -290,6 +292,76 @@ export class JsonStore implements StoreLike {
     }));
     rows.sort((a, b) => (b.usd - a.usd) || a.key.localeCompare(b.key));
     return rows.slice(0, limit);
+  }
+
+  dailySpendByTokenSince(tokenId: string, ts: string): DailySpendRow[] {
+    if (!existsSync(this.logsPath)) return [];
+    const lines = readFileSync(this.logsPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    const buckets = new Map<string, number>();
+    for (const l of lines) {
+      try {
+        const e = JSON.parse(l) as CallLogEntry;
+        if (e.tokenId !== tokenId) continue;
+        if (e.ts < ts) continue;
+        if (e.outcome !== "ok" && e.outcome !== "error") continue;
+        const cost = e.actualCostUsd ?? e.estimatedCostUsd;
+        if (typeof cost !== "number" || !Number.isFinite(cost)) continue;
+        // Same `YYYY-MM-DD` extraction as SQLite's substr(ts, 1, 10).
+        const day = e.ts.slice(0, 10);
+        buckets.set(day, (buckets.get(day) ?? 0) + cost);
+      } catch {
+        // skip malformed lines
+      }
+    }
+    return [...buckets.entries()]
+      .map(([day, usd]) => ({ day, usd }))
+      .sort((a, b) => a.day.localeCompare(b.day));
+  }
+
+  dailySpendByTagSince(bucket: TagBucket, ts: string): TagDailySpendRow[] {
+    if (!existsSync(this.logsPath)) return [];
+    const field = tagFieldFor(bucket);
+    const lines = readFileSync(this.logsPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    // Map<day, Map<key, usd>>. Two-level grouping mirrors SQLite's
+    // `GROUP BY day, tag_X`. Sort posture matches the SQL: day asc,
+    // key asc.
+    const buckets = new Map<string, Map<string, number>>();
+    for (const l of lines) {
+      try {
+        const e = JSON.parse(l) as CallLogEntry;
+        if (e.ts < ts) continue;
+        if (e.outcome !== "ok" && e.outcome !== "error") continue;
+        const tag = e[field];
+        if (typeof tag !== "string" || tag.length === 0) continue;
+        const cost = e.actualCostUsd ?? e.estimatedCostUsd;
+        if (typeof cost !== "number" || !Number.isFinite(cost)) continue;
+        const day = e.ts.slice(0, 10);
+        let perKey = buckets.get(day);
+        if (!perKey) {
+          perKey = new Map<string, number>();
+          buckets.set(day, perKey);
+        }
+        perKey.set(tag, (perKey.get(tag) ?? 0) + cost);
+      } catch {
+        // skip malformed lines
+      }
+    }
+    const out: TagDailySpendRow[] = [];
+    const days = [...buckets.keys()].sort();
+    for (const day of days) {
+      const perKey = buckets.get(day)!;
+      const keys = [...perKey.keys()].sort();
+      for (const key of keys) {
+        out.push({ day, key, usd: perKey.get(key)! });
+      }
+    }
+    return out;
   }
 
   recentCalls(opts: RecentCallsOptions): CallLogEntry[] {
