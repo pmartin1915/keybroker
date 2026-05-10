@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { SignJWT } from "jose";
 import {
   scopeAllows,
   issueToken,
@@ -179,5 +180,101 @@ describe("issueToken / verifyToken round-trip", () => {
     });
     const result = await verifyToken(SECRET, raw);
     expect("error" in result).toBe(false);
+  });
+});
+
+describe("issueToken / verifyToken: mdl claim round-trip (Phase 2.1)", () => {
+  it("round-trips an mdl allow-list", async () => {
+    const raw = await issueToken(SECRET, {
+      tokenId: "token-mdl-1",
+      provider: "openai",
+      scopes: ["*"],
+      label: "x",
+      ttlSeconds: 60,
+      models: ["gpt-4o-mini", "gpt-4o"],
+    });
+    const result = await verifyToken(SECRET, raw);
+    if ("error" in result) throw new Error("unexpected: " + result.error);
+    expect(result.claims.mdl).toEqual(["gpt-4o-mini", "gpt-4o"]);
+  });
+
+  it("omits the claim entirely when models is undefined", async () => {
+    const raw = await issueToken(SECRET, {
+      tokenId: "token-mdl-2",
+      provider: "openai",
+      scopes: ["*"],
+      label: "x",
+      ttlSeconds: 60,
+    });
+    const result = await verifyToken(SECRET, raw);
+    if ("error" in result) throw new Error("unreachable");
+    expect(result.claims.mdl).toBeUndefined();
+  });
+
+  it("omits the claim when models is an empty array (no restriction = no claim)", async () => {
+    const raw = await issueToken(SECRET, {
+      tokenId: "token-mdl-3",
+      provider: "openai",
+      scopes: ["*"],
+      label: "x",
+      ttlSeconds: 60,
+      models: [],
+    });
+    const result = await verifyToken(SECRET, raw);
+    if ("error" in result) throw new Error("unreachable");
+    expect(result.claims.mdl).toBeUndefined();
+  });
+
+  /**
+   * Hostile JWTs cannot exist for a stranger (signature requires the secret),
+   * but issueToken's contract is that mdl is always string[]. If a buggy
+   * future caller — or a legitimate token forged by someone with the secret
+   * for testing — produces a non-string-array mdl, verifyToken must reject
+   * it as malformed rather than letting an invalid shape into BrokerClaims
+   * downstream. We mint these directly with SignJWT to bypass issueToken.
+   */
+  async function signRaw(payload: Record<string, unknown>): Promise<string> {
+    const key = new TextEncoder().encode(SECRET);
+    const jwt = await new SignJWT(payload)
+      .setProtectedHeader({ alg: "HS256" })
+      .setIssuer("keybroker")
+      .setSubject("token-mdl-malformed")
+      .setJti("token-mdl-malformed")
+      .setIssuedAt()
+      .sign(key);
+    return TOKEN_PREFIX + jwt;
+  }
+
+  it("rejects mdl that is not an array (string)", async () => {
+    const raw = await signRaw({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      mdl: "gpt-4",
+    });
+    const result = await verifyToken(SECRET, raw);
+    expect(result).toEqual({ error: "malformed_claims" });
+  });
+
+  it("rejects mdl array that contains a non-string entry", async () => {
+    const raw = await signRaw({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      mdl: ["gpt-4", 123],
+    });
+    const result = await verifyToken(SECRET, raw);
+    expect(result).toEqual({ error: "malformed_claims" });
+  });
+
+  it("rejects mdl array that contains an object entry", async () => {
+    const raw = await signRaw({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      mdl: ["gpt-4", { name: "evil" }],
+    });
+    const result = await verifyToken(SECRET, raw);
+    expect(result).toEqual({ error: "malformed_claims" });
   });
 });

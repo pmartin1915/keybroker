@@ -245,6 +245,10 @@ token
   .option("--max-calls <n>", "maximum allowed calls (-1 = unlimited)", "-1")
   .option("--ttl <seconds>", "seconds until expiry (0 = no expiry)", "3600")
   .option("--label <label>", "free-form label for audit", "unlabeled")
+  .option(
+    "--model <name...>",
+    "restrict the token to one or more model names. Repeat or pass space-separated. Omit for no restriction.",
+  )
   .action(
     async (opts: {
       provider: string;
@@ -252,9 +256,21 @@ token
       maxCalls: string;
       ttl: string;
       label: string;
+      model?: string[];
     }) => {
-      if (!getProvider(opts.provider)) {
+      const provSpec = getProvider(opts.provider);
+      if (!provSpec) {
         console.error(`unknown provider: ${opts.provider}`);
+        process.exitCode = 1;
+        return;
+      }
+      const models = opts.model && opts.model.length > 0 ? opts.model : undefined;
+      if (models && !provSpec.extractRequestedModel) {
+        console.error(
+          `provider "${opts.provider}" does not support per-token model restrictions ` +
+            `(no request-body inspection registered). Issue without --model, or add an ` +
+            `extractRequestedModel implementation in src/providers/index.ts.`,
+        );
         process.exitCode = 1;
         return;
       }
@@ -281,10 +297,12 @@ token
         scopes: opts.scope,
         label: opts.label,
         ttlSeconds: ttl,
+        models,
       });
       console.log(jwt);
+      const modelSummary = models ? `, models: ${models.join(", ")}` : "";
       console.error(
-        `\nissued token ${id} for ${opts.provider} (scope: ${opts.scope.join(", ")}, max-calls: ${max}, ttl: ${ttl}s)`,
+        `\nissued token ${id} for ${opts.provider} (scope: ${opts.scope.join(", ")}, max-calls: ${max}, ttl: ${ttl}s${modelSummary})`,
       );
     },
   );

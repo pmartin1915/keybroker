@@ -7,6 +7,13 @@ export interface BrokerClaims extends JWTPayload {
   scp: string[];
   /** Free-form label for audit. */
   lbl: string;
+  /**
+   * Optional model allow-list. Empty/missing means no model restriction —
+   * the request body is not inspected. When set, the upstream provider must
+   * implement extractRequestedModel; the requested model must be a member
+   * of this list or the request is denied 403 model_not_allowed.
+   */
+  mdl?: string[];
 }
 
 export const TOKEN_PREFIX = "brk_";
@@ -20,14 +27,20 @@ export async function issueToken(
     label: string;
     /** Seconds until expiry. 0 = no expiry. */
     ttlSeconds: number;
+    /** Optional model allow-list. Empty/undefined → no restriction. */
+    models?: string[];
   },
 ): Promise<string> {
   const key = new TextEncoder().encode(secret);
-  const builder = new SignJWT({
+  const payload: Record<string, unknown> = {
     prv: args.provider,
     scp: args.scopes,
     lbl: args.label,
-  })
+  };
+  if (args.models && args.models.length > 0) {
+    payload.mdl = args.models;
+  }
+  const builder = new SignJWT(payload)
     .setProtectedHeader({ alg: "HS256" })
     .setIssuer("keybroker")
     .setSubject(args.tokenId)
@@ -54,6 +67,11 @@ export async function verifyToken(
     const claims = payload as BrokerClaims;
     if (!claims.jti || !claims.prv || !Array.isArray(claims.scp)) {
       return { error: "malformed_claims" };
+    }
+    if (claims.mdl !== undefined) {
+      if (!Array.isArray(claims.mdl) || !claims.mdl.every((m) => typeof m === "string")) {
+        return { error: "malformed_claims" };
+      }
     }
     return { tokenId: claims.jti, claims };
   } catch (e) {

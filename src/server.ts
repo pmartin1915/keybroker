@@ -97,6 +97,52 @@ export async function buildServer(
         }, store);
       }
 
+      // Build the request body buffer up here so the model-allow-list check
+      // (which inspects body.model) can run before we consume a quota slot.
+      // Fastify has already parsed the body per its content-type by this point.
+      const body = req.method === "GET" || req.method === "HEAD"
+        ? undefined
+        : (req.body as unknown);
+      const bodyBuf = body === undefined
+        ? undefined
+        : typeof body === "string"
+          ? Buffer.from(body)
+          : Buffer.from(JSON.stringify(body));
+
+      // Per-token model allow-list (Phase 2.1). The CLI rejects --model on
+      // providers without extractRequestedModel at issue time, so reaching
+      // this branch with a missing extractor is a token forged after a
+      // provider downgrade — fail closed. If the body has no extractable
+      // model field (GET, non-JSON, or the body simply doesn't request a
+      // model), let it through: the restriction is "you cannot INVOKE
+      // models outside the allow-list", not "every request must declare a
+      // model".
+      if (claims.mdl && claims.mdl.length > 0) {
+        if (!provSpec.extractRequestedModel) {
+          return denied(reply, 403, "model_not_allowed:provider_no_introspection", {
+            tokenId,
+            label: claims.lbl,
+            provider,
+            method: req.method,
+            path: upstreamPath,
+            started,
+            reqBytes: bodyBuf?.byteLength ?? 0,
+          }, store);
+        }
+        const requestedModel = provSpec.extractRequestedModel(bodyBuf);
+        if (requestedModel !== undefined && !claims.mdl.includes(requestedModel)) {
+          return denied(reply, 403, `model_not_allowed:${requestedModel}`, {
+            tokenId,
+            label: claims.lbl,
+            provider,
+            method: req.method,
+            path: upstreamPath,
+            started,
+            reqBytes: bodyBuf?.byteLength ?? 0,
+          }, store);
+        }
+      }
+
       const consumed = store.consumeToken(tokenId);
       if (typeof consumed === "string") {
         const status =
@@ -180,15 +226,6 @@ export async function buildServer(
           reqBytes: 0,
         }, store);
       }
-
-      const body = req.method === "GET" || req.method === "HEAD"
-        ? undefined
-        : (req.body as unknown);
-      const bodyBuf = body === undefined
-        ? undefined
-        : typeof body === "string"
-          ? Buffer.from(body)
-          : Buffer.from(JSON.stringify(body));
 
       try {
         const upstream = await undiciRequest(url.toString(), {

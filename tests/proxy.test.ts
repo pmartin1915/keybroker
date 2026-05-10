@@ -61,6 +61,7 @@ async function mintToken(opts: {
   ttlSeconds?: number;
   provider?: string;
   revoked?: boolean;
+  models?: string[];
 }): Promise<{ id: string; jwt: string }> {
   const id = newTokenId();
   const provider = opts.provider ?? "echo";
@@ -85,6 +86,7 @@ async function mintToken(opts: {
     scopes,
     label: "test",
     ttlSeconds: ttl,
+    models: opts.models,
   });
   return { id, jwt };
 }
@@ -318,6 +320,108 @@ describe("proxy: quota enforcement", () => {
     expect(r2.status).toBe(200);
     expect(r3.status).toBe(429);
     expect(await jsonError(r3)).toBe("exhausted");
+  });
+});
+
+describe("proxy: model allow-list (Phase 2.1)", () => {
+  it("allows a request whose body.model is in mdl", async () => {
+    const { jwt } = await mintToken({
+      scopes: ["*"],
+      models: ["gpt-4o-mini"],
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "gpt-4o-mini", messages: [] }),
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("denies 403 model_not_allowed:<attempted> when body.model is not in mdl", async () => {
+    const { id, jwt } = await mintToken({
+      scopes: ["*"],
+      models: ["gpt-4o-mini"],
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "gpt-4-turbo", messages: [] }),
+    });
+    expect(res.status).toBe(403);
+    expect(await jsonError(res)).toBe("model_not_allowed:gpt-4-turbo");
+    // Acceptance: the audit log records the attempted model.
+    const recent = store.recentCalls({ limit: 5, tokenId: id });
+    const denial = recent.find((e) => e.outcome === "denied" && e.reason?.startsWith("model_not_allowed"));
+    expect(denial).toBeDefined();
+    expect(denial?.reason).toBe("model_not_allowed:gpt-4-turbo");
+  });
+
+  it("does not consume a quota slot when the request is denied for model", async () => {
+    const { id, jwt } = await mintToken({
+      scopes: ["*"],
+      models: ["gpt-4o-mini"],
+      maxCalls: 1,
+    });
+    // First call: a denied model should NOT use up the only quota slot.
+    const r1 = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "gpt-4-turbo", messages: [] }),
+    });
+    expect(r1.status).toBe(403);
+    // Second call with the allowed model should succeed.
+    const r2 = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "gpt-4o-mini", messages: [] }),
+    });
+    expect(r2.status).toBe(200);
+    // And quota is now exhausted.
+    const tokenRow = store.listTokens().find((t) => t.id === id);
+    expect(tokenRow?.remaining).toBe(0);
+  });
+
+  it("token without mdl claim accepts any model (no restriction)", async () => {
+    const { jwt } = await mintToken({ scopes: ["*"] });
+    const res = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "literally-anything", messages: [] }),
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("a mdl-restricted token still passes requests with no body.model field (e.g. listing endpoints)", async () => {
+    const { jwt } = await mintToken({
+      scopes: ["*"],
+      models: ["gpt-4o-mini"],
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/something`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ messages: [] }), // no model field
+    });
+    // Permissive on undefined model: the restriction is "you can't INVOKE
+    // models outside the allow-list", not "every request must declare a model".
+    expect(res.status).toBe(200);
   });
 });
 
