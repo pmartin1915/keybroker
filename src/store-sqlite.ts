@@ -21,6 +21,9 @@ interface TokenRow {
   revoked: number;
   machine: string | null;
   cap_usd: number | null;
+  tag_team: string | null;
+  tag_project: string | null;
+  tag_env: string | null;
 }
 
 interface SecretRow {
@@ -46,6 +49,9 @@ interface CallRow {
   machine: string | null;
   estimated_cost_usd: number | null;
   actual_cost_usd: number | null;
+  tag_team: string | null;
+  tag_project: string | null;
+  tag_env: string | null;
 }
 
 const SCHEMA = `
@@ -66,7 +72,10 @@ CREATE TABLE IF NOT EXISTS tokens (
   label TEXT NOT NULL DEFAULT 'unlabeled',
   revoked INTEGER NOT NULL DEFAULT 0,
   machine TEXT,
-  cap_usd REAL
+  cap_usd REAL,
+  tag_team TEXT,
+  tag_project TEXT,
+  tag_env TEXT
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS calls (
@@ -86,7 +95,10 @@ CREATE TABLE IF NOT EXISTS calls (
   requested_model TEXT,
   machine TEXT,
   estimated_cost_usd REAL,
-  actual_cost_usd REAL
+  actual_cost_usd REAL,
+  tag_team TEXT,
+  tag_project TEXT,
+  tag_env TEXT
 );
 
 CREATE INDEX IF NOT EXISTS calls_token_id_idx ON calls(token_id);
@@ -157,8 +169,8 @@ export class SqliteStore implements StoreLike {
         `SELECT provider, created_at FROM secrets ORDER BY provider`,
       ),
       putToken: this.db.prepare(
-        `INSERT INTO tokens (id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO tokens (id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd, tag_team, tag_project, tag_env)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            provider = excluded.provider,
            scopes = excluded.scopes,
@@ -169,18 +181,21 @@ export class SqliteStore implements StoreLike {
            label = excluded.label,
            revoked = excluded.revoked,
            machine = excluded.machine,
-           cap_usd = excluded.cap_usd`,
+           cap_usd = excluded.cap_usd,
+           tag_team = excluded.tag_team,
+           tag_project = excluded.tag_project,
+           tag_env = excluded.tag_env`,
       ),
       getToken: this.db.prepare(
-        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd
+        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd, tag_team, tag_project, tag_env
          FROM tokens WHERE id = ?`,
       ),
       listTokens: this.db.prepare(
-        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd
+        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd, tag_team, tag_project, tag_env
          FROM tokens ORDER BY created_at`,
       ),
       listTokensByMachine: this.db.prepare(
-        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd
+        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd, tag_team, tag_project, tag_env
          FROM tokens WHERE machine = ? ORDER BY created_at`,
       ),
       // Single-statement atomic check-and-decrement. Returns 1 row updated
@@ -199,13 +214,13 @@ export class SqliteStore implements StoreLike {
       revoke: this.db.prepare(`UPDATE tokens SET revoked = 1 WHERE id = ?`),
       insertCall: this.db.prepare(
         `INSERT INTO calls
-           (ts, token_id, label, provider, method, path, status, duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine, estimated_cost_usd, actual_cost_usd)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (ts, token_id, label, provider, method, path, status, duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine, estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       selectCalls: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
                 duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
-                estimated_cost_usd, actual_cost_usd
+                estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env
          FROM calls
          ORDER BY id DESC
          LIMIT ?`,
@@ -213,7 +228,7 @@ export class SqliteStore implements StoreLike {
       selectCallsByToken: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
                 duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
-                estimated_cost_usd, actual_cost_usd
+                estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env
          FROM calls
          WHERE token_id = ?
          ORDER BY id DESC
@@ -222,7 +237,7 @@ export class SqliteStore implements StoreLike {
       selectCallsByMachine: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
                 duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
-                estimated_cost_usd, actual_cost_usd
+                estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env
          FROM calls
          WHERE machine = ?
          ORDER BY id DESC
@@ -231,7 +246,7 @@ export class SqliteStore implements StoreLike {
       selectCallsByTokenAndMachine: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
                 duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
-                estimated_cost_usd, actual_cost_usd
+                estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env
          FROM calls
          WHERE token_id = ? AND machine = ?
          ORDER BY id DESC
@@ -311,6 +326,9 @@ export class SqliteStore implements StoreLike {
       rec.revoked ? 1 : 0,
       rec.machine ?? null,
       rec.capUsd ?? null,
+      rec.tagTeam ?? null,
+      rec.tagProject ?? null,
+      rec.tagEnv ?? null,
     );
   }
 
@@ -373,6 +391,9 @@ export class SqliteStore implements StoreLike {
       entry.machine ?? null,
       entry.estimatedCostUsd ?? null,
       entry.actualCostUsd ?? null,
+      entry.tagTeam ?? null,
+      entry.tagProject ?? null,
+      entry.tagEnv ?? null,
     );
   }
 
@@ -420,6 +441,15 @@ export class SqliteStore implements StoreLike {
     addColumnIfMissing(db, "calls", "estimated_cost_usd", "REAL");
     addColumnIfMissing(db, "calls", "actual_cost_usd", "REAL");
     addColumnIfMissing(db, "tokens", "cap_usd", "REAL");
+    // Phase 3.3: tag attribution columns. Mirror calls/tokens — same
+    // posture as machine: never read for enforcement, only for display
+    // (tokens) and aggregation (calls).
+    addColumnIfMissing(db, "tokens", "tag_team", "TEXT");
+    addColumnIfMissing(db, "tokens", "tag_project", "TEXT");
+    addColumnIfMissing(db, "tokens", "tag_env", "TEXT");
+    addColumnIfMissing(db, "calls", "tag_team", "TEXT");
+    addColumnIfMissing(db, "calls", "tag_project", "TEXT");
+    addColumnIfMissing(db, "calls", "tag_env", "TEXT");
     // Indexes for the Phase 2.3 filters. Created post-ALTER so the
     // referenced columns are guaranteed to exist on pre-2.3 DBs that
     // have just been migrated.
@@ -477,6 +507,9 @@ function rowToToken(row: TokenRow): TokenRecord {
   };
   if (row.machine !== null) rec.machine = row.machine;
   if (row.cap_usd !== null) rec.capUsd = row.cap_usd;
+  if (row.tag_team !== null) rec.tagTeam = row.tag_team;
+  if (row.tag_project !== null) rec.tagProject = row.tag_project;
+  if (row.tag_env !== null) rec.tagEnv = row.tag_env;
   return rec;
 }
 
@@ -499,6 +532,9 @@ function rowToCall(row: CallRow): CallLogEntry {
   if (row.machine !== null) entry.machine = row.machine;
   if (row.estimated_cost_usd !== null) entry.estimatedCostUsd = row.estimated_cost_usd;
   if (row.actual_cost_usd !== null) entry.actualCostUsd = row.actual_cost_usd;
+  if (row.tag_team !== null) entry.tagTeam = row.tag_team;
+  if (row.tag_project !== null) entry.tagProject = row.tag_project;
+  if (row.tag_env !== null) entry.tagEnv = row.tag_env;
   return entry;
 }
 

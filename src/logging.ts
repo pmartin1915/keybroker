@@ -41,4 +41,14 @@ export interface CallLogEntry {
    * absent, treat `estimatedCostUsd` as the spend for cap accounting.
    */
   actualCostUsd?: number;
+  /**
+   * Phase 3.3: tag attribution carried from the JWT's `tag` claim into
+   * the audit log. Each subkey is independently optional. Absent on
+   * calls made with pre-3.3 tokens. The audit log is the source of
+   * truth for FinOps queries (Phase 3.4) — tag aggregation runs over
+   * these columns, not the tokens table.
+   */
+  tagTeam?: string;
+  tagProject?: string;
+  tagEnv?: string;
 }

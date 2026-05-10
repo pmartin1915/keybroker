@@ -40,6 +40,16 @@ export interface TokenRecord {
    * enforcement, only mis-display.
    */
   capUsd?: number;
+  /**
+   * Phase 3.3: tags recorded at issue time. Optional. Same posture as
+   * `capUsd` — the broker NEVER reads these for enforcement; they exist
+   * so `keybroker tokens` can display attribution and so the CLI's
+   * batch operations (3.8) can filter by tag without decoding every
+   * JWT. The signed `tag` claim is the source of truth.
+   */
+  tagTeam?: string;
+  tagProject?: string;
+  tagEnv?: string;
 }
 
 export type ConsumeResult =

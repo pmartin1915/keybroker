@@ -56,6 +56,9 @@ function tokenRec(overrides: Partial<TokenRecord> = {}): TokenRecord {
     revoked: overrides.revoked ?? false,
     ...(overrides.machine !== undefined ? { machine: overrides.machine } : {}),
     ...(overrides.capUsd !== undefined ? { capUsd: overrides.capUsd } : {}),
+    ...(overrides.tagTeam !== undefined ? { tagTeam: overrides.tagTeam } : {}),
+    ...(overrides.tagProject !== undefined ? { tagProject: overrides.tagProject } : {}),
+    ...(overrides.tagEnv !== undefined ? { tagEnv: overrides.tagEnv } : {}),
   };
 }
 
@@ -80,6 +83,9 @@ function callRec(overrides: Partial<CallLogEntry> = {}): CallLogEntry {
     ...(overrides.actualCostUsd !== undefined
       ? { actualCostUsd: overrides.actualCostUsd }
       : {}),
+    ...(overrides.tagTeam !== undefined ? { tagTeam: overrides.tagTeam } : {}),
+    ...(overrides.tagProject !== undefined ? { tagProject: overrides.tagProject } : {}),
+    ...(overrides.tagEnv !== undefined ? { tagEnv: overrides.tagEnv } : {}),
   };
 }
 
@@ -303,6 +309,76 @@ for (const { name, make } of STORES) {
         store.appendCall(callRec({ tokenId: "t1", path: "/c", machine: "beta" }));
         const r = store.recentCalls({ limit: 100, tokenId: "t1", machine: "alpha" });
         expect(r.map((c) => c.path)).toEqual(["/a"]);
+      });
+    });
+
+    describe("token tag attribution (Phase 3.3)", () => {
+      it("putToken + getToken round-trips all three tag fields", () => {
+        store.putToken(
+          tokenRec({
+            id: "tagged",
+            tagTeam: "platform",
+            tagProject: "dispatcher",
+            tagEnv: "prod",
+          }),
+        );
+        const t = store.getToken("tagged");
+        expect(t?.tagTeam).toBe("platform");
+        expect(t?.tagProject).toBe("dispatcher");
+        expect(t?.tagEnv).toBe("prod");
+      });
+
+      it("putToken + getToken round-trips a single tag without coercing the others", () => {
+        // Each tag is independently optional. A token tagged with
+        // project=broker must not surface as team=null/empty in the
+        // returned record — the absence is meaningful.
+        store.putToken(tokenRec({ id: "p-only", tagProject: "broker" }));
+        const t = store.getToken("p-only");
+        expect(t?.tagProject).toBe("broker");
+        expect(t?.tagTeam).toBeUndefined();
+        expect(t?.tagEnv).toBeUndefined();
+      });
+
+      it("putToken + getToken leaves all tag fields undefined when absent", () => {
+        store.putToken(tokenRec({ id: "untagged" }));
+        const t = store.getToken("untagged");
+        expect(t?.tagTeam).toBeUndefined();
+        expect(t?.tagProject).toBeUndefined();
+        expect(t?.tagEnv).toBeUndefined();
+      });
+
+      it("listTokens preserves tag fields", () => {
+        store.putToken(tokenRec({ id: "a", tagTeam: "platform", tagEnv: "prod" }));
+        store.putToken(tokenRec({ id: "b" }));
+        const list = store.listTokens();
+        const a = list.find((t) => t.id === "a");
+        const b = list.find((t) => t.id === "b");
+        expect(a?.tagTeam).toBe("platform");
+        expect(a?.tagEnv).toBe("prod");
+        expect(b?.tagTeam).toBeUndefined();
+      });
+
+      it("appendCall + recentCalls round-trips audit tag columns", () => {
+        store.appendCall(
+          callRec({
+            tokenId: "t",
+            tagTeam: "infra",
+            tagProject: "broker",
+            tagEnv: "dev",
+          }),
+        );
+        const [only] = store.recentCalls({ limit: 1 });
+        expect(only?.tagTeam).toBe("infra");
+        expect(only?.tagProject).toBe("broker");
+        expect(only?.tagEnv).toBe("dev");
+      });
+
+      it("appendCall + recentCalls keeps tag columns undefined when absent", () => {
+        store.appendCall(callRec({ tokenId: "t" }));
+        const [only] = store.recentCalls({ limit: 1 });
+        expect(only?.tagTeam).toBeUndefined();
+        expect(only?.tagProject).toBeUndefined();
+        expect(only?.tagEnv).toBeUndefined();
       });
     });
 
@@ -673,6 +749,116 @@ describe("SqliteStore: idempotent cost-column migration (Phase 2.2)", () => {
       try {
         expect(again.getToken("new-t")?.capUsd).toBe(1.5);
         expect(again.sumCostUsdByToken("new-t")).toBeCloseTo(0.05, 6);
+      } finally {
+        again.close?.();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("SqliteStore: idempotent tag-column migration (Phase 3.3)", () => {
+  it("adds the tag columns to a pre-3.3 schema without data loss", async () => {
+    // Same shape as the Phase 2.2 migration test: hand-craft the prior
+    // schema, seed it, open with SqliteStore (which will ALTER), and
+    // verify legacy rows survived + new tag-bearing rows write/read.
+    const { DatabaseSync } = await import("node:sqlite");
+    const dir = mkdtempSync(join(tmpdir(), "kb-mig33-"));
+    const dbPath = join(dir, "store.db");
+    try {
+      const old = new DatabaseSync(dbPath);
+      old.exec(`
+        CREATE TABLE tokens (
+          id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          scopes TEXT NOT NULL,
+          remaining INTEGER NOT NULL,
+          used INTEGER NOT NULL DEFAULT 0,
+          expires_at INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          label TEXT NOT NULL DEFAULT 'unlabeled',
+          revoked INTEGER NOT NULL DEFAULT 0,
+          machine TEXT,
+          cap_usd REAL
+        ) WITHOUT ROWID;
+        CREATE TABLE calls (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL,
+          token_id TEXT NOT NULL,
+          label TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          method TEXT NOT NULL,
+          path TEXT NOT NULL,
+          status INTEGER NOT NULL,
+          duration_ms INTEGER NOT NULL,
+          req_bytes INTEGER NOT NULL,
+          resp_bytes INTEGER NOT NULL,
+          outcome TEXT NOT NULL,
+          reason TEXT,
+          requested_model TEXT,
+          machine TEXT,
+          estimated_cost_usd REAL,
+          actual_cost_usd REAL
+        );
+      `);
+      old
+        .prepare(
+          `INSERT INTO tokens (id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("legacy-t", "echo", '["*"]', 5, 0, 0, "2026-01-01T00:00:00.000Z", "old", 0, "perrypc", null);
+      old
+        .prepare(
+          `INSERT INTO calls (ts, token_id, label, provider, method, path, status, duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine, estimated_cost_usd, actual_cost_usd)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("2026-01-01T00:00:00.000Z", "legacy-t", "old", "echo", "POST", "/v1/x", 200, 1, 0, 0, "ok", null, null, "perrypc", null, null);
+      old.close();
+
+      const s = new SqliteStore(dbPath);
+      try {
+        // Legacy rows survive; new tag columns are null/undefined.
+        const t = s.getToken("legacy-t");
+        expect(t?.machine).toBe("perrypc");
+        expect(t?.tagTeam).toBeUndefined();
+        expect(t?.tagProject).toBeUndefined();
+        expect(t?.tagEnv).toBeUndefined();
+        const calls = s.recentCalls({ limit: 10 });
+        expect(calls.length).toBe(1);
+        expect(calls[0]?.tagTeam).toBeUndefined();
+
+        // New writes can use the tag fields.
+        s.putToken(
+          tokenRec({
+            id: "new-t",
+            tagTeam: "platform",
+            tagProject: "dispatcher",
+            tagEnv: "prod",
+          }),
+        );
+        s.appendCall(
+          callRec({
+            tokenId: "new-t",
+            tagTeam: "platform",
+            tagProject: "dispatcher",
+            tagEnv: "prod",
+          }),
+        );
+        const newT = s.getToken("new-t");
+        expect(newT?.tagTeam).toBe("platform");
+        expect(newT?.tagProject).toBe("dispatcher");
+        expect(newT?.tagEnv).toBe("prod");
+        const newCalls = s.recentCalls({ limit: 10, tokenId: "new-t" });
+        expect(newCalls[0]?.tagTeam).toBe("platform");
+      } finally {
+        s.close?.();
+      }
+
+      // Re-open: migrate() must be a no-op on an already-migrated DB.
+      const again = new SqliteStore(dbPath);
+      try {
+        expect(again.getToken("new-t")?.tagTeam).toBe("platform");
       } finally {
         again.close?.();
       }
