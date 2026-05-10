@@ -1,8 +1,7 @@
 # Handoff — keybroker Phase 3.5 complete (2026-05-10)
 
 You are the next instance. Phase 3.5 (linear-regression burn forecast)
-landed as a single commit on top of `cddc33f`. Working tree is clean
-once the commit is made (this handoff is the last file in the change).
+shipped as commit `4e3dd32` on `origin/main`. Working tree is clean.
 
 Phase 3.2 commit 4 is still blocked on Phase 3.2.5 — unchanged from
 the prior handoffs (`HANDOFF-2026-05-10-phase-3-3.md`, `HANDOFF-2026-
@@ -207,8 +206,12 @@ curl 'http://127.0.0.1:7843/forecast/tags?bucket=project&since=30d'
 
 ## Final state
 
-- Working tree clean once the Phase 3.5 commit lands.
+- `4e3dd32` on `origin/main`. Working tree clean.
 - 375 tests green, typecheck clean.
+- Phase 3.5 spec exit criteria met: forecast output verified against
+  a hand-computed 14-day reference series; tokens with <7 days
+  runway are surfaced (the `f35-burn` proxy test confirms a $1/day
+  token against a $20 cap projects breach ~6 days out).
 - Plan file at `C:/Users/perry/.claude/plans/i-have-a-lot-tidy-newt.md`
   unchanged — Phase 3.5 spec there matches what shipped (with the
   `forecastTokens` / `forecastTags` route names + a 14d default).
