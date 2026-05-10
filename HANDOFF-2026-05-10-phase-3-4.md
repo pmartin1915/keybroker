@@ -1,16 +1,14 @@
 # Handoff — keybroker Phase 3.4 complete (2026-05-10)
 
 You are the next instance. Phase 3.4 (tag-based aggregation + dashboard
-endpoint) is implemented but **not yet committed** as of this handoff
-— the working tree has the changes, ready for review and a clean
-commit by the next instance (or split into 2-3 commits if you prefer).
+endpoint) shipped as a single commit `c13e7cb` and is on `origin/main`.
 
 Phase 3.2 commit 4 is still blocked on Phase 3.2.5 — unchanged from
 the prior handoff (`HANDOFF-2026-05-10-phase-3-3.md`).
 
 ---
 
-## What's in the working tree
+## What landed in c13e7cb
 
 | Layer | File | Change |
 |---|---|---|
@@ -146,8 +144,7 @@ integration's payoff bigger when 3.2.5 finally lands.
 
 ```sh
 # from keybroker
-git status                                 # see the Phase 3.4 changes
-git diff --stat                            # 9 files, ~691 insertions
+git log --oneline -5                       # c13e7cb at the tip
 npx vitest run                             # 331 tests, ~18s
 npm run typecheck                          # clean
 
@@ -168,30 +165,12 @@ curl 'http://127.0.0.1:7843/metrics/spend?bucket=project&since=7d&limit=10'
 
 ---
 
-## Suggested commit shape (if you want to split)
-
-If you'd rather split this into separate commits before pushing,
-natural seams:
-
-1. **3.4/1 — store contract + implementations.** `src/store-types.ts`,
-   `src/store-sqlite.ts`, `src/store-json.ts`, `src/store.ts`,
-   `tests/store.test.ts` (Phase 3.4 block only).
-2. **3.4/2 — `/metrics/spend` route + CLI.** `src/server.ts`,
-   `src/cli.ts`, `tests/proxy.test.ts` (Phase 3.4 block).
-3. **3.4/3 — README.** Just `README.md`.
-
-A single commit is also fine — the changes are coherent and test
-coverage gates them together.
-
----
-
 ## Final state
 
-- Working tree: 9 files modified, 0 untracked, 0 staged. Phase 3.4
-  changes ready to commit.
+- `c13e7cb` on `origin/main`. Working tree clean.
 - Phase 3.4 spec exit criteria met: dashboard rollup cards can be
   wired to real data with a single fetch swap; CLI surface ships.
-- All tests green, typecheck clean.
+- 331 tests green, typecheck clean.
 - Plan file at `C:/Users/perry/.claude/plans/i-have-a-lot-tidy-newt.md`
   unchanged — Phase 3.4 spec there matches what shipped.
 
