@@ -1,8 +1,8 @@
 # Handoff — keybroker Phase 3.2.5 complete (2026-05-10)
 
 You are the next instance. Phase 3.2.5 (gemini + mistral providers)
-shipped. Working tree clean once the commit lands. Phase 3.2 commit 4
-is now unblocked.
+shipped as commit `77612ef` on `origin/main` (handoff at `ff2d64f`).
+Working tree clean. Phase 3.2 commit 4 is now unblocked.
 
 Phase 3.5 (burn forecast) shipped earlier the same day on `4e3dd32`.
 See `HANDOFF-2026-05-10-phase-3-5.md` for that context.
@@ -196,7 +196,7 @@ npx vitest run tests/providers.test.ts
 
 ## Final state
 
-- Working tree carries Phase 3.2.5 changes; commit it.
+- `77612ef` (feature) + `ff2d64f` (handoff) on `origin/main`. Working tree clean.
 - 395 tests green, typecheck clean.
 - Phase 3.2.5 exit criteria met: `keybroker secret add gemini` accepts
   the provider name; `keybroker token issue --provider gemini --model
