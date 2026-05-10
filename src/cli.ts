@@ -23,6 +23,7 @@ import { issueToken } from "./tokens.js";
 import { PROVIDERS, getProvider } from "./providers/index.js";
 import { buildServer } from "./server.js";
 import { getKeychain, KC_JWT_SECRET, KC_MASTER_KEY } from "./keychain.js";
+import { normalizeMachine } from "./hostname.js";
 
 function parseStoreMode(s: string | undefined): StoreMode {
   if (!s) return "auto";
@@ -301,13 +302,14 @@ token
       const max = Number(opts.maxCalls);
       // Default to os.hostname(); --machine "" explicitly opts out so an
       // operator who doesn't want machine attribution (e.g. for tokens
-      // issued to a shared CI runner) can suppress it.
-      const machine =
-        opts.machine === undefined
-          ? hostname()
-          : opts.machine === ""
-            ? undefined
-            : opts.machine;
+      // issued to a shared CI runner) can suppress it. Normalization
+      // (lowercase + trim) is applied uniformly so a token issued from
+      // PERRY-PC matches `--machine perry-pc` filters / revoke-all on
+      // every fleet member regardless of what os.hostname() casing the
+      // OS reports.
+      const machine = normalizeMachine(
+        opts.machine === undefined ? hostname() : opts.machine,
+      );
       // Phase 2.2: validate up front so a typo'd --cap-usd doesn't yield
       // a token with no cap silently. Empty / 0 / missing = no cap (the
       // broker treats `cap` as absent in all three cases).
@@ -360,12 +362,16 @@ token
 token
   .command("list")
   .description("List issued tokens.")
-  .option("--machine <name>", "filter by machine attribution")
+  .option("--machine <name>", "filter by machine attribution (case-insensitive)")
   .action(async (opts: { machine?: string }) => {
     const cfg = await loadConfig();
     const store = openStore(cfg, { mode: storeMode() });
+    // Normalize the filter so `--machine PERRY-PC` matches tokens stored
+    // as `perry-pc`. An empty/whitespace-only filter normalizes to
+    // undefined (= no filter), matching the previous "no --machine" path.
+    const machineFilter = normalizeMachine(opts.machine);
     const rows = store.listTokens(
-      opts.machine !== undefined ? { machine: opts.machine } : undefined,
+      machineFilter !== undefined ? { machine: machineFilter } : undefined,
     );
     if (rows.length === 0) {
       console.log("(no tokens)");
@@ -415,7 +421,10 @@ token
   .description(
     "Bulk-revoke every active token attributed to a machine (laptop-was-stolen case).",
   )
-  .requiredOption("--machine <name>", "machine to revoke all tokens for")
+  .requiredOption(
+    "--machine <name>",
+    "machine to revoke all tokens for (case-insensitive)",
+  )
   .option(
     "--yes",
     "skip the interactive confirmation (required for non-interactive use)",
@@ -424,15 +433,25 @@ token
   .action(async (opts: { machine: string; yes: boolean }) => {
     const cfg = await loadConfig();
     const store = openStore(cfg, { mode: storeMode() });
+    // Normalize so `revoke-all --machine PERRY-PC` matches stored
+    // `perry-pc`. Refuse a whitespace-only argument outright — bulk
+    // revoke is destructive, and silently treating "  " as "all
+    // machines without attribution" would be a footgun.
+    const machine = normalizeMachine(opts.machine);
+    if (machine === undefined) {
+      console.error("--machine cannot be empty or whitespace-only.");
+      process.exitCode = 1;
+      return;
+    }
     const candidates = store
-      .listTokens({ machine: opts.machine })
+      .listTokens({ machine })
       .filter((t) => !t.revoked);
     if (candidates.length === 0) {
-      console.log(`(no active tokens for machine "${opts.machine}")`);
+      console.log(`(no active tokens for machine "${machine}")`);
       return;
     }
     console.error(
-      `about to revoke ${candidates.length} active token(s) for machine "${opts.machine}":`,
+      `about to revoke ${candidates.length} active token(s) for machine "${machine}":`,
     );
     for (const t of candidates) {
       console.error(`  - ${t.id}  (label=${t.label})`);
@@ -469,14 +488,18 @@ program
   .description("Tail recent call log entries.")
   .option("-n, --num <n>", "number of recent entries", "20")
   .option("--token <id>", "filter by token id")
-  .option("--machine <name>", "filter by machine attribution")
+  .option("--machine <name>", "filter by machine attribution (case-insensitive)")
   .action(async (opts: { num: string; token?: string; machine?: string }) => {
     const cfg = await loadConfig();
     const store = openStore(cfg, { mode: storeMode() });
     const limit = Number(opts.num);
     const filter: { limit: number; tokenId?: string; machine?: string } = { limit };
     if (opts.token) filter.tokenId = opts.token;
-    if (opts.machine !== undefined) filter.machine = opts.machine;
+    // Normalize machine filter (lowercase + trim) so logs --machine
+    // PERRY-PC matches audit rows where the issuing token's `mch` claim
+    // was normalized at issue time.
+    const machineFilter = normalizeMachine(opts.machine);
+    if (machineFilter !== undefined) filter.machine = machineFilter;
     const entries = store.recentCalls(filter);
     if (entries.length === 0) {
       console.log("(no logs yet)");

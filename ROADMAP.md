@@ -183,6 +183,25 @@ worth folding into the dispatcher.
 Every outbound call goes through keybroker. The Money Rule is enforced
 at the proxy layer instead of in dispatcher logic.
 
+### 3.0 Machine-identity contract  ✅ shipped 2026-05-09
+
+The `mch` JWT claim and every `--machine` filter (`token list`,
+`revoke-all`, `logs`) normalize the input through `normalizeMachine`
+in `src/hostname.ts`: **trim surrounding whitespace, then lowercase**.
+Empty / whitespace-only → `undefined` (= no claim / no filter). No
+trailing-dot stripping, no FQDN truncation, no DNS-charset filtering —
+both sides of the broker/dispatcher boundary must apply the *same*
+function or they will drift.
+
+**The dispatcher (Phase 3.2) MUST mirror this rule.** Today it does
+inline `hostname().toLowerCase()` at multiple sites in
+`scripts/dispatch.mjs`, `scripts/lib/heartbeat.mjs`, etc. — the lowercase
+half is already correct, but the trim half is implicit and the rule
+is duplicated at every call site. When migrating the dispatcher, add a
+single `normalizeMachine` helper (port the keybroker function verbatim,
+do not add cleverness) and route every machine-identity write/compare
+through it.
+
 ### 3.1 Embedded vs sidecar
 
 Decide before writing code:

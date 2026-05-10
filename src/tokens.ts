@@ -19,6 +19,14 @@ export interface BrokerClaims extends JWTPayload {
    * Recorded into the audit log for per-machine attribution and used by
    * `keybroker tokens --machine` / `revoke-all --machine`. Optional so
    * pre-2.3 tokens still verify; the broker NEVER enforces presence.
+   *
+   * Phase 3.0 contract: this field SHOULD be the normalized form
+   * (`normalizeMachine` from `src/hostname.ts` — lowercase + trim).
+   * The CLI normalizes at issue time; programmatic callers of
+   * `issueToken` are expected to do the same. The broker does NOT
+   * re-normalize on verify, so a JWT minted with mixed-case `mch`
+   * will simply not match `--machine` filters. This is intentional —
+   * verification trusts what was signed.
    */
   mch?: string;
   /**
