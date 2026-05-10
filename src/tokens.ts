@@ -39,9 +39,36 @@ export interface BrokerClaims extends JWTPayload {
    * negative / zero) so a hand-crafted JWT cannot disable enforcement.
    */
   cap?: number;
+  /**
+   * Phase 3.3: token tags for FinOps attribution. Optional. Each subkey
+   * (`t`=team, `p`=project, `e`=env) is independently optional. The
+   * CLI validates values against `policy.tagAllowlist` at issue time;
+   * the broker does NOT re-check policy on each request — the claim is
+   * trusted as signed (parallel to `mch`/`cap`). verifyToken rejects
+   * malformed shapes (non-string, empty string, oversized values, or a
+   * vacuous `{}`) so a hand-crafted JWT can't smuggle garbage into the
+   * audit log.
+   */
+  tag?: BrokerTagClaim;
+}
+
+export interface BrokerTagClaim {
+  /** Team. */
+  t?: string;
+  /** Project. */
+  p?: string;
+  /** Environment. */
+  e?: string;
 }
 
 export const TOKEN_PREFIX = "brk_";
+
+/**
+ * Phase 3.3: cap on a single tag value. Generous enough for slugs and
+ * short human names, tight enough that a malicious caller can't bloat
+ * the audit log or the JWT itself.
+ */
+export const MAX_TAG_VALUE_LEN = 64;
 
 export async function issueToken(
   secret: string,
@@ -58,6 +85,15 @@ export async function issueToken(
     machine?: string;
     /** Optional per-token USD cap. Must be > 0 and finite; 0/undefined → no cap. */
     capUsd?: number;
+    /**
+     * Phase 3.3: optional tags. Each value, when present, must be a
+     * non-empty string ≤ MAX_TAG_VALUE_LEN. Empty/undefined values are
+     * silently dropped. If every tag is dropped, no `tag` claim is
+     * emitted at all — parallel to the `machine: ""` handling.
+     * Allow-list enforcement is the caller's job (see policyDeniesTag);
+     * issueToken only validates shape and length.
+     */
+    tags?: { team?: string; project?: string; env?: string };
   },
 ): Promise<string> {
   const key = new TextEncoder().encode(secret);
@@ -88,6 +124,10 @@ export async function issueToken(
     }
     payload.cap = args.capUsd;
   }
+  const tagClaim = buildTagClaim(args.tags);
+  if (tagClaim !== undefined) {
+    payload.tag = tagClaim;
+  }
   const builder = new SignJWT(payload)
     .setProtectedHeader({ alg: "HS256" })
     .setIssuer("keybroker")
@@ -99,6 +139,35 @@ export async function issueToken(
   }
   const jwt = await builder.sign(key);
   return TOKEN_PREFIX + jwt;
+}
+
+/**
+ * Build the `tag` claim payload from caller-friendly `{team, project, env}`.
+ * Drops undefined / empty values; throws on values that exceed
+ * MAX_TAG_VALUE_LEN. Returns undefined if no usable tag remains so the
+ * caller can omit the claim entirely.
+ */
+function buildTagClaim(
+  tags: { team?: string; project?: string; env?: string } | undefined,
+): BrokerTagClaim | undefined {
+  if (!tags) return undefined;
+  const out: BrokerTagClaim = {};
+  const map = [
+    ["team", "t", tags.team],
+    ["project", "p", tags.project],
+    ["env", "e", tags.env],
+  ] as const;
+  for (const [name, key, value] of map) {
+    if (value === undefined || value.length === 0) continue;
+    if (value.length > MAX_TAG_VALUE_LEN) {
+      throw new Error(
+        `issueToken: ${name} tag exceeds ${MAX_TAG_VALUE_LEN} chars (got ${value.length})`,
+      );
+    }
+    out[key] = value;
+  }
+  if (Object.keys(out).length === 0) return undefined;
+  return out;
 }
 
 export async function verifyToken(
@@ -137,6 +206,34 @@ export async function verifyToken(
       // `cap: 0` or `cap: -1` could otherwise sneak past the cap check
       // (which only fires on `cap !== undefined && cap > 0`).
       return { error: "malformed_claims" };
+    }
+    if (claims.tag !== undefined) {
+      if (
+        typeof claims.tag !== "object" ||
+        claims.tag === null ||
+        Array.isArray(claims.tag)
+      ) {
+        return { error: "malformed_claims" };
+      }
+      const tag = claims.tag as Record<string, unknown>;
+      // A vacuous {} claim never comes from issueToken (it omits the
+      // claim instead). Treating it as malformed forces the only
+      // legitimate "no tag" path to be `tag` absent — keeping audit
+      // consumers from having to special-case empty objects.
+      if (tag.t === undefined && tag.p === undefined && tag.e === undefined) {
+        return { error: "malformed_claims" };
+      }
+      for (const k of ["t", "p", "e"] as const) {
+        const v = tag[k];
+        if (v === undefined) continue;
+        if (
+          typeof v !== "string" ||
+          v.length === 0 ||
+          v.length > MAX_TAG_VALUE_LEN
+        ) {
+          return { error: "malformed_claims" };
+        }
+      }
     }
     return { tokenId: claims.jti, claims };
   } catch (e) {

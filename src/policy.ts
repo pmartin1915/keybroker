@@ -11,15 +11,27 @@
  * Schema:
  *   {
  *     "forbidden_models":  ["gemini-3-pro-preview", "*-preview"],
- *     "allowed_providers": ["openai", "anthropic"]
+ *     "allowed_providers": ["openai", "anthropic"],
+ *     "tag_allowlist":     {
+ *       "team":    ["platform", "infra"],
+ *       "project": ["dispatcher", "broker"]
+ *       // env omitted -> any non-empty string ≤ MAX_TAG_VALUE_LEN accepted
+ *     }
  *   }
  *
  * Semantics:
- *   - Both fields are optional. Omitting/empty `allowed_providers` means
- *     no provider restriction; omitting/empty `forbidden_models` means no
- *     model deny-list.
+ *   - All top-level fields are optional. Omitting/empty `allowed_providers`
+ *     means no provider restriction; omitting/empty `forbidden_models`
+ *     means no model deny-list.
  *   - `forbidden_models` entries are glob patterns (see `glob-match`); `*`
  *     is the only wildcard.
+ *   - `tag_allowlist` (Phase 3.3) is per-tag: each of `team`/`project`/`env`
+ *     can be an array of legal values. Tags omitted from the allow-list
+ *     map are unrestricted — the CLI accepts any non-empty short string
+ *     (still bounded by the MAX_TAG_VALUE_LEN guard in tokens.ts). An
+ *     explicit empty array (e.g. `"team": []`) is treated identically
+ *     to "key omitted" so editing one to clear it can't accidentally
+ *     forbid all team tags.
  *   - Missing or unreadable policy file = no enforcement (the broker
  *     intentionally fails OPEN on policy: the policy file is opt-in, and a
  *     parse error during edit must not lock the operator out of their own
@@ -31,12 +43,25 @@
 import { existsSync, readFileSync } from "node:fs";
 import { matchesAny } from "./glob-match.js";
 
+export interface TagAllowlist {
+  team?: readonly string[];
+  project?: readonly string[];
+  env?: readonly string[];
+}
+
+export type TagKey = "team" | "project" | "env";
+
 export interface Policy {
   forbiddenModels: readonly string[];
   allowedProviders: readonly string[];
+  tagAllowlist: TagAllowlist;
 }
 
-const EMPTY: Policy = { forbiddenModels: [], allowedProviders: [] };
+const EMPTY: Policy = {
+  forbiddenModels: [],
+  allowedProviders: [],
+  tagAllowlist: {},
+};
 
 const CACHE_TTL_MS = 1000;
 
@@ -86,12 +111,26 @@ function normalize(raw: unknown): Policy {
   return {
     forbiddenModels: stringArray(obj.forbidden_models),
     allowedProviders: stringArray(obj.allowed_providers),
+    tagAllowlist: tagAllowlistFromRaw(obj.tag_allowlist),
   };
 }
 
 function stringArray(v: unknown): readonly string[] {
   if (!Array.isArray(v)) return [];
   return v.filter((x): x is string => typeof x === "string" && x.length > 0);
+}
+
+function tagAllowlistFromRaw(v: unknown): TagAllowlist {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return {};
+  const obj = v as Record<string, unknown>;
+  const out: TagAllowlist = {};
+  // Only keep keys that have at least one usable value. An empty array
+  // collapses to "no restriction" (see file-level comment).
+  for (const k of ["team", "project", "env"] as const) {
+    const arr = stringArray(obj[k]);
+    if (arr.length > 0) out[k] = arr;
+  }
+  return out;
 }
 
 /** Returns true if the policy bars this provider entirely. */
@@ -104,6 +143,22 @@ export function policyDeniesProvider(p: Policy, provider: string): boolean {
 export function policyDeniesModel(p: Policy, model: string): boolean {
   if (p.forbiddenModels.length === 0) return false;
   return matchesAny(model, p.forbiddenModels);
+}
+
+/**
+ * Phase 3.3: returns true if `value` is not in the configured allow-list
+ * for `key`. Unconfigured / empty allow-lists return false (free-form for
+ * that tag). Used by the CLI at issue time; the broker does NOT call
+ * this on the request path — token claims are trusted as signed.
+ */
+export function policyDeniesTag(
+  p: Policy,
+  key: TagKey,
+  value: string,
+): boolean {
+  const list = p.tagAllowlist[key];
+  if (!list || list.length === 0) return false;
+  return !list.includes(value);
 }
 
 /**

@@ -5,6 +5,7 @@ import {
   issueToken,
   verifyToken,
   TOKEN_PREFIX,
+  MAX_TAG_VALUE_LEN,
 } from "../src/tokens.js";
 import { generateJwtSecret } from "../src/crypto.js";
 
@@ -522,5 +523,189 @@ describe("issueToken / verifyToken: cap claim round-trip (Phase 2.2)", () => {
       cap: Number.POSITIVE_INFINITY,
     });
     expect(await verifyToken(SECRET, rawInf)).toEqual({ error: "malformed_claims" });
+  });
+});
+
+describe("issueToken / verifyToken: tag claim round-trip (Phase 3.3)", () => {
+  it("round-trips all three subkeys", async () => {
+    const raw = await issueToken(SECRET, {
+      tokenId: "token-tag-1",
+      provider: "openai",
+      scopes: ["*"],
+      label: "x",
+      ttlSeconds: 60,
+      tags: { team: "platform", project: "dispatcher", env: "prod" },
+    });
+    const result = await verifyToken(SECRET, raw);
+    if ("error" in result) throw new Error("unexpected: " + result.error);
+    expect(result.claims.tag).toEqual({
+      t: "platform",
+      p: "dispatcher",
+      e: "prod",
+    });
+  });
+
+  it("round-trips a single subkey (project only)", async () => {
+    const raw = await issueToken(SECRET, {
+      tokenId: "token-tag-partial",
+      provider: "openai",
+      scopes: ["*"],
+      label: "x",
+      ttlSeconds: 60,
+      tags: { project: "broker" },
+    });
+    const result = await verifyToken(SECRET, raw);
+    if ("error" in result) throw new Error("unreachable");
+    expect(result.claims.tag).toEqual({ p: "broker" });
+  });
+
+  it("omits the claim entirely when tags is undefined", async () => {
+    const raw = await issueToken(SECRET, {
+      tokenId: "token-tag-none",
+      provider: "openai",
+      scopes: ["*"],
+      label: "x",
+      ttlSeconds: 60,
+    });
+    const result = await verifyToken(SECRET, raw);
+    if ("error" in result) throw new Error("unreachable");
+    expect(result.claims.tag).toBeUndefined();
+  });
+
+  it("omits the claim when every tag is empty/undefined (no attribution = no claim)", async () => {
+    const raw = await issueToken(SECRET, {
+      tokenId: "token-tag-empty",
+      provider: "openai",
+      scopes: ["*"],
+      label: "x",
+      ttlSeconds: 60,
+      tags: { team: "", project: undefined, env: "" },
+    });
+    const result = await verifyToken(SECRET, raw);
+    if ("error" in result) throw new Error("unreachable");
+    expect(result.claims.tag).toBeUndefined();
+  });
+
+  it("issueToken throws on a tag that exceeds MAX_TAG_VALUE_LEN", async () => {
+    await expect(
+      issueToken(SECRET, {
+        tokenId: "token-tag-toolong",
+        provider: "openai",
+        scopes: ["*"],
+        label: "x",
+        ttlSeconds: 60,
+        tags: { team: "x".repeat(MAX_TAG_VALUE_LEN + 1) },
+      }),
+    ).rejects.toThrow(/team tag exceeds/);
+  });
+
+  it("accepts a tag exactly at MAX_TAG_VALUE_LEN", async () => {
+    const v = "x".repeat(MAX_TAG_VALUE_LEN);
+    const raw = await issueToken(SECRET, {
+      tokenId: "token-tag-edge",
+      provider: "openai",
+      scopes: ["*"],
+      label: "x",
+      ttlSeconds: 60,
+      tags: { project: v },
+    });
+    const result = await verifyToken(SECRET, raw);
+    if ("error" in result) throw new Error("unreachable");
+    expect(result.claims.tag?.p).toBe(v);
+  });
+
+  /**
+   * Hand-crafted JWTs (only possible if you hold the secret — i.e. test
+   * forgeries or a compromised-secret scenario) must not be able to
+   * smuggle a malformed tag into BrokerClaims. Same forging pattern as
+   * the mdl/mch/cap validation tests.
+   */
+  async function signRawTag(payload: Record<string, unknown>): Promise<string> {
+    const key = new TextEncoder().encode(SECRET);
+    const jwt = await new SignJWT(payload)
+      .setProtectedHeader({ alg: "HS256" })
+      .setIssuer("keybroker")
+      .setSubject("token-tag-malformed")
+      .setJti("token-tag-malformed")
+      .setIssuedAt()
+      .sign(key);
+    return TOKEN_PREFIX + jwt;
+  }
+
+  it("rejects tag that is not an object (string)", async () => {
+    const raw = await signRawTag({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      tag: "platform",
+    });
+    expect(await verifyToken(SECRET, raw)).toEqual({ error: "malformed_claims" });
+  });
+
+  it("rejects tag that is an array", async () => {
+    const raw = await signRawTag({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      tag: ["platform"],
+    });
+    expect(await verifyToken(SECRET, raw)).toEqual({ error: "malformed_claims" });
+  });
+
+  it("rejects vacuous tag {}", async () => {
+    // issueToken won't produce this; rejecting on verify means audit
+    // consumers don't have to handle "tag present but empty" specially.
+    const raw = await signRawTag({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      tag: {},
+    });
+    expect(await verifyToken(SECRET, raw)).toEqual({ error: "malformed_claims" });
+  });
+
+  it("rejects a subkey that is not a string", async () => {
+    const raw = await signRawTag({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      tag: { t: 42 },
+    });
+    expect(await verifyToken(SECRET, raw)).toEqual({ error: "malformed_claims" });
+  });
+
+  it("rejects a subkey that is the empty string", async () => {
+    const raw = await signRawTag({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      tag: { p: "" },
+    });
+    expect(await verifyToken(SECRET, raw)).toEqual({ error: "malformed_claims" });
+  });
+
+  it("rejects a subkey that exceeds MAX_TAG_VALUE_LEN", async () => {
+    const raw = await signRawTag({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      tag: { e: "x".repeat(MAX_TAG_VALUE_LEN + 1) },
+    });
+    expect(await verifyToken(SECRET, raw)).toEqual({ error: "malformed_claims" });
+  });
+
+  it("ignores unknown subkeys (forward-compat with future tag types)", async () => {
+    // The spec is: only t/p/e are validated. Future broker versions
+    // might add new subkeys; an older verifier should accept them
+    // rather than fail-closed when at least one known key is valid.
+    const raw = await signRawTag({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      tag: { t: "platform", region: "us-east" },
+    });
+    const result = await verifyToken(SECRET, raw);
+    if ("error" in result) throw new Error("expected acceptance");
+    expect(result.claims.tag?.t).toBe("platform");
   });
 });
