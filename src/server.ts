@@ -332,7 +332,11 @@ export async function buildServer(
           // through — the operator's deny-list is targeted at LLM
           // providers that DO expose a model field.
         } else {
-          const extraction = provSpec.extractRequestMetadata(bodyBuf);
+          const extraction = provSpec.extractRequestMetadata({
+            body: bodyBuf,
+            path: upstreamPath,
+            method: req.method,
+          });
           switch (extraction.kind) {
             case "no-body":
               // GET/HEAD or empty body — no model invocable, allow through.

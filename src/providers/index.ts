@@ -32,34 +32,58 @@ export type Extraction =
   | { kind: "unparseable" }
   | { kind: "no-model" };
 
+/**
+ * Inputs to a provider's request metadata extractor.
+ *
+ * Phase 3.2.5 widened this from a single `Buffer | undefined` to an object
+ * because Gemini puts the requested model in the URL path (`/v1beta/models/
+ * <model>:generateContent`), not the body. Providers that only care about
+ * the body can ignore `path` and `method`; providers that care about both
+ * (Gemini, and the Phase 3.6 scanner that wants to skip non-LLM paths) get
+ * a single input shape.
+ */
+export interface ExtractorInput {
+  body: Buffer | undefined;
+  path: string;
+  method: string;
+}
+
 export interface ProviderSpec {
   name: string;
   /** Upstream base URL — broker forwards `/${name}/<rest>` to `${baseUrl}/<rest>`. */
   baseUrl: string;
-  /** How the upstream wants the API key. */
-  authStyle: "bearer" | "x-api-key";
-  /** Header name for x-api-key style. Ignored for bearer. */
+  /**
+   * `bearer` sets `Authorization: Bearer <key>`. `header` sends the raw key
+   * as the value of `authHeader` (defaults to `x-api-key` when unset). The
+   * literal `"header"` replaced the older `"x-api-key"` literal in Phase
+   * 3.2.5 once Gemini joined the lineup with `x-goog-api-key` — the auth
+   * style is really just bearer-vs-named-header, and the header name is
+   * configured separately.
+   */
+  authStyle: "bearer" | "header";
+  /** Header name for `header` style. Ignored for bearer. Defaults to `x-api-key`. */
   authHeader?: string;
   /** Headers stripped from the request before forwarding (e.g. host headers). */
   stripHeaders: string[];
   /**
-   * Inspect the upstream request body and return a tagged Extraction.
+   * Inspect the upstream request and return a tagged Extraction.
    * Defining this field marks the provider as supporting per-token model
    * allow-lists (the `mdl` claim); providers without it cannot be issued
    * tokens with --model restrictions and will be rejected at `token issue`
    * time, AND the server will fail closed if such a token is somehow
    * presented.
    */
-  extractRequestMetadata?: (body: Buffer | undefined) => Extraction;
+  extractRequestMetadata?: (req: ExtractorInput) => Extraction;
 }
 
 /**
- * Both OpenAI and Anthropic put the requested model at top-level `.model`
- * in a JSON body, along with `stream` and `max_tokens`. Echo follows the
- * same shape so tests can exercise the allow-list path without a real LLM
- * provider.
+ * OpenAI, Anthropic, and Mistral all put the requested model at top-level
+ * `.model` in a JSON body, along with `stream` and `max_tokens`. Echo
+ * follows the same shape so tests can exercise the allow-list path without
+ * a real LLM provider.
  */
-function jsonRequestMetadata(body: Buffer | undefined): Extraction {
+function jsonRequestMetadata(req: ExtractorInput): Extraction {
+  const body = req.body;
   if (!body || body.byteLength === 0) return { kind: "no-body" };
   let parsed: unknown;
   try {
@@ -79,12 +103,67 @@ function jsonRequestMetadata(body: Buffer | undefined): Extraction {
     meta.stream = obj.stream;
   }
   // OpenAI: `max_tokens` (deprecated) or `max_completion_tokens`.
-  // Anthropic: `max_tokens` (required). Take the first numeric we find.
+  // Anthropic / Mistral: `max_tokens`. Take the first numeric we find.
   const mt = obj.max_completion_tokens ?? obj.max_tokens;
   if (typeof mt === "number" && Number.isFinite(mt) && mt >= 0) {
     meta.maxTokens = mt;
   }
   if (meta.model === undefined) return { kind: "no-model" };
+  return { kind: "ok", meta };
+}
+
+/**
+ * Gemini's REST surface puts the model in the URL path:
+ *   POST /v1beta/models/<model>:generateContent
+ *   POST /v1beta/models/<model>:streamGenerateContent
+ *
+ * The action suffix after `:` also encodes stream-vs-not. The body carries
+ * `generationConfig.maxOutputTokens` instead of OpenAI's `max_tokens`.
+ *
+ * Non-generation paths (e.g. `GET /v1beta/models`) are handled upstream of
+ * this extractor — Fastify-level GET/HEAD bodies are stripped, so we land
+ * in `no-body`. Paths that do carry a body but don't match the
+ * `models/<model>:<action>` shape return `no-model` so the per-token mdl
+ * gate fails closed.
+ */
+const GEMINI_GENERATE_PATH =
+  /\/v1beta(?:\/[^/]+)*?\/models\/([^/:]+):([A-Za-z][A-Za-z0-9]*)/;
+
+function geminiRequestMetadata(req: ExtractorInput): Extraction {
+  if (!req.body || req.body.byteLength === 0) return { kind: "no-body" };
+
+  const match = GEMINI_GENERATE_PATH.exec(req.path);
+  const model = match?.[1];
+  const action = match?.[2];
+
+  // Body parse is best-effort — even when the model came from the path we
+  // still want to surface `unparseable` so an mdl-restricted token can't
+  // ride malformed JSON into upstream.
+  let parsed: Record<string, unknown> | undefined;
+  try {
+    const raw = JSON.parse(req.body.toString("utf8")) as unknown;
+    if (raw && typeof raw === "object") {
+      parsed = raw as Record<string, unknown>;
+    }
+  } catch {
+    return { kind: "unparseable" };
+  }
+
+  if (!model) return { kind: "no-model" };
+
+  const meta: RequestMetadata = { model };
+  if (action) {
+    meta.stream = action.toLowerCase().startsWith("stream");
+  }
+  if (parsed) {
+    const gc = parsed.generationConfig;
+    if (gc && typeof gc === "object") {
+      const mot = (gc as Record<string, unknown>).maxOutputTokens;
+      if (typeof mot === "number" && Number.isFinite(mot) && mot >= 0) {
+        meta.maxTokens = mot;
+      }
+    }
+  }
   return { kind: "ok", meta };
 }
 
@@ -99,9 +178,24 @@ export const PROVIDERS: Record<string, ProviderSpec> = {
   anthropic: {
     name: "anthropic",
     baseUrl: "https://api.anthropic.com",
-    authStyle: "x-api-key",
+    authStyle: "header",
     authHeader: "x-api-key",
     stripHeaders: ["host", "content-length", "connection", "authorization"],
+    extractRequestMetadata: jsonRequestMetadata,
+  },
+  gemini: {
+    name: "gemini",
+    baseUrl: "https://generativelanguage.googleapis.com",
+    authStyle: "header",
+    authHeader: "x-goog-api-key",
+    stripHeaders: ["host", "content-length", "connection", "authorization"],
+    extractRequestMetadata: geminiRequestMetadata,
+  },
+  mistral: {
+    name: "mistral",
+    baseUrl: "https://api.mistral.ai",
+    authStyle: "bearer",
+    stripHeaders: ["host", "content-length", "connection"],
     extractRequestMetadata: jsonRequestMetadata,
   },
   // Built-in test provider. KEYBROKER_ECHO_BASE_URL may override the default,

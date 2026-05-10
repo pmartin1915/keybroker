@@ -124,18 +124,21 @@ Open `Prototype.html` in any modern browser to try it. Data is synthetic and cle
 
 ## Adding a provider
 
-`src/providers/index.ts` is a flat registry:
+`src/providers/index.ts` is a flat registry. Built-in: `openai`, `anthropic`, `gemini`, `mistral`, `echo`. Adding a new bearer-auth provider with an OpenAI-shaped request body is five lines:
 
 ```ts
-mistral: {
-  name: "mistral",
-  baseUrl: "https://api.mistral.ai",
+groq: {
+  name: "groq",
+  baseUrl: "https://api.groq.com/openai",
   authStyle: "bearer",
   stripHeaders: ["host", "content-length", "connection"],
+  extractRequestMetadata: jsonRequestMetadata,
 }
 ```
 
-Then `keybroker secret add mistral` and `keybroker token issue --provider mistral`.
+Header-auth providers (e.g. Google's `x-goog-api-key`) set `authStyle: "header"` plus `authHeader: "<name>"`. Providers that put the model in the URL path (Gemini) write a custom `extractRequestMetadata` — see `geminiRequestMetadata` for the pattern.
+
+Then `keybroker secret add <name>` and `keybroker token issue --provider <name>`.
 
 ## What this is **not**
 
