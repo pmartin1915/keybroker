@@ -42,12 +42,18 @@ export async function buildServer(
     const tokens = store.listTokens();
     const active = tokens.filter((t) => !t.revoked).length;
     return {
+      // `keybroker_ok` is the field the dispatcher writes verbatim into
+      // status/health-<machine>.json. Tautologically true if we responded
+      // — the dispatcher's check is "did we get a response with this set?"
+      // not the value itself.
+      keybroker_ok: true,
       ok: true,
       version: "0.1.0",
       tokens: { active, revoked: tokens.length - active, total: tokens.length },
       calls: {
         last24h: store.countCallsSince(dayAgo),
         last24hSpendUsd: store.sumCostUsdSince(dayAgo),
+        last24hSpendUsdByMachine: store.sumCostUsdByMachineSince(dayAgo),
       },
     };
   });

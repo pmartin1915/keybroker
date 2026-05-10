@@ -203,6 +203,29 @@ export class JsonStore implements StoreLike {
     return count;
   }
 
+  sumCostUsdByMachineSince(ts: string): Record<string, number> {
+    const out: Record<string, number> = {};
+    if (!existsSync(this.logsPath)) return out;
+    const lines = readFileSync(this.logsPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    for (const l of lines) {
+      try {
+        const e = JSON.parse(l) as CallLogEntry;
+        if (e.ts < ts) continue;
+        if (e.outcome !== "ok" && e.outcome !== "error") continue;
+        const cost = e.actualCostUsd ?? e.estimatedCostUsd;
+        if (typeof cost !== "number" || !Number.isFinite(cost)) continue;
+        const key = e.machine ?? "";
+        out[key] = (out[key] ?? 0) + cost;
+      } catch {
+        // skip malformed lines
+      }
+    }
+    return out;
+  }
+
   recentCalls(opts: RecentCallsOptions): CallLogEntry[] {
     if (!existsSync(this.logsPath)) return [];
     const lines = readFileSync(this.logsPath, "utf8")

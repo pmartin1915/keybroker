@@ -117,6 +117,7 @@ export class SqliteStore implements StoreLike {
     sumCostByToken: StatementSync;
     sumCostSince: StatementSync;
     countCallsSince: StatementSync;
+    sumCostByMachineSince: StatementSync;
   };
 
   constructor(path: string) {
@@ -261,6 +262,17 @@ export class SqliteStore implements StoreLike {
          FROM calls
          WHERE ts >= ?`,
       ),
+      // Phase 3.2: spend grouped by machine. COALESCE(machine, '') buckets
+      // pre-2.3 calls under "" so the caller sees them rather than silently
+      // dropping. Outcome filter mirrors sumCostByToken — denied calls
+      // never reached upstream and have no spend.
+      sumCostByMachineSince: this.db.prepare(
+        `SELECT COALESCE(machine, '') AS machine,
+                COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd)), 0) AS total
+         FROM calls
+         WHERE ts >= ? AND outcome IN ('ok', 'error')
+         GROUP BY COALESCE(machine, '')`,
+      ),
     };
   }
 
@@ -383,6 +395,16 @@ export class SqliteStore implements StoreLike {
       | { total: number | null }
       | undefined;
     return row?.total ?? 0;
+  }
+
+  sumCostUsdByMachineSince(ts: string): Record<string, number> {
+    const rows = this.stmts.sumCostByMachineSince.all(ts) as Array<{
+      machine: string;
+      total: number | null;
+    }>;
+    const out: Record<string, number> = {};
+    for (const r of rows) out[r.machine] = r.total ?? 0;
+    return out;
   }
 
   private migrate(db: DatabaseSync): void {

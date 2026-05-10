@@ -100,6 +100,14 @@ export interface StoreLike {
    * Used by the health endpoint for dispatcher integration.
    */
   countCallsSince(ts: string): number;
+  /**
+   * Phase 3.2: return USD spend grouped by `machine` since ISO timestamp.
+   * Used by the dispatcher to write `keybroker_ok` + per-machine totals
+   * into status/health-<machine>.json. Calls without a machine attribution
+   * (pre-2.3 records) are bucketed under the empty string ""; the caller
+   * decides whether to surface that bucket.
+   */
+  sumCostUsdByMachineSince(ts: string): Record<string, number>;
   /** Optional close hook (SQLite handle, etc.). */
   close?(): void;
 }

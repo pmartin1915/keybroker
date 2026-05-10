@@ -413,6 +413,44 @@ for (const { name, make } of STORES) {
         store.appendCall(callRec({ tokenId: "t", outcome: "error", ts }));
         expect(store.countCallsSince(ts)).toBe(3);
       });
+
+      it("sumCostUsdByMachineSince returns empty object when no calls", () => {
+        expect(store.sumCostUsdByMachineSince(new Date().toISOString())).toEqual({});
+      });
+
+      it("sumCostUsdByMachineSince groups by machine", () => {
+        const ts = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", machine: "host-a", outcome: "ok", actualCostUsd: 0.10, ts }));
+        store.appendCall(callRec({ tokenId: "t", machine: "host-a", outcome: "ok", actualCostUsd: 0.05, ts }));
+        store.appendCall(callRec({ tokenId: "t", machine: "host-b", outcome: "ok", actualCostUsd: 0.20, ts }));
+        const out = store.sumCostUsdByMachineSince(ts);
+        expect(out["host-a"]).toBeCloseTo(0.15, 6);
+        expect(out["host-b"]).toBeCloseTo(0.20, 6);
+      });
+
+      it("sumCostUsdByMachineSince excludes denied calls", () => {
+        const ts = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", machine: "host-a", outcome: "ok", actualCostUsd: 0.10, ts }));
+        store.appendCall(callRec({ tokenId: "t", machine: "host-a", outcome: "denied", estimatedCostUsd: 0.99, ts }));
+        const out = store.sumCostUsdByMachineSince(ts);
+        expect(out["host-a"]).toBeCloseTo(0.10, 6);
+      });
+
+      it("sumCostUsdByMachineSince buckets unattributed calls under empty string", () => {
+        const ts = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", outcome: "ok", actualCostUsd: 0.07, ts }));
+        const out = store.sumCostUsdByMachineSince(ts);
+        expect(out[""]).toBeCloseTo(0.07, 6);
+      });
+
+      it("sumCostUsdByMachineSince respects the timestamp window", () => {
+        const oldTs = new Date(Date.now() - 86400000).toISOString();
+        const newTs = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", machine: "host-a", outcome: "ok", actualCostUsd: 0.10, ts: oldTs }));
+        store.appendCall(callRec({ tokenId: "t", machine: "host-a", outcome: "ok", actualCostUsd: 0.20, ts: newTs }));
+        const out = store.sumCostUsdByMachineSince(newTs);
+        expect(out["host-a"]).toBeCloseTo(0.20, 6);
+      });
     });
   });
 }
