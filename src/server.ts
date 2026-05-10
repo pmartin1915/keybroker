@@ -5,7 +5,7 @@ import { finished } from "node:stream/promises";
 import type { BrokerConfig } from "./config.js";
 import { openStore } from "./store.js";
 import type { StoreLike } from "./store-types.js";
-import { scopeAllows, verifyToken } from "./tokens.js";
+import { scopeAllows, verifyToken, type BrokerClaims } from "./tokens.js";
 import { decrypt } from "./crypto.js";
 import { getProvider } from "./providers/index.js";
 import type { CallLogEntry } from "./logging.js";
@@ -105,10 +105,19 @@ export async function buildServer(
       }
       const { tokenId, claims } = verified;
 
-      // Capture the machine claim once; threaded into every audit entry
-      // for this request (success, denial, or error) so the audit log
-      // unambiguously attributes the call. Pre-2.3 tokens have no claim.
+      // Capture attribution claims (machine + tags) once; threaded into
+      // every audit entry for this request — success, denial, or error —
+      // so the audit log unambiguously attributes the call. Pre-2.3
+      // tokens have no `mch`; pre-3.3 tokens have no `tag`. The broker
+      // never re-validates the tag claim against policy here; the CLI
+      // is responsible for allow-list enforcement at issue time, and
+      // anything signed is trusted to be the operator's intent.
       const machine = claims.mch;
+      const auditAttribution: {
+        machine?: string;
+        claims?: BrokerClaims;
+      } = { claims };
+      if (machine !== undefined) auditAttribution.machine = machine;
 
       if (claims.prv !== provider) {
         return denied(reply, 403, "provider_mismatch", {
@@ -119,7 +128,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
-          machine,
+          ...auditAttribution,
         }, store);
       }
 
@@ -137,7 +146,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
-          machine,
+          ...auditAttribution,
         }, store);
       }
 
@@ -198,7 +207,7 @@ export async function buildServer(
               path: upstreamPath,
               started,
               reqBytes: bodyBuf?.byteLength ?? 0,
-              machine,
+              ...auditAttribution,
             }, store);
           }
           if (hasCapClaim) {
@@ -213,7 +222,7 @@ export async function buildServer(
               path: upstreamPath,
               started,
               reqBytes: bodyBuf?.byteLength ?? 0,
-              machine,
+              ...auditAttribution,
             }, store);
           }
           // Only policy is in play and the provider has no model surface
@@ -237,7 +246,7 @@ export async function buildServer(
                   path: upstreamPath,
                   started,
                   reqBytes: bodyBuf?.byteLength ?? 0,
-                  machine,
+                  ...auditAttribution,
                 }, store);
               }
               if (hasCapClaim) {
@@ -253,7 +262,7 @@ export async function buildServer(
                   path: upstreamPath,
                   started,
                   reqBytes: bodyBuf?.byteLength ?? 0,
-                  machine,
+                  ...auditAttribution,
                 }, store);
               }
               // Policy alone with no extractable model — nothing to forbid.
@@ -277,7 +286,7 @@ export async function buildServer(
                   started,
                   reqBytes: bodyBuf?.byteLength ?? 0,
                   requestedModel: requested,
-                  machine,
+                  ...auditAttribution,
                 }, store);
               }
               // Then per-token `mdl` (glob-matched as of Phase 2.4).
@@ -292,7 +301,7 @@ export async function buildServer(
                     started,
                     reqBytes: bodyBuf?.byteLength ?? 0,
                     requestedModel: requested,
-                    machine,
+                    ...auditAttribution,
                   }, store);
                 }
               }
@@ -319,7 +328,7 @@ export async function buildServer(
                     started,
                     reqBytes: bodyBuf?.byteLength ?? 0,
                     requestedModel: requested,
-                    machine,
+                    ...auditAttribution,
                   }, store);
                 }
                 const cumulative = store.sumCostUsdByToken(tokenId);
@@ -335,7 +344,7 @@ export async function buildServer(
                     started,
                     reqBytes: bodyBuf?.byteLength ?? 0,
                     requestedModel: requested,
-                    machine,
+                    ...auditAttribution,
                   }, store);
                 }
                 estimatedCostUsd = est;
@@ -362,7 +371,7 @@ export async function buildServer(
                 path: upstreamPath,
                 started,
                 reqBytes: bodyBuf?.byteLength ?? 0,
-                machine,
+                ...auditAttribution,
               }, store);
             }
           }
@@ -382,7 +391,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: bodyBuf?.byteLength ?? 0,
-          machine,
+          ...auditAttribution,
         }, store);
       }
 
@@ -398,7 +407,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
-          machine,
+          ...auditAttribution,
         }, store);
       }
 
@@ -412,7 +421,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
-          machine,
+          ...auditAttribution,
         }, store);
       }
 
@@ -429,7 +438,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
-          machine,
+          ...auditAttribution,
         }, store);
       }
 
@@ -470,7 +479,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
-          machine,
+          ...auditAttribution,
         }, store);
       }
 
@@ -548,6 +557,7 @@ export async function buildServer(
           };
           if (reason !== undefined) entry.reason = reason;
           if (machine !== undefined) entry.machine = machine;
+          applyTagAttribution(entry, claims);
           if (estimatedCostUsd !== undefined) entry.estimatedCostUsd = estimatedCostUsd;
           // Try to reconcile actual cost from upstream usage. Only
           // priced models (i.e. those for which we already produced an
@@ -600,6 +610,7 @@ export async function buildServer(
           reason: (e as Error).message,
         };
         if (machine !== undefined) log.machine = machine;
+        applyTagAttribution(log, claims);
         // Phase 2.2: an upstream connect/transport error never produced
         // usage. Record the estimate so the cap accounting still
         // counts this attempt — otherwise a stuck upstream + retries
@@ -660,6 +671,15 @@ function denied(
     reqBytes: number;
     requestedModel?: string;
     machine?: string;
+    /**
+     * Phase 3.3: when present, tag attribution is pulled from the
+     * signed `tag` claim onto the audit entry. Pre-3.3 tokens have
+     * no `tag` claim, so the fields stay undefined. Early-pre-verify
+     * call sites (unknown_provider, no_token, invalid_token) pass no
+     * claims at all and write tagless audit rows — that's correct,
+     * the request never authenticated.
+     */
+    claims?: BrokerClaims;
   },
   store: StoreLike,
 ) {
@@ -679,6 +699,24 @@ function denied(
   };
   if (ctx.requestedModel !== undefined) entry.requestedModel = ctx.requestedModel;
   if (ctx.machine !== undefined) entry.machine = ctx.machine;
+  applyTagAttribution(entry, ctx.claims);
   store.appendCall(entry);
   return reply.status(status).send({ error: reason });
+}
+
+/**
+ * Phase 3.3: copy tag attribution from a verified JWT's `tag` claim onto
+ * an audit entry. No-op when claims/tag is absent. Same posture as
+ * machine: the broker doesn't re-validate against policy here — the
+ * claim is trusted as signed.
+ */
+function applyTagAttribution(
+  entry: CallLogEntry,
+  claims: BrokerClaims | undefined,
+): void {
+  const tag = claims?.tag;
+  if (!tag) return;
+  if (tag.t !== undefined) entry.tagTeam = tag.t;
+  if (tag.p !== undefined) entry.tagProject = tag.p;
+  if (tag.e !== undefined) entry.tagEnv = tag.e;
 }

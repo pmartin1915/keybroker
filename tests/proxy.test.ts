@@ -83,6 +83,7 @@ async function mintToken(opts: {
   models?: string[];
   machine?: string;
   capUsd?: number;
+  tags?: { team?: string; project?: string; env?: string };
 }): Promise<{ id: string; jwt: string }> {
   const id = newTokenId();
   const provider = opts.provider ?? "echo";
@@ -102,6 +103,9 @@ async function mintToken(opts: {
   };
   if (opts.machine !== undefined) rec.machine = opts.machine;
   if (opts.capUsd !== undefined) rec.capUsd = opts.capUsd;
+  if (opts.tags?.team !== undefined) rec.tagTeam = opts.tags.team;
+  if (opts.tags?.project !== undefined) rec.tagProject = opts.tags.project;
+  if (opts.tags?.env !== undefined) rec.tagEnv = opts.tags.env;
   store.putToken(rec);
   const jwt = await issueToken(config.jwtSecret, {
     tokenId: id,
@@ -112,6 +116,7 @@ async function mintToken(opts: {
     models: opts.models,
     machine: opts.machine,
     capUsd: opts.capUsd,
+    tags: opts.tags,
   });
   return { id, jwt };
 }
@@ -824,5 +829,100 @@ describe("proxy: token presentation styles", () => {
       body: "{}",
     });
     expect(res.status).toBe(200);
+  });
+});
+
+describe("proxy: tag attribution (Phase 3.3)", () => {
+  // Each test mints a freshly-tagged token and inspects its row in the
+  // audit log via store.recentCalls. The broker carries `tag.t/p/e` from
+  // the verified JWT into CallLogEntry.tagTeam/tagProject/tagEnv on
+  // every audit-write path: success, error, and denied.
+
+  it("propagates tag fields to a successful call's audit row", async () => {
+    const { id, jwt } = await mintToken({
+      scopes: ["POST:/v1/"],
+      tags: { team: "platform", project: "dispatcher", env: "prod" },
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/tagged-ok`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(res.status).toBe(200);
+    const calls = store.recentCalls({ limit: 5, tokenId: id });
+    expect(calls.length).toBeGreaterThan(0);
+    const last = calls[calls.length - 1];
+    expect(last?.outcome).toBe("ok");
+    expect(last?.tagTeam).toBe("platform");
+    expect(last?.tagProject).toBe("dispatcher");
+    expect(last?.tagEnv).toBe("prod");
+  });
+
+  it("propagates a partial tag (project only) without leaking the others", async () => {
+    const { id, jwt } = await mintToken({
+      scopes: ["POST:/v1/"],
+      tags: { project: "broker" },
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/tag-partial`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(res.status).toBe(200);
+    const calls = store.recentCalls({ limit: 5, tokenId: id });
+    const last = calls[calls.length - 1];
+    expect(last?.tagProject).toBe("broker");
+    expect(last?.tagTeam).toBeUndefined();
+    expect(last?.tagEnv).toBeUndefined();
+  });
+
+  it("propagates tags to denied audit rows (scope_denied path)", async () => {
+    // Denials must carry attribution too — otherwise FinOps queries
+    // would miss spend-adjacent activity (e.g. who tried to call the
+    // wrong endpoint with a forbidden token).
+    const { id, jwt } = await mintToken({
+      scopes: ["GET:/v1/onlyget"],
+      tags: { team: "infra", env: "dev" },
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/something/else`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(res.status).toBe(403);
+    expect(await jsonError(res)).toBe("scope_denied");
+    const calls = store.recentCalls({ limit: 5, tokenId: id });
+    const last = calls[calls.length - 1];
+    expect(last?.outcome).toBe("denied");
+    expect(last?.tagTeam).toBe("infra");
+    expect(last?.tagEnv).toBe("dev");
+    expect(last?.tagProject).toBeUndefined();
+  });
+
+  it("leaves tag fields undefined for an untagged token", async () => {
+    const { id, jwt } = await mintToken({ scopes: ["POST:/v1/"] });
+    const res = await fetch(`${brokerOrigin}/echo/v1/untagged`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(res.status).toBe(200);
+    const calls = store.recentCalls({ limit: 5, tokenId: id });
+    const last = calls[calls.length - 1];
+    expect(last?.tagTeam).toBeUndefined();
+    expect(last?.tagProject).toBeUndefined();
+    expect(last?.tagEnv).toBeUndefined();
   });
 });

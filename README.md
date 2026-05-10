@@ -89,8 +89,9 @@ The echo upstream's response will show you exactly what the broker forwarded, in
 | Expiry            | `--ttl <seconds>`. JWT `exp` + server-side check.                  |
 | Revocation        | `keybroker token revoke <id>` — server-side flag, takes effect immediately. `revoke-all --machine <name>` for bulk rotation. |
 | Machine           | `--machine` (default `os.hostname()`). Every audit entry carries `mch`. Filter tokens and logs by machine. |
-| Fleet policy      | `~/.keybroker/policy.json`: `forbidden_models` (glob deny-list) + `allowed_providers`. Hot-reloads without restart. |
-| Audit             | Every call (allowed or denied) appended to SQLite `calls` table with token id, label, status, latency, requested model, machine, estimated and actual cost. |
+| Tags              | `--team`, `--project`, `--env` for FinOps attribution. Validated against `policy.json` `tag_allowlist` (per-tag, optional). Carried into every audit row for spend roll-ups. |
+| Fleet policy      | `~/.keybroker/policy.json`: `forbidden_models` (glob deny-list) + `allowed_providers` + `tag_allowlist` (per-tag allow-list). Hot-reloads without restart. |
+| Audit             | Every call (allowed or denied) appended to SQLite `calls` table with token id, label, status, latency, requested model, machine, tags, estimated and actual cost. |
 
 ## Architecture
 
@@ -99,7 +100,7 @@ your app  ──Authorization: Bearer brk_xxx──►  keybroker  ──Authori
                                                   │
                                                   ├─ store: ~/.keybroker/store.sqlite
                                                   │   secrets: AES-256-GCM @ master key
-                                                  │   tokens: scopes, quota, spend, expiry, revoked-flag, machine
+                                                  │   tokens: scopes, quota, spend, expiry, revoked-flag, machine, tags
                                                   │
                                                   └─ audit: SQLite `calls` table (JSONL export available)
 ```

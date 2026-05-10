@@ -19,11 +19,12 @@ import {
   type StoreMode,
   type TokenRecord,
 } from "./store.js";
-import { issueToken } from "./tokens.js";
+import { issueToken, MAX_TAG_VALUE_LEN } from "./tokens.js";
 import { PROVIDERS, getProvider } from "./providers/index.js";
 import { buildServer } from "./server.js";
 import { getKeychain, KC_JWT_SECRET, KC_MASTER_KEY } from "./keychain.js";
 import { normalizeMachine } from "./hostname.js";
+import { loadPolicy, policyDeniesTag, type TagKey } from "./policy.js";
 
 function parseStoreMode(s: string | undefined): StoreMode {
   if (!s) return "auto";
@@ -268,6 +269,21 @@ token
       "calls can exceed the cap before the broker notices; pad the cap accordingly. " +
       "Decimals allowed (e.g. 0.50). Omit / 0 = no cap.",
   )
+  .option(
+    "--team <name>",
+    "tag the token with a team for FinOps attribution. Validated against " +
+      "policy.json `tag_allowlist.team` if configured.",
+  )
+  .option(
+    "--project <name>",
+    "tag the token with a project for FinOps attribution. Validated against " +
+      "policy.json `tag_allowlist.project` if configured.",
+  )
+  .option(
+    "--env <name>",
+    "tag the token with an environment (e.g. dev/staging/prod). Validated " +
+      "against policy.json `tag_allowlist.env` if configured.",
+  )
   .action(
     async (opts: {
       provider: string;
@@ -278,6 +294,9 @@ token
       model?: string[];
       machine?: string;
       capUsd?: string;
+      team?: string;
+      project?: string;
+      env?: string;
     }) => {
       const provSpec = getProvider(opts.provider);
       if (!provSpec) {
@@ -325,6 +344,38 @@ token
         }
         if (n > 0) capUsd = n;
       }
+      // Phase 3.3: tag validation. Allow-list is per-tag and optional;
+      // unconfigured keys accept any value (still subject to the
+      // length cap in tokens.ts). We validate BEFORE writing anything
+      // so a typo'd --team doesn't leave a half-issued record.
+      const policy = loadPolicy(cfg.policyPath);
+      const tagInputs: Array<[TagKey, string | undefined]> = [
+        ["team", opts.team],
+        ["project", opts.project],
+        ["env", opts.env],
+      ];
+      const tags: { team?: string; project?: string; env?: string } = {};
+      for (const [key, raw] of tagInputs) {
+        if (raw === undefined || raw === "") continue;
+        if (raw.length > MAX_TAG_VALUE_LEN) {
+          console.error(
+            `--${key} value exceeds ${MAX_TAG_VALUE_LEN} chars (got ${raw.length}).`,
+          );
+          process.exitCode = 1;
+          return;
+        }
+        if (policyDeniesTag(policy, key, raw)) {
+          const list = policy.tagAllowlist[key];
+          console.error(
+            `--${key} "${raw}" is not in the policy allow-list ` +
+              `[${list?.join(", ")}]. Edit ${cfg.policyPath} to extend it.`,
+          );
+          process.exitCode = 1;
+          return;
+        }
+        tags[key] = raw;
+      }
+      const haveTag = tags.team || tags.project || tags.env;
       const rec: TokenRecord = {
         id,
         provider: opts.provider,
@@ -338,6 +389,9 @@ token
       };
       if (machine !== undefined) rec.machine = machine;
       if (capUsd !== undefined) rec.capUsd = capUsd;
+      if (tags.team !== undefined) rec.tagTeam = tags.team;
+      if (tags.project !== undefined) rec.tagProject = tags.project;
+      if (tags.env !== undefined) rec.tagEnv = tags.env;
       store.putToken(rec);
       const jwt = await issueToken(cfg.jwtSecret, {
         tokenId: id,
@@ -348,13 +402,19 @@ token
         models,
         machine,
         capUsd,
+        tags: haveTag ? tags : undefined,
       });
       console.log(jwt);
       const modelSummary = models ? `, models: ${models.join(", ")}` : "";
       const machineSummary = machine ? `, machine: ${machine}` : "";
       const capSummary = capUsd !== undefined ? `, cap: $${capUsd.toFixed(2)}` : "";
+      const tagBits: string[] = [];
+      if (tags.team) tagBits.push(`team=${tags.team}`);
+      if (tags.project) tagBits.push(`project=${tags.project}`);
+      if (tags.env) tagBits.push(`env=${tags.env}`);
+      const tagSummary = tagBits.length > 0 ? `, tags: ${tagBits.join(" ")}` : "";
       console.error(
-        `\nissued token ${id} for ${opts.provider} (scope: ${opts.scope.join(", ")}, max-calls: ${max}, ttl: ${ttl}s${modelSummary}${machineSummary}${capSummary})`,
+        `\nissued token ${id} for ${opts.provider} (scope: ${opts.scope.join(", ")}, max-calls: ${max}, ttl: ${ttl}s${modelSummary}${machineSummary}${capSummary}${tagSummary})`,
       );
     },
   );
@@ -395,8 +455,15 @@ token
       const cap = t.capUsd !== undefined
         ? `  spent=$${store.sumCostUsdByToken(t.id).toFixed(4)}/cap=$${t.capUsd.toFixed(2)}`
         : "";
+      // Phase 3.3: show whichever tag fields are populated. Skipped
+      // entirely on untagged tokens to keep the row short.
+      const tagBits: string[] = [];
+      if (t.tagTeam) tagBits.push(`team=${t.tagTeam}`);
+      if (t.tagProject) tagBits.push(`project=${t.tagProject}`);
+      if (t.tagEnv) tagBits.push(`env=${t.tagEnv}`);
+      const tagOut = tagBits.length > 0 ? `  ${tagBits.join(" ")}` : "";
       console.log(
-        `${t.id}  ${t.provider.padEnd(10)}  ${status.padEnd(9)}  used=${t.used}  remaining=${t.remaining}  expires=${exp}  label=${t.label}${mach}${cap}`,
+        `${t.id}  ${t.provider.padEnd(10)}  ${status.padEnd(9)}  used=${t.used}  remaining=${t.remaining}  expires=${exp}  label=${t.label}${mach}${cap}${tagOut}`,
       );
     }
   });
