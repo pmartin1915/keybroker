@@ -80,6 +80,11 @@ export async function buildServer(
       }
       const { tokenId, claims } = verified;
 
+      // Capture the machine claim once; threaded into every audit entry
+      // for this request (success, denial, or error) so the audit log
+      // unambiguously attributes the call. Pre-2.3 tokens have no claim.
+      const machine = claims.mch;
+
       if (claims.prv !== provider) {
         return denied(reply, 403, "provider_mismatch", {
           tokenId,
@@ -89,6 +94,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
+          machine,
         }, store);
       }
 
@@ -106,6 +112,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
+          machine,
         }, store);
       }
 
@@ -154,6 +161,7 @@ export async function buildServer(
               path: upstreamPath,
               started,
               reqBytes: bodyBuf?.byteLength ?? 0,
+              machine,
             }, store);
           }
           // Only policy is in play and the provider has no model surface
@@ -177,6 +185,7 @@ export async function buildServer(
                   path: upstreamPath,
                   started,
                   reqBytes: bodyBuf?.byteLength ?? 0,
+                  machine,
                 }, store);
               }
               // Policy alone with no extractable model — nothing to forbid.
@@ -194,6 +203,7 @@ export async function buildServer(
                   started,
                   reqBytes: bodyBuf?.byteLength ?? 0,
                   requestedModel: requested,
+                  machine,
                 }, store);
               }
               // Then per-token `mdl` (glob-matched as of Phase 2.4).
@@ -208,6 +218,7 @@ export async function buildServer(
                     started,
                     reqBytes: bodyBuf?.byteLength ?? 0,
                     requestedModel: requested,
+                    machine,
                   }, store);
                 }
               }
@@ -233,6 +244,7 @@ export async function buildServer(
                 path: upstreamPath,
                 started,
                 reqBytes: bodyBuf?.byteLength ?? 0,
+                machine,
               }, store);
             }
           }
@@ -252,6 +264,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: bodyBuf?.byteLength ?? 0,
+          machine,
         }, store);
       }
 
@@ -267,6 +280,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
+          machine,
         }, store);
       }
 
@@ -280,6 +294,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
+          machine,
         }, store);
       }
 
@@ -296,6 +311,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
+          machine,
         }, store);
       }
 
@@ -336,6 +352,7 @@ export async function buildServer(
           path: upstreamPath,
           started,
           reqBytes: 0,
+          machine,
         }, store);
       }
 
@@ -372,7 +389,7 @@ export async function buildServer(
 
         finished(counter).then(
           () => {
-            store.appendCall({
+            const entry: CallLogEntry = {
               ts: new Date().toISOString(),
               tokenId,
               label: upstreamLabel,
@@ -384,10 +401,12 @@ export async function buildServer(
               reqBytes,
               respBytes,
               outcome: "ok",
-            });
+            };
+            if (machine !== undefined) entry.machine = machine;
+            store.appendCall(entry);
           },
           (err: unknown) => {
-            store.appendCall({
+            const entry: CallLogEntry = {
               ts: new Date().toISOString(),
               tokenId,
               label: upstreamLabel,
@@ -400,7 +419,9 @@ export async function buildServer(
               respBytes,
               outcome: "error",
               reason: (err as Error).message,
-            });
+            };
+            if (machine !== undefined) entry.machine = machine;
+            store.appendCall(entry);
           },
         );
 
@@ -422,6 +443,7 @@ export async function buildServer(
           outcome: "error",
           reason: (e as Error).message,
         };
+        if (machine !== undefined) log.machine = machine;
         store.appendCall(log);
         return reply.status(502).send({ error: "upstream_error" });
       }
@@ -475,6 +497,7 @@ function denied(
     started: number;
     reqBytes: number;
     requestedModel?: string;
+    machine?: string;
   },
   store: StoreLike,
 ) {
@@ -493,6 +516,7 @@ function denied(
     reason,
   };
   if (ctx.requestedModel !== undefined) entry.requestedModel = ctx.requestedModel;
+  if (ctx.machine !== undefined) entry.machine = ctx.machine;
   store.appendCall(entry);
   return reply.status(status).send({ error: reason });
 }

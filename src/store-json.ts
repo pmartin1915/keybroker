@@ -8,6 +8,7 @@ import {
 import type { CallLogEntry } from "./logging.js";
 import type {
   ConsumeResult,
+  ListTokensOptions,
   RecentCallsOptions,
   SecretRecord,
   StoreLike,
@@ -93,8 +94,10 @@ export class JsonStore implements StoreLike {
     return this.read().tokens[id];
   }
 
-  listTokens(): TokenRecord[] {
-    return Object.values(this.read().tokens);
+  listTokens(opts?: ListTokensOptions): TokenRecord[] {
+    const all = Object.values(this.read().tokens);
+    if (opts?.machine === undefined) return all;
+    return all.filter((t) => t.machine === opts.machine);
   }
 
   consumeToken(id: string): ConsumeResult {
@@ -154,9 +157,11 @@ export class JsonStore implements StoreLike {
         // skip malformed lines
       }
     }
-    const filtered = opts.tokenId
-      ? parsed.filter((e) => e.tokenId === opts.tokenId)
-      : parsed;
+    const filtered = parsed.filter((e) => {
+      if (opts.tokenId !== undefined && e.tokenId !== opts.tokenId) return false;
+      if (opts.machine !== undefined && e.machine !== opts.machine) return false;
+      return true;
+    });
     return filtered.slice(-opts.limit);
   }
 }

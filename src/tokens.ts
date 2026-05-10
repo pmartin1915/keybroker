@@ -14,6 +14,13 @@ export interface BrokerClaims extends JWTPayload {
    * of this list or the request is denied 403 model_not_allowed.
    */
   mdl?: string[];
+  /**
+   * Phase 2.3: machine that issued this token (typically `os.hostname()`).
+   * Recorded into the audit log for per-machine attribution and used by
+   * `keybroker tokens --machine` / `revoke-all --machine`. Optional so
+   * pre-2.3 tokens still verify; the broker NEVER enforces presence.
+   */
+  mch?: string;
 }
 
 export const TOKEN_PREFIX = "brk_";
@@ -29,6 +36,8 @@ export async function issueToken(
     ttlSeconds: number;
     /** Optional model allow-list. Empty/undefined → no restriction. */
     models?: string[];
+    /** Optional machine identifier (typically os.hostname()). Empty/undefined → no claim. */
+    machine?: string;
   },
 ): Promise<string> {
   const key = new TextEncoder().encode(secret);
@@ -39,6 +48,9 @@ export async function issueToken(
   };
   if (args.models && args.models.length > 0) {
     payload.mdl = args.models;
+  }
+  if (args.machine && args.machine.length > 0) {
+    payload.mch = args.machine;
   }
   const builder = new SignJWT(payload)
     .setProtectedHeader({ alg: "HS256" })
@@ -72,6 +84,12 @@ export async function verifyToken(
       if (!Array.isArray(claims.mdl) || !claims.mdl.every((m) => typeof m === "string")) {
         return { error: "malformed_claims" };
       }
+    }
+    if (
+      claims.mch !== undefined &&
+      (typeof claims.mch !== "string" || claims.mch.length === 0)
+    ) {
+      return { error: "malformed_claims" };
     }
     return { tokenId: claims.jti, claims };
   } catch (e) {

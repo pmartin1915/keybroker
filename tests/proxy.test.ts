@@ -62,6 +62,7 @@ async function mintToken(opts: {
   provider?: string;
   revoked?: boolean;
   models?: string[];
+  machine?: string;
 }): Promise<{ id: string; jwt: string }> {
   const id = newTokenId();
   const provider = opts.provider ?? "echo";
@@ -79,6 +80,7 @@ async function mintToken(opts: {
     label: "test",
     revoked: opts.revoked ?? false,
   };
+  if (opts.machine !== undefined) rec.machine = opts.machine;
   store.putToken(rec);
   const jwt = await issueToken(config.jwtSecret, {
     tokenId: id,
@@ -87,6 +89,7 @@ async function mintToken(opts: {
     label: "test",
     ttlSeconds: ttl,
     models: opts.models,
+    machine: opts.machine,
   });
   return { id, jwt };
 }
@@ -462,6 +465,115 @@ describe("proxy: model allow-list (Phase 2.1)", () => {
       headers: { Authorization: `Bearer ${jwt}` },
     });
     expect(res.status).toBe(200);
+  });
+});
+
+describe("proxy: machine attribution (Phase 2.3)", () => {
+  it("threads the issuing machine into the success audit entry", async () => {
+    const { id, jwt } = await mintToken({
+      scopes: ["*"],
+      machine: "perrypc",
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/hello`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ hi: "there" }),
+    });
+    expect(res.status).toBe(200);
+    const recent = store.recentCalls({ limit: 5, tokenId: id });
+    const ok = recent.find((e) => e.outcome === "ok");
+    expect(ok?.machine).toBe("perrypc");
+  });
+
+  it("threads the issuing machine into denial audit entries", async () => {
+    const { id, jwt } = await mintToken({
+      scopes: ["GET:/v1/onlyget"],
+      machine: "perrypc",
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/forbidden`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(res.status).toBe(403);
+    const recent = store.recentCalls({ limit: 5, tokenId: id });
+    const denial = recent.find((e) => e.outcome === "denied");
+    expect(denial?.reason).toBe("scope_denied");
+    expect(denial?.machine).toBe("perrypc");
+  });
+
+  it("omits the machine field when token has no mch claim (back-compat)", async () => {
+    const { id, jwt } = await mintToken({ scopes: ["*"] });
+    const res = await fetch(`${brokerOrigin}/echo/v1/hello`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(res.status).toBe(200);
+    const recent = store.recentCalls({ limit: 5, tokenId: id });
+    const ok = recent.find((e) => e.outcome === "ok");
+    expect(ok?.machine).toBeUndefined();
+  });
+
+  it("acceptance: three machines → audit unambiguously attributes every call, and revoke-all isolates by machine", async () => {
+    // Roadmap acceptance criterion for Phase 2.3.
+    const a = await mintToken({ scopes: ["*"], machine: "alpha" });
+    const b = await mintToken({ scopes: ["*"], machine: "beta" });
+    const c = await mintToken({ scopes: ["*"], machine: "gamma" });
+
+    const callOnce = (jwt: string, path: string) =>
+      fetch(`${brokerOrigin}/echo/v1/${path}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+      });
+    expect((await callOnce(a.jwt, "fa")).status).toBe(200);
+    expect((await callOnce(b.jwt, "fb")).status).toBe(200);
+    expect((await callOnce(c.jwt, "fc")).status).toBe(200);
+
+    // Audit log attributes every call to the right machine.
+    const alphaCalls = store
+      .recentCalls({ limit: 100, machine: "alpha" })
+      .filter((e) => e.tokenId === a.id);
+    const betaCalls = store
+      .recentCalls({ limit: 100, machine: "beta" })
+      .filter((e) => e.tokenId === b.id);
+    const gammaCalls = store
+      .recentCalls({ limit: 100, machine: "gamma" })
+      .filter((e) => e.tokenId === c.id);
+    expect(alphaCalls.every((e) => e.machine === "alpha")).toBe(true);
+    expect(betaCalls.every((e) => e.machine === "beta")).toBe(true);
+    expect(gammaCalls.every((e) => e.machine === "gamma")).toBe(true);
+    expect(alphaCalls.length).toBeGreaterThanOrEqual(1);
+    expect(betaCalls.length).toBeGreaterThanOrEqual(1);
+    expect(gammaCalls.length).toBeGreaterThanOrEqual(1);
+
+    // Bulk-revoke alpha (laptop-was-stolen): mirrors what the
+    // `keybroker revoke-all --machine alpha` CLI does internally —
+    // listTokens({ machine }) → revokeToken each.
+    const stolen = store.listTokens({ machine: "alpha" });
+    for (const t of stolen) store.revokeToken(t.id);
+
+    // Alpha can no longer call.
+    const aRetry = await callOnce(a.jwt, "still-alpha");
+    expect(aRetry.status).toBe(401);
+    expect(((await aRetry.json()) as { error: string }).error).toBe("revoked");
+
+    // Beta and gamma are unaffected.
+    expect((await callOnce(b.jwt, "still-beta")).status).toBe(200);
+    expect((await callOnce(c.jwt, "still-gamma")).status).toBe(200);
   });
 });
 

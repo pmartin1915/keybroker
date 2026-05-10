@@ -278,3 +278,96 @@ describe("issueToken / verifyToken: mdl claim round-trip (Phase 2.1)", () => {
     expect(result).toEqual({ error: "malformed_claims" });
   });
 });
+
+describe("issueToken / verifyToken: mch claim round-trip (Phase 2.3)", () => {
+  it("round-trips an mch machine identifier", async () => {
+    const raw = await issueToken(SECRET, {
+      tokenId: "token-mch-1",
+      provider: "openai",
+      scopes: ["*"],
+      label: "x",
+      ttlSeconds: 60,
+      machine: "perrypc",
+    });
+    const result = await verifyToken(SECRET, raw);
+    if ("error" in result) throw new Error("unexpected: " + result.error);
+    expect(result.claims.mch).toBe("perrypc");
+  });
+
+  it("omits the claim entirely when machine is undefined", async () => {
+    const raw = await issueToken(SECRET, {
+      tokenId: "token-mch-2",
+      provider: "openai",
+      scopes: ["*"],
+      label: "x",
+      ttlSeconds: 60,
+    });
+    const result = await verifyToken(SECRET, raw);
+    if ("error" in result) throw new Error("unreachable");
+    expect(result.claims.mch).toBeUndefined();
+  });
+
+  it("omits the claim when machine is empty string (no attribution = no claim)", async () => {
+    const raw = await issueToken(SECRET, {
+      tokenId: "token-mch-3",
+      provider: "openai",
+      scopes: ["*"],
+      label: "x",
+      ttlSeconds: 60,
+      machine: "",
+    });
+    const result = await verifyToken(SECRET, raw);
+    if ("error" in result) throw new Error("unreachable");
+    expect(result.claims.mch).toBeUndefined();
+  });
+
+  /**
+   * Same forging-via-secret pattern as the mdl validation tests: the broker
+   * must reject a malformed mch shape rather than letting it leak into
+   * BrokerClaims downstream.
+   */
+  async function signRawMch(payload: Record<string, unknown>): Promise<string> {
+    const key = new TextEncoder().encode(SECRET);
+    const jwt = await new SignJWT(payload)
+      .setProtectedHeader({ alg: "HS256" })
+      .setIssuer("keybroker")
+      .setSubject("token-mch-malformed")
+      .setJti("token-mch-malformed")
+      .setIssuedAt()
+      .sign(key);
+    return TOKEN_PREFIX + jwt;
+  }
+
+  it("rejects mch that is not a string (number)", async () => {
+    const raw = await signRawMch({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      mch: 12345,
+    });
+    const result = await verifyToken(SECRET, raw);
+    expect(result).toEqual({ error: "malformed_claims" });
+  });
+
+  it("rejects mch that is not a string (object)", async () => {
+    const raw = await signRawMch({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      mch: { host: "evil" },
+    });
+    const result = await verifyToken(SECRET, raw);
+    expect(result).toEqual({ error: "malformed_claims" });
+  });
+
+  it("rejects mch that is the empty string (issueToken won't produce this; reject on verify too)", async () => {
+    const raw = await signRawMch({
+      prv: "openai",
+      scp: ["*"],
+      lbl: "x",
+      mch: "",
+    });
+    const result = await verifyToken(SECRET, raw);
+    expect(result).toEqual({ error: "malformed_claims" });
+  });
+});

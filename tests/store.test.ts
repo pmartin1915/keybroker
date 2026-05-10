@@ -54,6 +54,7 @@ function tokenRec(overrides: Partial<TokenRecord> = {}): TokenRecord {
     createdAt: overrides.createdAt ?? new Date().toISOString(),
     label: overrides.label ?? "test",
     revoked: overrides.revoked ?? false,
+    ...(overrides.machine !== undefined ? { machine: overrides.machine } : {}),
   };
 }
 
@@ -71,6 +72,7 @@ function callRec(overrides: Partial<CallLogEntry> = {}): CallLogEntry {
     respBytes: overrides.respBytes ?? 0,
     outcome: overrides.outcome ?? "ok",
     ...(overrides.reason !== undefined ? { reason: overrides.reason } : {}),
+    ...(overrides.machine !== undefined ? { machine: overrides.machine } : {}),
   };
 }
 
@@ -249,6 +251,53 @@ for (const { name, make } of STORES) {
         expect(only?.reason).toBe("scope_denied");
       });
     });
+
+    describe("machine attribution (Phase 2.3)", () => {
+      it("putToken + getToken preserves the optional machine field", () => {
+        const t = tokenRec({ id: "with-mch", machine: "perrypc" });
+        store.putToken(t);
+        expect(store.getToken("with-mch")?.machine).toBe("perrypc");
+      });
+
+      it("putToken + getToken keeps machine undefined when absent", () => {
+        store.putToken(tokenRec({ id: "no-mch" }));
+        expect(store.getToken("no-mch")?.machine).toBeUndefined();
+      });
+
+      it("listTokens filters by machine when opts.machine is set", () => {
+        store.putToken(tokenRec({ id: "a", machine: "alpha" }));
+        store.putToken(tokenRec({ id: "b", machine: "beta" }));
+        store.putToken(tokenRec({ id: "c", machine: "alpha" }));
+        store.putToken(tokenRec({ id: "d" })); // no machine
+        const alpha = store.listTokens({ machine: "alpha" }).map((t) => t.id).sort();
+        const beta = store.listTokens({ machine: "beta" }).map((t) => t.id).sort();
+        expect(alpha).toEqual(["a", "c"]);
+        expect(beta).toEqual(["b"]);
+        expect(store.listTokens().length).toBe(4);
+      });
+
+      it("appendCall + recentCalls round-trips the machine field", () => {
+        store.appendCall(callRec({ tokenId: "t", machine: "perrypc" }));
+        const [only] = store.recentCalls({ limit: 1 });
+        expect(only?.machine).toBe("perrypc");
+      });
+
+      it("recentCalls filters by machine", () => {
+        store.appendCall(callRec({ tokenId: "t", path: "/a", machine: "alpha" }));
+        store.appendCall(callRec({ tokenId: "t", path: "/b", machine: "beta" }));
+        store.appendCall(callRec({ tokenId: "t", path: "/c", machine: "alpha" }));
+        const alphaOnly = store.recentCalls({ limit: 100, machine: "alpha" });
+        expect(alphaOnly.map((c) => c.path)).toEqual(["/a", "/c"]);
+      });
+
+      it("recentCalls combines tokenId and machine filters", () => {
+        store.appendCall(callRec({ tokenId: "t1", path: "/a", machine: "alpha" }));
+        store.appendCall(callRec({ tokenId: "t2", path: "/b", machine: "alpha" }));
+        store.appendCall(callRec({ tokenId: "t1", path: "/c", machine: "beta" }));
+        const r = store.recentCalls({ limit: 100, tokenId: "t1", machine: "alpha" });
+        expect(r.map((c) => c.path)).toEqual(["/a"]);
+      });
+    });
   });
 }
 
@@ -291,6 +340,93 @@ describe("SqliteStore: schema persistence", () => {
       expect(b.getToken("t1")?.remaining).toBe(7);
       expect(b.recentCalls({ limit: 10 }).length).toBe(1);
       b.close?.();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("SqliteStore: idempotent machine-column migration (Phase 2.3)", () => {
+  it("adds the machine column to a pre-2.3 calls/tokens schema without data loss", async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const dir = mkdtempSync(join(tmpdir(), "kb-mig-"));
+    const dbPath = join(dir, "store.db");
+    try {
+      // Hand-craft a pre-2.3 schema (no machine columns, requested_model
+      // present per Phase 2.1) and seed a row in each table.
+      const old = new DatabaseSync(dbPath);
+      old.exec(`
+        CREATE TABLE tokens (
+          id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          scopes TEXT NOT NULL,
+          remaining INTEGER NOT NULL,
+          used INTEGER NOT NULL DEFAULT 0,
+          expires_at INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          label TEXT NOT NULL DEFAULT 'unlabeled',
+          revoked INTEGER NOT NULL DEFAULT 0
+        ) WITHOUT ROWID;
+        CREATE TABLE calls (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL,
+          token_id TEXT NOT NULL,
+          label TEXT NOT NULL,
+          provider TEXT NOT NULL,
+          method TEXT NOT NULL,
+          path TEXT NOT NULL,
+          status INTEGER NOT NULL,
+          duration_ms INTEGER NOT NULL,
+          req_bytes INTEGER NOT NULL,
+          resp_bytes INTEGER NOT NULL,
+          outcome TEXT NOT NULL,
+          reason TEXT,
+          requested_model TEXT
+        );
+      `);
+      old
+        .prepare(
+          `INSERT INTO tokens (id, provider, scopes, remaining, used, expires_at, created_at, label, revoked)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("legacy-t", "echo", '["*"]', 5, 0, 0, "2026-01-01T00:00:00.000Z", "old", 0);
+      old
+        .prepare(
+          `INSERT INTO calls (ts, token_id, label, provider, method, path, status, duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("2026-01-01T00:00:00.000Z", "legacy-t", "old", "echo", "POST", "/v1/x", 200, 1, 0, 0, "ok", null, null);
+      old.close();
+
+      // Open with the new code — migrate() should ALTER both tables.
+      const s = new SqliteStore(dbPath);
+      try {
+        // Existing data survived.
+        const t = s.getToken("legacy-t");
+        expect(t?.id).toBe("legacy-t");
+        expect(t?.machine).toBeUndefined();
+        const calls = s.recentCalls({ limit: 10 });
+        expect(calls.length).toBe(1);
+        expect(calls[0]?.machine).toBeUndefined();
+        // New writes can use the new field.
+        s.putToken(tokenRec({ id: "new-t", machine: "perrypc" }));
+        s.appendCall(callRec({ tokenId: "new-t", machine: "perrypc" }));
+        expect(s.getToken("new-t")?.machine).toBe("perrypc");
+        expect(s.listTokens({ machine: "perrypc" }).length).toBe(1);
+        expect(s.recentCalls({ limit: 10, machine: "perrypc" }).length).toBe(1);
+      } finally {
+        s.close?.();
+      }
+
+      // Re-open: migrate() must be a no-op on an already-migrated DB
+      // (idempotent — index creation guarded by IF NOT EXISTS, ALTER guarded
+      // by PRAGMA table_info check).
+      const again = new SqliteStore(dbPath);
+      try {
+        expect(again.getToken("new-t")?.machine).toBe("perrypc");
+      } finally {
+        again.close?.();
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { writeFileSync, existsSync, readFileSync, renameSync } from "node:fs";
+import { hostname } from "node:os";
 import { join } from "node:path";
+import * as readline from "node:readline/promises";
 import { ensureDataDir, loadConfig } from "./config.js";
 import {
   generateJwtSecret,
@@ -253,6 +255,10 @@ token
       "(the broker cannot verify the model otherwise). For non-LLM endpoints " +
       "(e.g. file uploads, audio transcriptions), issue a separate token without --model.",
   )
+  .option(
+    "--machine <name>",
+    "machine to attribute the token to (defaults to os.hostname()). Pass --machine '' to omit the claim.",
+  )
   .action(
     async (opts: {
       provider: string;
@@ -261,6 +267,7 @@ token
       ttl: string;
       label: string;
       model?: string[];
+      machine?: string;
     }) => {
       const provSpec = getProvider(opts.provider);
       if (!provSpec) {
@@ -283,6 +290,15 @@ token
       const id = newTokenId();
       const ttl = Number(opts.ttl);
       const max = Number(opts.maxCalls);
+      // Default to os.hostname(); --machine "" explicitly opts out so an
+      // operator who doesn't want machine attribution (e.g. for tokens
+      // issued to a shared CI runner) can suppress it.
+      const machine =
+        opts.machine === undefined
+          ? hostname()
+          : opts.machine === ""
+            ? undefined
+            : opts.machine;
       const rec: TokenRecord = {
         id,
         provider: opts.provider,
@@ -294,6 +310,7 @@ token
         label: opts.label,
         revoked: false,
       };
+      if (machine !== undefined) rec.machine = machine;
       store.putToken(rec);
       const jwt = await issueToken(cfg.jwtSecret, {
         tokenId: id,
@@ -302,11 +319,13 @@ token
         label: opts.label,
         ttlSeconds: ttl,
         models,
+        machine,
       });
       console.log(jwt);
       const modelSummary = models ? `, models: ${models.join(", ")}` : "";
+      const machineSummary = machine ? `, machine: ${machine}` : "";
       console.error(
-        `\nissued token ${id} for ${opts.provider} (scope: ${opts.scope.join(", ")}, max-calls: ${max}, ttl: ${ttl}s${modelSummary})`,
+        `\nissued token ${id} for ${opts.provider} (scope: ${opts.scope.join(", ")}, max-calls: ${max}, ttl: ${ttl}s${modelSummary}${machineSummary})`,
       );
     },
   );
@@ -314,10 +333,13 @@ token
 token
   .command("list")
   .description("List issued tokens.")
-  .action(async () => {
+  .option("--machine <name>", "filter by machine attribution")
+  .action(async (opts: { machine?: string }) => {
     const cfg = await loadConfig();
     const store = openStore(cfg, { mode: storeMode() });
-    const rows = store.listTokens();
+    const rows = store.listTokens(
+      opts.machine !== undefined ? { machine: opts.machine } : undefined,
+    );
     if (rows.length === 0) {
       console.log("(no tokens)");
       return;
@@ -333,8 +355,9 @@ token
           : t.remaining === 0
             ? "EXHAUSTED"
             : "active";
+      const mach = t.machine ? `  machine=${t.machine}` : "";
       console.log(
-        `${t.id}  ${t.provider.padEnd(10)}  ${status.padEnd(9)}  used=${t.used}  remaining=${t.remaining}  expires=${exp}  label=${t.label}`,
+        `${t.id}  ${t.provider.padEnd(10)}  ${status.padEnd(9)}  used=${t.used}  remaining=${t.remaining}  expires=${exp}  label=${t.label}${mach}`,
       );
     }
   });
@@ -354,26 +377,83 @@ token
     }
   });
 
+token
+  .command("revoke-all")
+  .description(
+    "Bulk-revoke every active token attributed to a machine (laptop-was-stolen case).",
+  )
+  .requiredOption("--machine <name>", "machine to revoke all tokens for")
+  .option(
+    "--yes",
+    "skip the interactive confirmation (required for non-interactive use)",
+    false,
+  )
+  .action(async (opts: { machine: string; yes: boolean }) => {
+    const cfg = await loadConfig();
+    const store = openStore(cfg, { mode: storeMode() });
+    const candidates = store
+      .listTokens({ machine: opts.machine })
+      .filter((t) => !t.revoked);
+    if (candidates.length === 0) {
+      console.log(`(no active tokens for machine "${opts.machine}")`);
+      return;
+    }
+    console.error(
+      `about to revoke ${candidates.length} active token(s) for machine "${opts.machine}":`,
+    );
+    for (const t of candidates) {
+      console.error(`  - ${t.id}  (label=${t.label})`);
+    }
+    if (!opts.yes) {
+      // Bulk revoke is destructive and a typo'd --machine could nuke the
+      // wrong fleet member. Require an explicit "yes" unless --yes was passed.
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stderr,
+      });
+      try {
+        const answer = await rl.question("type 'yes' to proceed: ");
+        if (answer.trim() !== "yes") {
+          console.error("aborted.");
+          return;
+        }
+      } finally {
+        rl.close();
+      }
+    }
+    let revoked = 0;
+    for (const t of candidates) {
+      if (store.revokeToken(t.id)) {
+        console.log(`revoked ${t.id}  (label=${t.label})`);
+        revoked++;
+      }
+    }
+    console.error(`done — ${revoked}/${candidates.length} revoked.`);
+  });
+
 program
   .command("logs")
   .description("Tail recent call log entries.")
   .option("-n, --num <n>", "number of recent entries", "20")
   .option("--token <id>", "filter by token id")
-  .action(async (opts: { num: string; token?: string }) => {
+  .option("--machine <name>", "filter by machine attribution")
+  .action(async (opts: { num: string; token?: string; machine?: string }) => {
     const cfg = await loadConfig();
     const store = openStore(cfg, { mode: storeMode() });
     const limit = Number(opts.num);
-    const entries = store.recentCalls(
-      opts.token ? { limit, tokenId: opts.token } : { limit },
-    );
+    const filter: { limit: number; tokenId?: string; machine?: string } = { limit };
+    if (opts.token) filter.tokenId = opts.token;
+    if (opts.machine !== undefined) filter.machine = opts.machine;
+    const entries = store.recentCalls(filter);
     if (entries.length === 0) {
       console.log("(no logs yet)");
       return;
     }
     for (const e of entries) {
       const tag = e.outcome === "ok" ? "OK" : e.outcome.toUpperCase();
+      const mach = e.machine ? `  machine=${e.machine}` : "";
       console.log(
-        `${e.ts}  ${tag.padEnd(7)}  ${String(e.status).padStart(3)}  ${e.method.padEnd(6)}  ${e.provider}${e.path}  ${e.durationMs}ms  token=${e.tokenId.slice(0, 8)}  ${e.reason ?? ""}`,
+        `${e.ts}  ${tag.padEnd(7)}  ${String(e.status).padStart(3)}  ${e.method.padEnd(6)}  ${e.provider}${e.path}  ${e.durationMs}ms  token=${e.tokenId.slice(0, 8)}${mach}  ${e.reason ?? ""}`,
       );
     }
   });

@@ -25,6 +25,13 @@ export interface TokenRecord {
   /** Free-form label so you can find tokens in logs. */
   label: string;
   revoked: boolean;
+  /**
+   * Phase 2.3: machine the token was issued from (typically `os.hostname()`
+   * at issue time). Optional so pre-2.3 records remain valid. Stored on the
+   * record so `keybroker tokens --machine` and `revoke-all --machine` can
+   * filter without decoding every JWT.
+   */
+  machine?: string;
 }
 
 export type ConsumeResult =
@@ -37,6 +44,14 @@ export type ConsumeResult =
 export interface RecentCallsOptions {
   limit: number;
   tokenId?: string;
+  /** Phase 2.3: filter by `machine` audit column. */
+  machine?: string;
+}
+
+/** Phase 2.3: filter for `listTokens`. Empty/missing = no filter. */
+export interface ListTokensOptions {
+  /** Restrict to tokens issued from this machine. */
+  machine?: string;
 }
 
 /**
@@ -51,7 +66,7 @@ export interface StoreLike {
   // tokens
   putToken(rec: TokenRecord): void;
   getToken(id: string): TokenRecord | undefined;
-  listTokens(): TokenRecord[];
+  listTokens(opts?: ListTokensOptions): TokenRecord[];
   /** Atomic check-and-decrement. */
   consumeToken(id: string): ConsumeResult;
   revokeToken(id: string): boolean;

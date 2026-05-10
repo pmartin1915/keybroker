@@ -22,4 +22,9 @@ export interface CallLogEntry {
    * billing-accurate (alias-resolved) reporting.
    */
   requestedModel?: string;
+  /**
+   * Phase 2.3: machine that issued the calling token (from the `mch` claim).
+   * Absent on calls made with pre-2.3 tokens that have no claim.
+   */
+  machine?: string;
 }

@@ -2,6 +2,7 @@ import { DatabaseSync, type StatementSync } from "node:sqlite";
 import type { CallLogEntry } from "./logging.js";
 import type {
   ConsumeResult,
+  ListTokensOptions,
   RecentCallsOptions,
   SecretRecord,
   StoreLike,
@@ -18,6 +19,7 @@ interface TokenRow {
   created_at: string;
   label: string;
   revoked: number;
+  machine: string | null;
 }
 
 interface SecretRow {
@@ -40,6 +42,7 @@ interface CallRow {
   outcome: string;
   reason: string | null;
   requested_model: string | null;
+  machine: string | null;
 }
 
 const SCHEMA = `
@@ -58,7 +61,8 @@ CREATE TABLE IF NOT EXISTS tokens (
   expires_at INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   label TEXT NOT NULL DEFAULT 'unlabeled',
-  revoked INTEGER NOT NULL DEFAULT 0
+  revoked INTEGER NOT NULL DEFAULT 0,
+  machine TEXT
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS calls (
@@ -75,7 +79,8 @@ CREATE TABLE IF NOT EXISTS calls (
   resp_bytes INTEGER NOT NULL,
   outcome TEXT NOT NULL,
   reason TEXT,
-  requested_model TEXT
+  requested_model TEXT,
+  machine TEXT
 );
 
 CREATE INDEX IF NOT EXISTS calls_token_id_idx ON calls(token_id);
@@ -95,11 +100,14 @@ export class SqliteStore implements StoreLike {
     putToken: StatementSync;
     getToken: StatementSync;
     listTokens: StatementSync;
+    listTokensByMachine: StatementSync;
     consumeAttempt: StatementSync;
     revoke: StatementSync;
     insertCall: StatementSync;
     selectCalls: StatementSync;
     selectCallsByToken: StatementSync;
+    selectCallsByMachine: StatementSync;
+    selectCallsByTokenAndMachine: StatementSync;
   };
 
   constructor(path: string) {
@@ -139,8 +147,8 @@ export class SqliteStore implements StoreLike {
         `SELECT provider, created_at FROM secrets ORDER BY provider`,
       ),
       putToken: this.db.prepare(
-        `INSERT INTO tokens (id, provider, scopes, remaining, used, expires_at, created_at, label, revoked)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO tokens (id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            provider = excluded.provider,
            scopes = excluded.scopes,
@@ -149,15 +157,20 @@ export class SqliteStore implements StoreLike {
            expires_at = excluded.expires_at,
            created_at = excluded.created_at,
            label = excluded.label,
-           revoked = excluded.revoked`,
+           revoked = excluded.revoked,
+           machine = excluded.machine`,
       ),
       getToken: this.db.prepare(
-        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked
+        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine
          FROM tokens WHERE id = ?`,
       ),
       listTokens: this.db.prepare(
-        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked
+        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine
          FROM tokens ORDER BY created_at`,
+      ),
+      listTokensByMachine: this.db.prepare(
+        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine
+         FROM tokens WHERE machine = ? ORDER BY created_at`,
       ),
       // Single-statement atomic check-and-decrement. Returns 1 row updated
       // iff the token is consumable. We then read it back to return the
@@ -175,21 +188,37 @@ export class SqliteStore implements StoreLike {
       revoke: this.db.prepare(`UPDATE tokens SET revoked = 1 WHERE id = ?`),
       insertCall: this.db.prepare(
         `INSERT INTO calls
-           (ts, token_id, label, provider, method, path, status, duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (ts, token_id, label, provider, method, path, status, duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       selectCalls: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
-                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model
+                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine
          FROM calls
          ORDER BY id DESC
          LIMIT ?`,
       ),
       selectCallsByToken: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
-                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model
+                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine
          FROM calls
          WHERE token_id = ?
+         ORDER BY id DESC
+         LIMIT ?`,
+      ),
+      selectCallsByMachine: this.db.prepare(
+        `SELECT ts, token_id, label, provider, method, path, status,
+                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine
+         FROM calls
+         WHERE machine = ?
+         ORDER BY id DESC
+         LIMIT ?`,
+      ),
+      selectCallsByTokenAndMachine: this.db.prepare(
+        `SELECT ts, token_id, label, provider, method, path, status,
+                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine
+         FROM calls
+         WHERE token_id = ? AND machine = ?
          ORDER BY id DESC
          LIMIT ?`,
       ),
@@ -229,6 +258,7 @@ export class SqliteStore implements StoreLike {
       rec.createdAt,
       rec.label,
       rec.revoked ? 1 : 0,
+      rec.machine ?? null,
     );
   }
 
@@ -237,10 +267,13 @@ export class SqliteStore implements StoreLike {
     return row ? rowToToken(row) : undefined;
   }
 
-  listTokens(): TokenRecord[] {
-    return (this.stmts.listTokens.all() as unknown as TokenRow[]).map(
-      rowToToken,
-    );
+  listTokens(opts?: ListTokensOptions): TokenRecord[] {
+    const rows = (
+      opts?.machine !== undefined
+        ? this.stmts.listTokensByMachine.all(opts.machine)
+        : this.stmts.listTokens.all()
+    ) as unknown as TokenRow[];
+    return rows.map(rowToToken);
   }
 
   consumeToken(id: string): ConsumeResult {
@@ -285,35 +318,52 @@ export class SqliteStore implements StoreLike {
       entry.outcome,
       entry.reason ?? null,
       entry.requestedModel ?? null,
+      entry.machine ?? null,
     );
   }
 
   private migrate(db: DatabaseSync): void {
-    const cols = db.prepare("PRAGMA table_info(calls)").all() as Array<{
-      name: string;
-    }>;
-    const have = new Set(cols.map((c) => c.name));
-    if (!have.has("requested_model")) {
-      // Race with concurrent openers: two processes can both observe the
-      // column missing, both attempt ALTER, and the loser sees "duplicate
-      // column name". That's a benign race — the column exists either way
-      // — so swallow it. Re-throw anything else, including a different
-      // error message ("duplicate column" wording could change in node:sqlite).
-      try {
-        db.exec("ALTER TABLE calls ADD COLUMN requested_model TEXT");
-      } catch (e) {
-        const msg = (e as Error).message ?? "";
-        if (!/duplicate column name/i.test(msg)) throw e;
-      }
-    }
+    // Same idempotent ALTER pattern as the Phase 2.1 `requested_model`
+    // migration: each missing column is ALTERed individually so a
+    // partially-migrated DB recovers, and the duplicate-column race
+    // between concurrent openers is swallowed.
+    addColumnIfMissing(db, "calls", "requested_model", "TEXT");
+    addColumnIfMissing(db, "calls", "machine", "TEXT");
+    addColumnIfMissing(db, "tokens", "machine", "TEXT");
+    // Indexes for the Phase 2.3 filters. Created post-ALTER so the
+    // referenced columns are guaranteed to exist on pre-2.3 DBs that
+    // have just been migrated.
+    db.exec("CREATE INDEX IF NOT EXISTS calls_machine_idx ON calls(machine)");
+    // Composite index for the combined `--token <id> --machine <name>` log
+    // filter (selectCallsByTokenAndMachine). Without it, SQLite would pick
+    // one single-column index and table-scan the rest of the predicate.
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS calls_token_machine_idx ON calls(token_id, machine)",
+    );
+    db.exec("CREATE INDEX IF NOT EXISTS tokens_machine_idx ON tokens(machine)");
   }
 
   recentCalls(opts: RecentCallsOptions): CallLogEntry[] {
-    const rows = (
-      opts.tokenId
-        ? this.stmts.selectCallsByToken.all(opts.tokenId, opts.limit)
-        : this.stmts.selectCalls.all(opts.limit)
-    ) as unknown as CallRow[];
+    let rows: CallRow[];
+    if (opts.tokenId !== undefined && opts.machine !== undefined) {
+      rows = this.stmts.selectCallsByTokenAndMachine.all(
+        opts.tokenId,
+        opts.machine,
+        opts.limit,
+      ) as unknown as CallRow[];
+    } else if (opts.tokenId !== undefined) {
+      rows = this.stmts.selectCallsByToken.all(
+        opts.tokenId,
+        opts.limit,
+      ) as unknown as CallRow[];
+    } else if (opts.machine !== undefined) {
+      rows = this.stmts.selectCallsByMachine.all(
+        opts.machine,
+        opts.limit,
+      ) as unknown as CallRow[];
+    } else {
+      rows = this.stmts.selectCalls.all(opts.limit) as unknown as CallRow[];
+    }
     // selectCalls returns DESC for "tail N" semantics; flip back to chronological.
     return rows.reverse().map(rowToCall);
   }
@@ -324,7 +374,7 @@ export class SqliteStore implements StoreLike {
 }
 
 function rowToToken(row: TokenRow): TokenRecord {
-  return {
+  const rec: TokenRecord = {
     id: row.id,
     provider: row.provider,
     scopes: JSON.parse(row.scopes) as string[],
@@ -335,6 +385,8 @@ function rowToToken(row: TokenRow): TokenRecord {
     label: row.label,
     revoked: row.revoked === 1,
   };
+  if (row.machine !== null) rec.machine = row.machine;
+  return rec;
 }
 
 function rowToCall(row: CallRow): CallLogEntry {
@@ -353,5 +405,30 @@ function rowToCall(row: CallRow): CallLogEntry {
   };
   if (row.reason !== null) entry.reason = row.reason;
   if (row.requested_model !== null) entry.requestedModel = row.requested_model;
+  if (row.machine !== null) entry.machine = row.machine;
   return entry;
+}
+
+function addColumnIfMissing(
+  db: DatabaseSync,
+  table: string,
+  column: string,
+  type: string,
+): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+    name: string;
+  }>;
+  const have = new Set(cols.map((c) => c.name));
+  if (have.has(column)) return;
+  // Race with concurrent openers: two processes can both observe the
+  // column missing, both attempt ALTER, and the loser sees "duplicate
+  // column name". That's a benign race — the column exists either way
+  // — so swallow it. Re-throw anything else, including a different
+  // error message ("duplicate column" wording could change in node:sqlite).
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  } catch (e) {
+    const msg = (e as Error).message ?? "";
+    if (!/duplicate column name/i.test(msg)) throw e;
+  }
 }
