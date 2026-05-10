@@ -6,8 +6,17 @@ import type {
   RecentCallsOptions,
   SecretRecord,
   StoreLike,
+  TagBucket,
+  TagSpendRow,
   TokenRecord,
 } from "./store-types.js";
+
+// Phase 3.4: tag-bucket SQL is keyed by `TagBucket` via three pairs of
+// prepared statements (sum + top, one per bucket). The dispatch lives
+// in `tagSumStmt` / `tagTopStmt` rather than dynamic SQL on purpose —
+// `bucket` is reachable from the HTTP layer, and any path that builds
+// a SQL fragment from request input is exactly the kind of thing that
+// turns into table drops. The closed type set is the safety boundary.
 
 interface TokenRow {
   id: string;
@@ -130,6 +139,12 @@ export class SqliteStore implements StoreLike {
     sumCostSince: StatementSync;
     countCallsSince: StatementSync;
     sumCostByMachineSince: StatementSync;
+    sumCostByTagTeamSince: StatementSync;
+    sumCostByTagProjectSince: StatementSync;
+    sumCostByTagEnvSince: StatementSync;
+    topTagTeamBySpend: StatementSync;
+    topTagProjectBySpend: StatementSync;
+    topTagEnvBySpend: StatementSync;
   };
 
   constructor(path: string) {
@@ -288,6 +303,70 @@ export class SqliteStore implements StoreLike {
          WHERE ts >= ? AND outcome IN ('ok', 'error')
          GROUP BY COALESCE(machine, '')`,
       ),
+      // Phase 3.4: tag-bucketed aggregations. One prepared statement per
+      // column rather than dynamic SQL — SqliteStore prepares everything
+      // in the constructor and `tag_team` / `tag_project` / `tag_env`
+      // are the closed set of buckets. The `IS NOT NULL` filter excludes
+      // untagged calls so tag-focused dashboards don't get dominated by
+      // a phantom NULL bucket; use sumCostUsdSince for the total. Denied
+      // outcome filter mirrors every other spend query.
+      sumCostByTagTeamSince: this.db.prepare(
+        `SELECT tag_team AS key,
+                COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd)), 0) AS total
+         FROM calls
+         WHERE ts >= ? AND outcome IN ('ok', 'error') AND tag_team IS NOT NULL
+         GROUP BY tag_team`,
+      ),
+      sumCostByTagProjectSince: this.db.prepare(
+        `SELECT tag_project AS key,
+                COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd)), 0) AS total
+         FROM calls
+         WHERE ts >= ? AND outcome IN ('ok', 'error') AND tag_project IS NOT NULL
+         GROUP BY tag_project`,
+      ),
+      sumCostByTagEnvSince: this.db.prepare(
+        `SELECT tag_env AS key,
+                COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd)), 0) AS total
+         FROM calls
+         WHERE ts >= ? AND outcome IN ('ok', 'error') AND tag_env IS NOT NULL
+         GROUP BY tag_env`,
+      ),
+      // ORDER BY usd DESC, key ASC: the alphabetic tiebreak makes the
+      // leaderboard deterministic when two buckets have identical spend
+      // (common in tests, possible in low-traffic prod). Without it,
+      // SQLite's GROUP BY order is unspecified and snapshot tests would
+      // flake. callCount is COUNT over the same filter — a tagged call
+      // with no priced cost still counts as activity.
+      topTagTeamBySpend: this.db.prepare(
+        `SELECT tag_team AS key,
+                COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd)), 0) AS usd,
+                COUNT(*) AS call_count
+         FROM calls
+         WHERE ts >= ? AND outcome IN ('ok', 'error') AND tag_team IS NOT NULL
+         GROUP BY tag_team
+         ORDER BY usd DESC, key ASC
+         LIMIT ?`,
+      ),
+      topTagProjectBySpend: this.db.prepare(
+        `SELECT tag_project AS key,
+                COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd)), 0) AS usd,
+                COUNT(*) AS call_count
+         FROM calls
+         WHERE ts >= ? AND outcome IN ('ok', 'error') AND tag_project IS NOT NULL
+         GROUP BY tag_project
+         ORDER BY usd DESC, key ASC
+         LIMIT ?`,
+      ),
+      topTagEnvBySpend: this.db.prepare(
+        `SELECT tag_env AS key,
+                COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd)), 0) AS usd,
+                COUNT(*) AS call_count
+         FROM calls
+         WHERE ts >= ? AND outcome IN ('ok', 'error') AND tag_env IS NOT NULL
+         GROUP BY tag_env
+         ORDER BY usd DESC, key ASC
+         LIMIT ?`,
+      ),
     };
   }
 
@@ -428,6 +507,57 @@ export class SqliteStore implements StoreLike {
     return out;
   }
 
+  sumCostUsdByTagSince(bucket: TagBucket, ts: string): Record<string, number> {
+    const stmt = this.tagSumStmt(bucket);
+    const rows = stmt.all(ts) as Array<{
+      key: string;
+      total: number | null;
+    }>;
+    const out: Record<string, number> = {};
+    for (const r of rows) out[r.key] = r.total ?? 0;
+    return out;
+  }
+
+  topTagsBySpend(
+    bucket: TagBucket,
+    since: string,
+    limit: number,
+  ): TagSpendRow[] {
+    const stmt = this.tagTopStmt(bucket);
+    const rows = stmt.all(since, limit) as Array<{
+      key: string;
+      usd: number | null;
+      call_count: number;
+    }>;
+    return rows.map((r) => ({
+      key: r.key,
+      usd: r.usd ?? 0,
+      callCount: r.call_count,
+    }));
+  }
+
+  private tagSumStmt(bucket: TagBucket): StatementSync {
+    switch (bucket) {
+      case "team":
+        return this.stmts.sumCostByTagTeamSince;
+      case "project":
+        return this.stmts.sumCostByTagProjectSince;
+      case "env":
+        return this.stmts.sumCostByTagEnvSince;
+    }
+  }
+
+  private tagTopStmt(bucket: TagBucket): StatementSync {
+    switch (bucket) {
+      case "team":
+        return this.stmts.topTagTeamBySpend;
+      case "project":
+        return this.stmts.topTagProjectBySpend;
+      case "env":
+        return this.stmts.topTagEnvBySpend;
+    }
+  }
+
   private migrate(db: DatabaseSync): void {
     // Same idempotent ALTER pattern as the Phase 2.1 `requested_model`
     // migration: each missing column is ALTERed individually so a
@@ -461,6 +591,22 @@ export class SqliteStore implements StoreLike {
       "CREATE INDEX IF NOT EXISTS calls_token_machine_idx ON calls(token_id, machine)",
     );
     db.exec("CREATE INDEX IF NOT EXISTS tokens_machine_idx ON tokens(machine)");
+    // Phase 3.4: partial indexes for the tag-bucketed spend queries. Each
+    // tag is sparse (most calls untagged in early rollout), and the
+    // queries already filter `IS NOT NULL`, so a partial index on the
+    // non-null subset stays small and avoids indexing the long tail of
+    // untagged rows. `(ts, tag_X)` puts the time-range filter first,
+    // matching the access pattern of `WHERE ts >= ? AND tag_X IS NOT
+    // NULL GROUP BY tag_X`.
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS calls_tag_team_ts_idx ON calls(ts, tag_team) WHERE tag_team IS NOT NULL",
+    );
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS calls_tag_project_ts_idx ON calls(ts, tag_project) WHERE tag_project IS NOT NULL",
+    );
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS calls_tag_env_ts_idx ON calls(ts, tag_env) WHERE tag_env IS NOT NULL",
+    );
   }
 
   recentCalls(opts: RecentCallsOptions): CallLogEntry[] {

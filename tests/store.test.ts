@@ -528,6 +528,140 @@ for (const { name, make } of STORES) {
         expect(out["host-a"]).toBeCloseTo(0.20, 6);
       });
     });
+
+    describe("tag-bucketed spend (Phase 3.4)", () => {
+      it("sumCostUsdByTagSince returns empty object when no calls", () => {
+        expect(
+          store.sumCostUsdByTagSince("team", new Date().toISOString()),
+        ).toEqual({});
+      });
+
+      it("sumCostUsdByTagSince groups by tag value for the chosen bucket", () => {
+        const ts = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", actualCostUsd: 0.10, ts }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", actualCostUsd: 0.05, ts }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "research", outcome: "ok", actualCostUsd: 0.20, ts }));
+        const out = store.sumCostUsdByTagSince("team", ts);
+        expect(out["platform"]).toBeCloseTo(0.15, 6);
+        expect(out["research"]).toBeCloseTo(0.20, 6);
+      });
+
+      it("sumCostUsdByTagSince respects the bucket — project tags do not pollute team results", () => {
+        // A call tagged project=broker has tagTeam null, so it must
+        // not appear in the team bucket. Mirror dimensions cleanly.
+        const ts = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", tagProject: "broker", outcome: "ok", actualCostUsd: 0.10, ts }));
+        store.appendCall(callRec({ tokenId: "t", tagProject: "dispatcher", outcome: "ok", actualCostUsd: 0.20, ts }));
+        const team = store.sumCostUsdByTagSince("team", ts);
+        const project = store.sumCostUsdByTagSince("project", ts);
+        expect(Object.keys(team)).toEqual(["platform"]);
+        expect(team["platform"]).toBeCloseTo(0.10, 6);
+        expect(project["broker"]).toBeCloseTo(0.10, 6);
+        expect(project["dispatcher"]).toBeCloseTo(0.20, 6);
+      });
+
+      it("sumCostUsdByTagSince excludes denied calls", () => {
+        const ts = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", actualCostUsd: 0.10, ts }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "denied", estimatedCostUsd: 0.99, ts }));
+        const out = store.sumCostUsdByTagSince("team", ts);
+        expect(out["platform"]).toBeCloseTo(0.10, 6);
+      });
+
+      it("sumCostUsdByTagSince excludes untagged rows entirely (no '' bucket)", () => {
+        // Tag aggregation is opt-in; an untagged bucket would dominate
+        // any project that hasn't fully rolled out tagging. For total
+        // spend, callers use sumCostUsdSince.
+        const ts = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", outcome: "ok", actualCostUsd: 0.10, ts }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", actualCostUsd: 0.20, ts }));
+        const out = store.sumCostUsdByTagSince("team", ts);
+        expect(Object.keys(out)).toEqual(["platform"]);
+        expect(out["platform"]).toBeCloseTo(0.20, 6);
+        expect(out[""]).toBeUndefined();
+      });
+
+      it("sumCostUsdByTagSince respects the timestamp window", () => {
+        const oldTs = new Date(Date.now() - 86400000).toISOString();
+        const newTs = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", actualCostUsd: 0.10, ts: oldTs }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", actualCostUsd: 0.30, ts: newTs }));
+        const out = store.sumCostUsdByTagSince("team", newTs);
+        expect(out["platform"]).toBeCloseTo(0.30, 6);
+      });
+
+      it("topTagsBySpend returns empty array when no calls", () => {
+        expect(
+          store.topTagsBySpend("team", new Date().toISOString(), 10),
+        ).toEqual([]);
+      });
+
+      it("topTagsBySpend orders by usd descending with alphabetic tiebreak", () => {
+        // Two tags with identical spend: alphabetic order pins their
+        // position so leaderboard rendering is stable across runs.
+        const ts = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "alpha", outcome: "ok", actualCostUsd: 0.10, ts }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "bravo", outcome: "ok", actualCostUsd: 0.10, ts }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "charlie", outcome: "ok", actualCostUsd: 0.50, ts }));
+        const rows = store.topTagsBySpend("team", ts, 10);
+        expect(rows.map((r) => r.key)).toEqual(["charlie", "alpha", "bravo"]);
+        expect(rows[0]!.usd).toBeCloseTo(0.50, 6);
+      });
+
+      it("topTagsBySpend caps at the requested limit", () => {
+        const ts = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "a", outcome: "ok", actualCostUsd: 0.10, ts }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "b", outcome: "ok", actualCostUsd: 0.20, ts }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "c", outcome: "ok", actualCostUsd: 0.30, ts }));
+        const rows = store.topTagsBySpend("team", ts, 2);
+        expect(rows.length).toBe(2);
+        expect(rows.map((r) => r.key)).toEqual(["c", "b"]);
+      });
+
+      it("topTagsBySpend reports callCount, including unpriced tagged calls", () => {
+        // A tagged call with no estimated/actual cost still attributes
+        // activity to that bucket — count != usd.
+        const ts = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", actualCostUsd: 0.10, ts }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", ts }));
+        const rows = store.topTagsBySpend("team", ts, 10);
+        expect(rows.length).toBe(1);
+        expect(rows[0]!.callCount).toBe(2);
+        expect(rows[0]!.usd).toBeCloseTo(0.10, 6);
+      });
+
+      it("topTagsBySpend excludes denied calls", () => {
+        const ts = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", actualCostUsd: 0.10, ts }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "denied", estimatedCostUsd: 0.99, ts }));
+        const rows = store.topTagsBySpend("team", ts, 10);
+        expect(rows[0]!.usd).toBeCloseTo(0.10, 6);
+        // callCount counts only the ok call — denied is filtered out
+        // entirely (same posture as sumCostUsdSince).
+        expect(rows[0]!.callCount).toBe(1);
+      });
+
+      it("topTagsBySpend respects the timestamp window", () => {
+        const oldTs = new Date(Date.now() - 86400000).toISOString();
+        const newTs = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", actualCostUsd: 0.10, ts: oldTs }));
+        store.appendCall(callRec({ tokenId: "t", tagTeam: "platform", outcome: "ok", actualCostUsd: 0.30, ts: newTs }));
+        const rows = store.topTagsBySpend("team", newTs, 10);
+        expect(rows.length).toBe(1);
+        expect(rows[0]!.usd).toBeCloseTo(0.30, 6);
+        expect(rows[0]!.callCount).toBe(1);
+      });
+
+      it("topTagsBySpend works for project and env buckets independently", () => {
+        const ts = new Date().toISOString();
+        store.appendCall(callRec({ tokenId: "t", tagProject: "broker", tagEnv: "prod", outcome: "ok", actualCostUsd: 0.10, ts }));
+        store.appendCall(callRec({ tokenId: "t", tagProject: "dispatcher", tagEnv: "dev", outcome: "ok", actualCostUsd: 0.20, ts }));
+        const proj = store.topTagsBySpend("project", ts, 10);
+        const env = store.topTagsBySpend("env", ts, 10);
+        expect(proj.map((r) => r.key)).toEqual(["dispatcher", "broker"]);
+        expect(env.map((r) => r.key)).toEqual(["dev", "prod"]);
+      });
+    });
   });
 }
 

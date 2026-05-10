@@ -926,3 +926,132 @@ describe("proxy: tag attribution (Phase 3.3)", () => {
     expect(last?.tagEnv).toBeUndefined();
   });
 });
+
+describe("/metrics/spend (Phase 3.4)", () => {
+  // The route is open (no token required) — same posture as /health.
+  // It reads the same audit log every other test populates, so each
+  // assertion seeds its own tagged audit rows directly via store.appendCall
+  // rather than going through the proxy. That keeps these tests fast
+  // and independent of upstream availability.
+
+  it("rejects an invalid bucket", async () => {
+    const res = await fetch(`${brokerOrigin}/metrics/spend?bucket=region&since=24h`);
+    expect(res.status).toBe(400);
+    expect(await jsonError(res)).toBe("invalid_bucket");
+  });
+
+  it("rejects a missing bucket", async () => {
+    const res = await fetch(`${brokerOrigin}/metrics/spend?since=24h`);
+    expect(res.status).toBe(400);
+    expect(await jsonError(res)).toBe("invalid_bucket");
+  });
+
+  it("rejects a missing since", async () => {
+    const res = await fetch(`${brokerOrigin}/metrics/spend?bucket=team`);
+    expect(res.status).toBe(400);
+    expect(await jsonError(res)).toBe("missing_since");
+  });
+
+  it("rejects an unparseable since", async () => {
+    const res = await fetch(`${brokerOrigin}/metrics/spend?bucket=team&since=yesterday`);
+    expect(res.status).toBe(400);
+    expect(await jsonError(res)).toBe("invalid_since");
+  });
+
+  it("rejects since with a non-shorthand unit", async () => {
+    const res = await fetch(`${brokerOrigin}/metrics/spend?bucket=team&since=24x`);
+    expect(res.status).toBe(400);
+    expect(await jsonError(res)).toBe("invalid_since");
+  });
+
+  it("rejects an invalid limit", async () => {
+    const res = await fetch(`${brokerOrigin}/metrics/spend?bucket=team&since=24h&limit=0`);
+    expect(res.status).toBe(400);
+    expect(await jsonError(res)).toBe("invalid_limit");
+  });
+
+  it("rejects a limit above the cap", async () => {
+    const res = await fetch(`${brokerOrigin}/metrics/spend?bucket=team&since=24h&limit=9999`);
+    expect(res.status).toBe(400);
+    expect(await jsonError(res)).toBe("invalid_limit");
+  });
+
+  it("returns a ranked list with key, usd, and callCount", async () => {
+    // Seed three tagged calls inside the 24h window. We use a unique
+    // team-tag prefix so this assertion isn't disturbed by the rows
+    // earlier tests in this file appended (those use generic team
+    // names like "platform" / "infra").
+    const ts = new Date().toISOString();
+    const tag = (s: string) => `m34-${s}`;
+    store.appendCall({
+      ts,
+      tokenId: "metrics-test",
+      label: "test",
+      provider: "echo",
+      method: "POST",
+      path: "/v1/x",
+      status: 200,
+      durationMs: 5,
+      reqBytes: 0,
+      respBytes: 0,
+      outcome: "ok",
+      tagTeam: tag("alpha"),
+      actualCostUsd: 0.10,
+    });
+    store.appendCall({
+      ts,
+      tokenId: "metrics-test",
+      label: "test",
+      provider: "echo",
+      method: "POST",
+      path: "/v1/x",
+      status: 200,
+      durationMs: 5,
+      reqBytes: 0,
+      respBytes: 0,
+      outcome: "ok",
+      tagTeam: tag("alpha"),
+      actualCostUsd: 0.05,
+    });
+    store.appendCall({
+      ts,
+      tokenId: "metrics-test",
+      label: "test",
+      provider: "echo",
+      method: "POST",
+      path: "/v1/x",
+      status: 200,
+      durationMs: 5,
+      reqBytes: 0,
+      respBytes: 0,
+      outcome: "ok",
+      tagTeam: tag("bravo"),
+      actualCostUsd: 0.50,
+    });
+    const res = await fetch(`${brokerOrigin}/metrics/spend?bucket=team&since=24h`);
+    expect(res.status).toBe(200);
+    const rows = (await res.json()) as Array<{
+      key: string;
+      usd: number;
+      callCount: number;
+    }>;
+    const ours = rows.filter((r) => r.key.startsWith("m34-"));
+    expect(ours.map((r) => r.key)).toEqual([tag("bravo"), tag("alpha")]);
+    expect(ours[0]!.usd).toBeCloseTo(0.50, 6);
+    expect(ours[0]!.callCount).toBe(1);
+    expect(ours[1]!.usd).toBeCloseTo(0.15, 6);
+    expect(ours[1]!.callCount).toBe(2);
+  });
+
+  it("respects the limit query parameter", async () => {
+    // We've seeded two m34- team tags above (alpha, bravo). Asking
+    // limit=1 should truncate to just the highest-spend bucket. We
+    // can't assert exact identity since other tests in this file
+    // populate "platform"/"infra"/etc with potentially higher spend,
+    // so we check only that the response respects the cap.
+    const res = await fetch(`${brokerOrigin}/metrics/spend?bucket=team&since=24h&limit=1`);
+    expect(res.status).toBe(200);
+    const rows = (await res.json()) as Array<{ key: string; usd: number }>;
+    expect(rows.length).toBe(1);
+  });
+});

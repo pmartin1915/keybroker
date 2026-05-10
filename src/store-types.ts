@@ -73,6 +73,28 @@ export interface ListTokensOptions {
 }
 
 /**
+ * Phase 3.4: which tag column to bucket on. Maps to the audit columns
+ * `tag_team` / `tag_project` / `tag_env`. The string spelling matches
+ * the CLI's `--by` flag and the HTTP `bucket` query parameter — keep
+ * them in lockstep.
+ */
+export type TagBucket = "team" | "project" | "env";
+
+/**
+ * Phase 3.4: one row of tag-bucketed spend. `key` is the literal tag
+ * value (never empty — untagged calls are filtered out at the store
+ * layer; the "Spend by Team" view is a tag-focused query, not a
+ * total-spend query). `usd` and `callCount` are scoped to the same
+ * `outcome IN ('ok', 'error')` filter as `sumCostUsdSince` so denied
+ * calls — which never reached upstream — don't pollute the bucket.
+ */
+export interface TagSpendRow {
+  key: string;
+  usd: number;
+  callCount: number;
+}
+
+/**
  * Storage interface implemented by JsonStore (legacy) and SqliteStore (default).
  * `consumeToken` MUST be atomic across concurrent processes.
  */
@@ -118,6 +140,27 @@ export interface StoreLike {
    * decides whether to surface that bucket.
    */
   sumCostUsdByMachineSince(ts: string): Record<string, number>;
+  /**
+   * Phase 3.4: USD spend grouped by tag value for a single tag bucket
+   * since ISO timestamp. Untagged calls (NULL tag column) are excluded
+   * — tag aggregation is opt-in and a phantom "" bucket would dominate
+   * any project that hasn't fully rolled out tagging. Denied calls are
+   * excluded for the same reason as `sumCostUsdSince`.
+   */
+  sumCostUsdByTagSince(bucket: TagBucket, ts: string): Record<string, number>;
+  /**
+   * Phase 3.4: ranked tag-bucket spend for the dashboard / CLI. Same
+   * filter posture as `sumCostUsdByTagSince` (untagged + denied
+   * excluded) but ordered by spend descending and capped by `limit`.
+   * Ties broken alphabetically by `key` so successive calls with the
+   * same data return a stable order — load-bearing for snapshot tests
+   * and for any UI that diff-renders the leaderboard.
+   */
+  topTagsBySpend(
+    bucket: TagBucket,
+    since: string,
+    limit: number,
+  ): TagSpendRow[];
   /** Optional close hook (SQLite handle, etc.). */
   close?(): void;
 }

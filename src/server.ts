@@ -4,7 +4,7 @@ import { Transform } from "node:stream";
 import { finished } from "node:stream/promises";
 import type { BrokerConfig } from "./config.js";
 import { openStore } from "./store.js";
-import type { StoreLike } from "./store-types.js";
+import type { StoreLike, TagBucket } from "./store-types.js";
 import { scopeAllows, verifyToken, type BrokerClaims } from "./tokens.js";
 import { decrypt } from "./crypto.js";
 import { getProvider } from "./providers/index.js";
@@ -56,6 +56,50 @@ export async function buildServer(
         last24hSpendUsdByMachine: store.sumCostUsdByMachineSince(dayAgo),
       },
     };
+  });
+
+  // Phase 3.4: tag-bucketed spend dashboard endpoint. Same trust model as
+  // /health — open on 127.0.0.1, intended for the operator's own
+  // dashboard / CLI to curl. The store layer applies the
+  // tagged-and-priced filter (untagged + denied excluded), so the route
+  // is mostly query-string parsing + validation.
+  app.get<{
+    Querystring: { bucket?: string; since?: string; limit?: string };
+  }>("/metrics/spend", async (req, reply) => {
+    const bucket = req.query.bucket;
+    if (bucket !== "team" && bucket !== "project" && bucket !== "env") {
+      return reply.status(400).send({
+        error: "invalid_bucket",
+        hint: "bucket must be one of: team, project, env",
+      });
+    }
+    const sinceRaw = req.query.since;
+    if (!sinceRaw) {
+      return reply.status(400).send({
+        error: "missing_since",
+        hint: "pass since=<n>(s|m|h|d), e.g. since=24h",
+      });
+    }
+    const sinceTs = parseSinceShorthand(sinceRaw);
+    if (sinceTs === undefined) {
+      return reply.status(400).send({
+        error: "invalid_since",
+        hint: "pass since=<n>(s|m|h|d), e.g. since=24h or since=7d",
+      });
+    }
+    const limitRaw = req.query.limit;
+    let limit = 50;
+    if (limitRaw !== undefined) {
+      const n = Number(limitRaw);
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0 || n > 1000) {
+        return reply.status(400).send({
+          error: "invalid_limit",
+          hint: "limit must be an integer in 1..1000",
+        });
+      }
+      limit = n;
+    }
+    return store.topTagsBySpend(bucket as TagBucket, sinceTs, limit);
   });
 
   app.all<{ Params: { provider: string; "*": string } }>(
@@ -702,6 +746,36 @@ function denied(
   applyTagAttribution(entry, ctx.claims);
   store.appendCall(entry);
   return reply.status(status).send({ error: reason });
+}
+
+/**
+ * Phase 3.4: parse the `since=` query parameter for /metrics/spend. We
+ * accept a duration shorthand (`30s`, `10m`, `24h`, `7d`) only — no
+ * raw ISO timestamps, since `Date.parse` is permissive enough that
+ * an attacker-controlled string can produce surprising windows. The
+ * shorthand is the operator-facing UX the dashboard cards and CLI both
+ * use, and an ISO variant can be added later if a use case emerges.
+ *
+ * Returns the ISO timestamp at `now - duration`, or undefined for
+ * unparseable input. The caller maps undefined to a 400 response.
+ */
+export function parseSinceShorthand(s: string): string | undefined {
+  const m = /^(\d+)([smhd])$/.exec(s);
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  const unit = m[2]!;
+  const msPerUnit: Record<string, number> = {
+    s: 1_000,
+    m: 60_000,
+    h: 3_600_000,
+    d: 86_400_000,
+  };
+  const ms = n * msPerUnit[unit]!;
+  // Cap at ~10 years so a typo doesn't compute a nonsensical window
+  // that pulls the entire calls table.
+  if (ms > 10 * 365 * 86_400_000) return undefined;
+  return new Date(Date.now() - ms).toISOString();
 }
 
 /**

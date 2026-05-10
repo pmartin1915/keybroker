@@ -21,7 +21,8 @@ import {
 } from "./store.js";
 import { issueToken, MAX_TAG_VALUE_LEN } from "./tokens.js";
 import { PROVIDERS, getProvider } from "./providers/index.js";
-import { buildServer } from "./server.js";
+import { buildServer, parseSinceShorthand } from "./server.js";
+import type { TagBucket } from "./store-types.js";
 import { getKeychain, KC_JWT_SECRET, KC_MASTER_KEY } from "./keychain.js";
 import { normalizeMachine } from "./hostname.js";
 import { loadPolicy, policyDeniesTag, type TagKey } from "./policy.js";
@@ -629,6 +630,84 @@ program
     console.log(`done. JSON store moved to ${migratedMarker}`);
     console.log("future calls will use the SQLite store at " + cfg.sqliteStorePath);
   });
+
+const metrics = program
+  .command("metrics")
+  .description("Operator-facing metrics over the audit log.");
+
+metrics
+  .command("spend")
+  .description(
+    "Top tag-bucketed spend over a time window. Reads the audit log directly — broker does not need to be running.",
+  )
+  .requiredOption(
+    "--by <bucket>",
+    'tag bucket to aggregate by: "team" | "project" | "env"',
+  )
+  .requiredOption(
+    "--since <duration>",
+    'time window shorthand: "30s" | "10m" | "24h" | "7d"',
+  )
+  .option("--limit <n>", "maximum rows to return (1..1000)", "50")
+  .option("--json", "emit JSON instead of a table (machine-parseable)", false)
+  .action(
+    async (opts: {
+      by: string;
+      since: string;
+      limit: string;
+      json: boolean;
+    }) => {
+      if (opts.by !== "team" && opts.by !== "project" && opts.by !== "env") {
+        console.error(`--by must be one of: team, project, env (got "${opts.by}")`);
+        process.exitCode = 1;
+        return;
+      }
+      const sinceTs = parseSinceShorthand(opts.since);
+      if (sinceTs === undefined) {
+        console.error(
+          `--since must be shorthand like 30s|10m|24h|7d (got "${opts.since}")`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+      const limit = Number(opts.limit);
+      if (!Number.isFinite(limit) || !Number.isInteger(limit) || limit <= 0 || limit > 1000) {
+        console.error(`--limit must be an integer in 1..1000 (got "${opts.limit}")`);
+        process.exitCode = 1;
+        return;
+      }
+      const cfg = await loadConfig();
+      const store = openStore(cfg, { mode: storeMode() });
+      const rows = store.topTagsBySpend(opts.by as TagBucket, sinceTs, limit);
+      if (opts.json) {
+        console.log(JSON.stringify(rows, null, 2));
+        return;
+      }
+      if (rows.length === 0) {
+        console.log(`(no tagged spend for bucket=${opts.by} since=${opts.since})`);
+        return;
+      }
+      // Right-align $ amounts so a column of mixed-magnitude values
+      // stays readable. usd is formatted to 4 decimals — same
+      // precision as `keybroker tokens` spent= column.
+      const keyWidth = Math.max(
+        ...rows.map((r) => r.key.length),
+        opts.by.length,
+      );
+      const usdStrs = rows.map((r) => `$${r.usd.toFixed(4)}`);
+      const usdWidth = Math.max(...usdStrs.map((s) => s.length), "USD".length);
+      const callsStrs = rows.map((r) => String(r.callCount));
+      const callsWidth = Math.max(...callsStrs.map((s) => s.length), "CALLS".length);
+      console.log(
+        `${opts.by.toUpperCase().padEnd(keyWidth)}  ${"USD".padStart(usdWidth)}  ${"CALLS".padStart(callsWidth)}`,
+      );
+      for (let i = 0; i < rows.length; i++) {
+        console.log(
+          `${rows[i]!.key.padEnd(keyWidth)}  ${usdStrs[i]!.padStart(usdWidth)}  ${callsStrs[i]!.padStart(callsWidth)}`,
+        );
+      }
+    },
+  );
 
 program
   .command("serve")

@@ -12,6 +12,8 @@ import type {
   RecentCallsOptions,
   SecretRecord,
   StoreLike,
+  TagBucket,
+  TagSpendRow,
   TokenRecord,
 } from "./store-types.js";
 
@@ -226,6 +228,70 @@ export class JsonStore implements StoreLike {
     return out;
   }
 
+  sumCostUsdByTagSince(bucket: TagBucket, ts: string): Record<string, number> {
+    const out: Record<string, number> = {};
+    if (!existsSync(this.logsPath)) return out;
+    const field = tagFieldFor(bucket);
+    const lines = readFileSync(this.logsPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    for (const l of lines) {
+      try {
+        const e = JSON.parse(l) as CallLogEntry;
+        if (e.ts < ts) continue;
+        if (e.outcome !== "ok" && e.outcome !== "error") continue;
+        const tag = e[field];
+        if (typeof tag !== "string" || tag.length === 0) continue;
+        const cost = e.actualCostUsd ?? e.estimatedCostUsd;
+        if (typeof cost !== "number" || !Number.isFinite(cost)) continue;
+        out[tag] = (out[tag] ?? 0) + cost;
+      } catch {
+        // skip malformed lines — same posture as the other aggregators
+      }
+    }
+    return out;
+  }
+
+  topTagsBySpend(
+    bucket: TagBucket,
+    since: string,
+    limit: number,
+  ): TagSpendRow[] {
+    if (!existsSync(this.logsPath)) return [];
+    const field = tagFieldFor(bucket);
+    const lines = readFileSync(this.logsPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    const buckets = new Map<string, { usd: number; callCount: number }>();
+    for (const l of lines) {
+      try {
+        const e = JSON.parse(l) as CallLogEntry;
+        if (e.ts < since) continue;
+        if (e.outcome !== "ok" && e.outcome !== "error") continue;
+        const tag = e[field];
+        if (typeof tag !== "string" || tag.length === 0) continue;
+        const cur = buckets.get(tag) ?? { usd: 0, callCount: 0 };
+        cur.callCount += 1;
+        const cost = e.actualCostUsd ?? e.estimatedCostUsd;
+        if (typeof cost === "number" && Number.isFinite(cost)) cur.usd += cost;
+        buckets.set(tag, cur);
+      } catch {
+        // skip malformed lines
+      }
+    }
+    // Mirror SqliteStore's ORDER BY usd DESC, key ASC so the two stores
+    // are interchangeable in tests + production. Sort then truncate.
+    const rows: TagSpendRow[] = [...buckets.entries()].map(([key, v]) => ({
+      key,
+      usd: v.usd,
+      callCount: v.callCount,
+    }));
+    rows.sort((a, b) => (b.usd - a.usd) || a.key.localeCompare(b.key));
+    return rows.slice(0, limit);
+  }
+
   recentCalls(opts: RecentCallsOptions): CallLogEntry[] {
     if (!existsSync(this.logsPath)) return [];
     const lines = readFileSync(this.logsPath, "utf8")
@@ -246,5 +312,18 @@ export class JsonStore implements StoreLike {
       return true;
     });
     return filtered.slice(-opts.limit);
+  }
+}
+
+function tagFieldFor(
+  bucket: TagBucket,
+): "tagTeam" | "tagProject" | "tagEnv" {
+  switch (bucket) {
+    case "team":
+      return "tagTeam";
+    case "project":
+      return "tagProject";
+    case "env":
+      return "tagEnv";
   }
 }

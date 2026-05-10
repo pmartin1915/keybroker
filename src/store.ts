@@ -11,6 +11,8 @@ export type {
   TokenRecord,
   ConsumeResult,
   RecentCallsOptions,
+  TagBucket,
+  TagSpendRow,
 } from "./store-types.js";
 export { JsonStore } from "./store-json.js";
 export { SqliteStore } from "./store-sqlite.js";

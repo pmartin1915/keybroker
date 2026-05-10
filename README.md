@@ -92,6 +92,7 @@ The echo upstream's response will show you exactly what the broker forwarded, in
 | Tags              | `--team`, `--project`, `--env` for FinOps attribution. Validated against `policy.json` `tag_allowlist` (per-tag, optional). Carried into every audit row for spend roll-ups. |
 | Fleet policy      | `~/.keybroker/policy.json`: `forbidden_models` (glob deny-list) + `allowed_providers` + `tag_allowlist` (per-tag allow-list). Hot-reloads without restart. |
 | Audit             | Every call (allowed or denied) appended to SQLite `calls` table with token id, label, status, latency, requested model, machine, tags, estimated and actual cost. |
+| Spend rollups     | `GET /metrics/spend?bucket=team\|project\|env&since=24h` and `keybroker metrics spend --by team --since 24h` aggregate the audit log by tag for FinOps dashboards. |
 
 ## Architecture
 
@@ -156,6 +157,8 @@ If you ship this to production as-is, you will have a bad time.
 - Per-machine token attribution and bulk revoke-by-machine (Phase 2.3 ✅)
 - Fleet policy with hot reload (Phase 2.4 ✅)
 - Machine-identity normalization contract (`normalizeMachine`) (Phase 3.0 ✅)
+- Token tag attribution end-to-end (team / project / env) (Phase 3.3 ✅)
+- Tag-bucketed spend aggregation (`/metrics/spend`, `keybroker metrics spend`) (Phase 3.4 ✅)
 
 ## Roadmap
 
