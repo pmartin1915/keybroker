@@ -104,6 +104,7 @@ beforeAll(async () => {
     sqliteStorePath: join(dataDir, "store.db"),
     logsPath: join(dataDir, "calls.log.jsonl"),
     configPath: join(dataDir, "config.json"),
+    policyPath: join(dataDir, "policy.json"),
     port: 0,
     host: "127.0.0.1",
     masterKeyHex,

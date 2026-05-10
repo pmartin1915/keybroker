@@ -247,10 +247,11 @@ token
   .option("--label <label>", "free-form label for audit", "unlabeled")
   .option(
     "--model <name...>",
-    "restrict the token to one or more model names. Repeat or pass space-separated. " +
-      "Omit for no restriction. Note: model-restricted tokens deny requests with non-JSON " +
-      "or model-less bodies (the broker cannot verify the model otherwise). For non-LLM " +
-      "endpoints (e.g. file uploads, audio transcriptions), issue a separate token without --model.",
+    "restrict the token to one or more model names (glob: `*` is the only wildcard, " +
+      "e.g. `gpt-4o-mini*`). Repeat or pass space-separated. Omit for no restriction. " +
+      "Note: model-restricted tokens deny requests with non-JSON or model-less bodies " +
+      "(the broker cannot verify the model otherwise). For non-LLM endpoints " +
+      "(e.g. file uploads, audio transcriptions), issue a separate token without --model.",
   )
   .action(
     async (opts: {

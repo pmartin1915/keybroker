@@ -311,6 +311,7 @@ describe("SqliteStore: openStore mode=auto guard", () => {
         sqliteStorePath: join(dir, "store.db"),
         logsPath: join(dir, "calls.log.jsonl"),
         configPath: join(dir, "config.json"),
+        policyPath: join(dir, "policy.json"),
         port: 0,
         host: "127.0.0.1",
         masterKeyHex: "00".repeat(32),

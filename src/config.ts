@@ -17,6 +17,8 @@ export interface BrokerConfig {
   /** Append-only call log used by the JSON store. SQLite store keeps calls in-db. */
   logsPath: string;
   configPath: string;
+  /** Phase 2.4 fleet policy file (forbidden_models, allowed_providers). Optional on disk. */
+  policyPath: string;
   port: number;
   host: string;
   /** Hex-encoded 32-byte master key for AES-256-GCM at-rest encryption. */
@@ -102,6 +104,7 @@ export async function loadConfig(
     sqliteStorePath: join(dir, "store.db"),
     logsPath: join(dir, "calls.log.jsonl"),
     configPath,
+    policyPath: join(dir, "policy.json"),
     port: raw.port ?? Number(process.env.KEYBROKER_PORT ?? 8787),
     host: raw.host ?? process.env.KEYBROKER_HOST ?? "127.0.0.1",
     masterKeyHex,

@@ -9,6 +9,13 @@ import { scopeAllows, verifyToken } from "./tokens.js";
 import { decrypt } from "./crypto.js";
 import { getProvider } from "./providers/index.js";
 import type { CallLogEntry } from "./logging.js";
+import {
+  loadPolicy,
+  policyDeniesModel,
+  policyDeniesProvider,
+  type Policy,
+} from "./policy.js";
+import { matchesAny } from "./glob-match.js";
 
 export interface BuildServerOptions {
   /** Pass `false` to silence fastify's logger (used in tests). */
@@ -85,8 +92,13 @@ export async function buildServer(
         }, store);
       }
 
-      if (!scopeAllows(claims.scp, req.method, upstreamPath)) {
-        return denied(reply, 403, "scope_denied", {
+      // Phase 2.4 fleet policy. Loaded fresh each request (cached 1s) so an
+      // operator can edit policy.json and have changes take effect without
+      // restarting the broker. Enforced AHEAD OF scope: even a "*"-scoped
+      // token cannot reach a provider or model that policy disallows.
+      const policy: Policy = loadPolicy(config.policyPath);
+      if (policyDeniesProvider(policy, provider)) {
+        return denied(reply, 403, "provider_forbidden", {
           tokenId,
           label: claims.lbl,
           provider,
@@ -97,9 +109,10 @@ export async function buildServer(
         }, store);
       }
 
-      // Build the request body buffer up here so the model-allow-list check
-      // (which inspects body.model) can run before we consume a quota slot.
-      // Fastify has already parsed the body per its content-type by this point.
+      // Build the request body buffer up here so the model checks (policy
+      // forbidden_models, per-token `mdl`) can inspect body.model before
+      // we consume a quota slot. Fastify has already parsed the body per
+      // its content-type by this point.
       const body = req.method === "GET" || req.method === "HEAD"
         ? undefined
         : (req.body as unknown);
@@ -109,36 +122,30 @@ export async function buildServer(
           ? Buffer.from(body)
           : Buffer.from(JSON.stringify(body));
 
-      // Per-token model allow-list (Phase 2.1). Deny-by-default: when `mdl`
-      // is set we require an extractable model that's in the allow-list.
-      // Only `no-body` (GET/HEAD) gets a free pass — those requests cannot
-      // invoke a model. Permissive-on-undefined would let an attacker with
-      // a stolen token bypass the guard by sending malformed JSON, since
-      // the broker's defense would then depend on upstream strictness
-      // rather than being its own boundary.
+      // Combined model gate:
+      //   - Policy `forbidden_models` (Phase 2.4): system-wide deny-list,
+      //     applied even when the token has no `mdl` claim. This is the
+      //     literal Money Rule encoded as broker policy — the deny wins
+      //     against any token, including wildcard scopes.
+      //   - Per-token `mdl` allow-list (Phase 2.1): deny-by-default; when
+      //     set we require an extractable model that matches.
       //
-      // SECURITY: this missing-extractor branch is the actual enforcement.
-      // The CLI mirror in `token issue` is a UX guard — do not delete the
-      // runtime check on the assumption it is redundant.
-      if (claims.mdl && claims.mdl.length > 0) {
+      // Deny-by-default for the per-token check means GET/HEAD (no body)
+      // gets a free pass because no model can be invoked, but malformed
+      // JSON or a missing `.model` is treated as suspicious — defending
+      // the boundary at the broker rather than relying on upstream
+      // strictness.
+      //
+      // SECURITY: the missing-extractor branch below is the actual
+      // enforcement for `mdl`. The CLI mirror in `token issue` is a UX
+      // guard — do not delete the runtime check on the assumption it is
+      // redundant.
+      const hasMdlClaim = !!(claims.mdl && claims.mdl.length > 0);
+      const needsModelInspection = hasMdlClaim || policy.forbiddenModels.length > 0;
+      if (needsModelInspection) {
         if (!provSpec.extractRequestMetadata) {
-          return denied(reply, 403, "model_not_allowed", {
-            tokenId,
-            label: claims.lbl,
-            provider,
-            method: req.method,
-            path: upstreamPath,
-            started,
-            reqBytes: bodyBuf?.byteLength ?? 0,
-          }, store);
-        }
-        const extraction = provSpec.extractRequestMetadata(bodyBuf);
-        switch (extraction.kind) {
-          case "no-body":
-            // GET/HEAD or empty body — no model invocable, allow through.
-            break;
-          case "unparseable":
-          case "no-model":
+          if (hasMdlClaim) {
+            // Token requires a model match but provider can't extract.
             return denied(reply, 403, "model_not_allowed", {
               tokenId,
               label: claims.lbl,
@@ -148,9 +155,76 @@ export async function buildServer(
               started,
               reqBytes: bodyBuf?.byteLength ?? 0,
             }, store);
-          case "ok": {
-            const requested = extraction.meta.model;
-            if (requested === undefined || !claims.mdl.includes(requested)) {
+          }
+          // Only policy is in play and the provider has no model surface
+          // we can inspect. forbidden_models cannot apply here, so allow
+          // through — the operator's deny-list is targeted at LLM
+          // providers that DO expose a model field.
+        } else {
+          const extraction = provSpec.extractRequestMetadata(bodyBuf);
+          switch (extraction.kind) {
+            case "no-body":
+              // GET/HEAD or empty body — no model invocable, allow through.
+              break;
+            case "unparseable":
+            case "no-model":
+              if (hasMdlClaim) {
+                return denied(reply, 403, "model_not_allowed", {
+                  tokenId,
+                  label: claims.lbl,
+                  provider,
+                  method: req.method,
+                  path: upstreamPath,
+                  started,
+                  reqBytes: bodyBuf?.byteLength ?? 0,
+                }, store);
+              }
+              // Policy alone with no extractable model — nothing to forbid.
+              break;
+            case "ok": {
+              const requested = extraction.meta.model;
+              // Policy `forbidden_models` first (system-wide guardrail).
+              if (requested !== undefined && policyDeniesModel(policy, requested)) {
+                return denied(reply, 403, "model_forbidden", {
+                  tokenId,
+                  label: claims.lbl,
+                  provider,
+                  method: req.method,
+                  path: upstreamPath,
+                  started,
+                  reqBytes: bodyBuf?.byteLength ?? 0,
+                  requestedModel: requested,
+                }, store);
+              }
+              // Then per-token `mdl` (glob-matched as of Phase 2.4).
+              if (hasMdlClaim) {
+                if (requested === undefined || !matchesAny(requested, claims.mdl!)) {
+                  return denied(reply, 403, "model_not_allowed", {
+                    tokenId,
+                    label: claims.lbl,
+                    provider,
+                    method: req.method,
+                    path: upstreamPath,
+                    started,
+                    reqBytes: bodyBuf?.byteLength ?? 0,
+                    requestedModel: requested,
+                  }, store);
+                }
+              }
+              break;
+            }
+            default: {
+              // Fail-closed default: a future Extraction kind not handled
+              // here must not silently bypass the model check. The
+              // `_never` assignment is also a TypeScript exhaustiveness
+              // check — adding a new kind without updating this switch
+              // is a compile error.
+              const _never: never = extraction;
+              void _never;
+              req.log.error(
+                { unexpectedExtraction: extraction },
+                "extractRequestMetadata returned an unhandled kind; failing closed",
+              );
               return denied(reply, 403, "model_not_allowed", {
                 tokenId,
                 label: claims.lbl,
@@ -159,35 +233,26 @@ export async function buildServer(
                 path: upstreamPath,
                 started,
                 reqBytes: bodyBuf?.byteLength ?? 0,
-                requestedModel: requested,
               }, store);
             }
-            break;
-          }
-          default: {
-            // Fail-closed default: a future Extraction kind not handled
-            // here must not silently bypass the model check. The `_never`
-            // assignment is also a TypeScript exhaustiveness check —
-            // adding a new kind without updating this switch is a
-            // compile error. The log line surfaces the unexpected value
-            // for debugging if exhaustiveness was somehow bypassed.
-            const _never: never = extraction;
-            void _never;
-            req.log.error(
-              { unexpectedExtraction: extraction },
-              "extractRequestMetadata returned an unhandled kind; failing closed",
-            );
-            return denied(reply, 403, "model_not_allowed", {
-              tokenId,
-              label: claims.lbl,
-              provider,
-              method: req.method,
-              path: upstreamPath,
-              started,
-              reqBytes: bodyBuf?.byteLength ?? 0,
-            }, store);
           }
         }
+      }
+
+      // Scope check runs AFTER policy + model checks — see roadmap 2.4:
+      // "Policy is enforced *before* token scope" so that a system-wide
+      // deny is reported as such rather than being masked by a narrower
+      // scope deny.
+      if (!scopeAllows(claims.scp, req.method, upstreamPath)) {
+        return denied(reply, 403, "scope_denied", {
+          tokenId,
+          label: claims.lbl,
+          provider,
+          method: req.method,
+          path: upstreamPath,
+          started,
+          reqBytes: bodyBuf?.byteLength ?? 0,
+        }, store);
       }
 
       const consumed = store.consumeToken(tokenId);
