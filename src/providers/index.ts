@@ -1,3 +1,37 @@
+/**
+ * Per-request metadata extracted from the upstream request body.
+ *
+ * Phase 2.1 only consumes `model` (for the allow-list check). Phase 2.2
+ * (dollar spend caps) will use `maxTokens` for the pre-flight cap estimate
+ * and `stream` to dispatch the response-parsing path. Keeping all three on
+ * the same digest avoids re-parsing the body in Phase 2.2 — one parse per
+ * request, one place per provider.
+ */
+export interface RequestMetadata {
+  model?: string;
+  stream?: boolean;
+  maxTokens?: number;
+}
+
+/**
+ * Tagged result of body inspection. The kinds carry different security
+ * meaning, so the server can take different actions per kind:
+ *
+ * - `ok`: body parsed, metadata extracted (model may still be undefined
+ *   inside the meta — see `no-model` for the "no field at all" variant).
+ * - `no-body`: GET/HEAD or otherwise empty. Cannot invoke a model.
+ * - `unparseable`: body has bytes but JSON parse failed. Suspicious when
+ *   the token is model-restricted — fail closed.
+ * - `no-model`: parsed JSON, no `.model` field. For known LLM endpoints
+ *   the upstream would reject anyway; we deny earlier so the broker's
+ *   guard does not depend on upstream strictness.
+ */
+export type Extraction =
+  | { kind: "ok"; meta: RequestMetadata }
+  | { kind: "no-body" }
+  | { kind: "unparseable" }
+  | { kind: "no-model" };
+
 export interface ProviderSpec {
   name: string;
   /** Upstream base URL — broker forwards `/${name}/<rest>` to `${baseUrl}/<rest>`. */
@@ -9,33 +43,49 @@ export interface ProviderSpec {
   /** Headers stripped from the request before forwarding (e.g. host headers). */
   stripHeaders: string[];
   /**
-   * Inspect the upstream request body and return the requested model name,
-   * or undefined if the body has no parseable model field. Defining this
-   * field marks the provider as supporting per-token model allow-lists
-   * (the `mdl` claim); providers without it cannot be issued tokens with
-   * --model restrictions and will be rejected at `token issue` time.
+   * Inspect the upstream request body and return a tagged Extraction.
+   * Defining this field marks the provider as supporting per-token model
+   * allow-lists (the `mdl` claim); providers without it cannot be issued
+   * tokens with --model restrictions and will be rejected at `token issue`
+   * time, AND the server will fail closed if such a token is somehow
+   * presented.
    */
-  extractRequestedModel?: (body: Buffer | undefined) => string | undefined;
+  extractRequestMetadata?: (body: Buffer | undefined) => Extraction;
 }
 
 /**
  * Both OpenAI and Anthropic put the requested model at top-level `.model`
- * in a JSON body. Echo follows the same shape so tests can exercise the
- * model-allowlist path without a real LLM provider.
+ * in a JSON body, along with `stream` and `max_tokens`. Echo follows the
+ * same shape so tests can exercise the allow-list path without a real LLM
+ * provider.
  */
-function jsonBodyModel(body: Buffer | undefined): string | undefined {
-  if (!body || body.byteLength === 0) return undefined;
+function jsonRequestMetadata(body: Buffer | undefined): Extraction {
+  if (!body || body.byteLength === 0) return { kind: "no-body" };
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(body.toString("utf8")) as unknown;
-    if (parsed && typeof parsed === "object" && "model" in parsed) {
-      const m = (parsed as { model: unknown }).model;
-      if (typeof m === "string" && m.length > 0) return m;
-    }
+    parsed = JSON.parse(body.toString("utf8"));
   } catch {
-    // Non-JSON body (e.g. multipart upload to /v1/files) — caller treats
-    // "no extractable model" as deny when mdl is set; that's the safe default.
+    return { kind: "unparseable" };
   }
-  return undefined;
+  if (!parsed || typeof parsed !== "object") {
+    return { kind: "no-model" };
+  }
+  const obj = parsed as Record<string, unknown>;
+  const meta: RequestMetadata = {};
+  if (typeof obj.model === "string" && obj.model.length > 0) {
+    meta.model = obj.model;
+  }
+  if (typeof obj.stream === "boolean") {
+    meta.stream = obj.stream;
+  }
+  // OpenAI: `max_tokens` (deprecated) or `max_completion_tokens`.
+  // Anthropic: `max_tokens` (required). Take the first numeric we find.
+  const mt = obj.max_completion_tokens ?? obj.max_tokens;
+  if (typeof mt === "number" && Number.isFinite(mt) && mt >= 0) {
+    meta.maxTokens = mt;
+  }
+  if (meta.model === undefined) return { kind: "no-model" };
+  return { kind: "ok", meta };
 }
 
 export const PROVIDERS: Record<string, ProviderSpec> = {
@@ -44,7 +94,7 @@ export const PROVIDERS: Record<string, ProviderSpec> = {
     baseUrl: "https://api.openai.com",
     authStyle: "bearer",
     stripHeaders: ["host", "content-length", "connection"],
-    extractRequestedModel: jsonBodyModel,
+    extractRequestMetadata: jsonRequestMetadata,
   },
   anthropic: {
     name: "anthropic",
@@ -52,7 +102,7 @@ export const PROVIDERS: Record<string, ProviderSpec> = {
     authStyle: "x-api-key",
     authHeader: "x-api-key",
     stripHeaders: ["host", "content-length", "connection", "authorization"],
-    extractRequestedModel: jsonBodyModel,
+    extractRequestMetadata: jsonRequestMetadata,
   },
   // Built-in test provider. KEYBROKER_ECHO_BASE_URL may override the default,
   // but only if it points at a loopback address — otherwise the env var is
@@ -63,7 +113,7 @@ export const PROVIDERS: Record<string, ProviderSpec> = {
     baseUrl: resolveEchoBaseUrl(),
     authStyle: "bearer",
     stripHeaders: ["host", "content-length", "connection"],
-    extractRequestedModel: jsonBodyModel,
+    extractRequestMetadata: jsonRequestMetadata,
   },
 };
 

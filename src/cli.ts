@@ -247,7 +247,10 @@ token
   .option("--label <label>", "free-form label for audit", "unlabeled")
   .option(
     "--model <name...>",
-    "restrict the token to one or more model names. Repeat or pass space-separated. Omit for no restriction.",
+    "restrict the token to one or more model names. Repeat or pass space-separated. " +
+      "Omit for no restriction. Note: model-restricted tokens deny requests with non-JSON " +
+      "or model-less bodies (the broker cannot verify the model otherwise). For non-LLM " +
+      "endpoints (e.g. file uploads, audio transcriptions), issue a separate token without --model.",
   )
   .action(
     async (opts: {
@@ -265,11 +268,11 @@ token
         return;
       }
       const models = opts.model && opts.model.length > 0 ? opts.model : undefined;
-      if (models && !provSpec.extractRequestedModel) {
+      if (models && !provSpec.extractRequestMetadata) {
         console.error(
           `provider "${opts.provider}" does not support per-token model restrictions ` +
             `(no request-body inspection registered). Issue without --model, or add an ` +
-            `extractRequestedModel implementation in src/providers/index.ts.`,
+            `extractRequestMetadata implementation in src/providers/index.ts.`,
         );
         process.exitCode = 1;
         return;

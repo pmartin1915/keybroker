@@ -39,6 +39,7 @@ interface CallRow {
   resp_bytes: number;
   outcome: string;
   reason: string | null;
+  requested_model: string | null;
 }
 
 const SCHEMA = `
@@ -73,7 +74,8 @@ CREATE TABLE IF NOT EXISTS calls (
   req_bytes INTEGER NOT NULL,
   resp_bytes INTEGER NOT NULL,
   outcome TEXT NOT NULL,
-  reason TEXT
+  reason TEXT,
+  requested_model TEXT
 );
 
 CREATE INDEX IF NOT EXISTS calls_token_id_idx ON calls(token_id);
@@ -118,6 +120,10 @@ export class SqliteStore implements StoreLike {
     this.db.exec("PRAGMA synchronous = NORMAL");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.db.exec(SCHEMA);
+    // Idempotent migrations for stores that pre-date a column. SQLite's
+    // ALTER TABLE ADD COLUMN is cheap (no table rewrite), but we guard with
+    // PRAGMA table_info so re-runs are no-ops on schemas already at head.
+    this.migrate(this.db);
     this.stmts = {
       putSecret: this.db.prepare(
         `INSERT INTO secrets (provider, ciphertext, created_at)
@@ -169,19 +175,19 @@ export class SqliteStore implements StoreLike {
       revoke: this.db.prepare(`UPDATE tokens SET revoked = 1 WHERE id = ?`),
       insertCall: this.db.prepare(
         `INSERT INTO calls
-           (ts, token_id, label, provider, method, path, status, duration_ms, req_bytes, resp_bytes, outcome, reason)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (ts, token_id, label, provider, method, path, status, duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       selectCalls: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
-                duration_ms, req_bytes, resp_bytes, outcome, reason
+                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model
          FROM calls
          ORDER BY id DESC
          LIMIT ?`,
       ),
       selectCallsByToken: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
-                duration_ms, req_bytes, resp_bytes, outcome, reason
+                duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model
          FROM calls
          WHERE token_id = ?
          ORDER BY id DESC
@@ -278,7 +284,28 @@ export class SqliteStore implements StoreLike {
       entry.respBytes,
       entry.outcome,
       entry.reason ?? null,
+      entry.requestedModel ?? null,
     );
+  }
+
+  private migrate(db: DatabaseSync): void {
+    const cols = db.prepare("PRAGMA table_info(calls)").all() as Array<{
+      name: string;
+    }>;
+    const have = new Set(cols.map((c) => c.name));
+    if (!have.has("requested_model")) {
+      // Race with concurrent openers: two processes can both observe the
+      // column missing, both attempt ALTER, and the loser sees "duplicate
+      // column name". That's a benign race — the column exists either way
+      // — so swallow it. Re-throw anything else, including a different
+      // error message ("duplicate column" wording could change in node:sqlite).
+      try {
+        db.exec("ALTER TABLE calls ADD COLUMN requested_model TEXT");
+      } catch (e) {
+        const msg = (e as Error).message ?? "";
+        if (!/duplicate column name/i.test(msg)) throw e;
+      }
+    }
   }
 
   recentCalls(opts: RecentCallsOptions): CallLogEntry[] {
@@ -325,5 +352,6 @@ function rowToCall(row: CallRow): CallLogEntry {
     outcome: row.outcome as CallLogEntry["outcome"],
   };
   if (row.reason !== null) entry.reason = row.reason;
+  if (row.requested_model !== null) entry.requestedModel = row.requested_model;
   return entry;
 }

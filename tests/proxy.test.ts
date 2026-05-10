@@ -340,7 +340,7 @@ describe("proxy: model allow-list (Phase 2.1)", () => {
     expect(res.status).toBe(200);
   });
 
-  it("denies 403 model_not_allowed:<attempted> when body.model is not in mdl", async () => {
+  it("denies 403 model_not_allowed when body.model is not in mdl, recording attempted model in requestedModel column", async () => {
     const { id, jwt } = await mintToken({
       scopes: ["*"],
       models: ["gpt-4o-mini"],
@@ -354,12 +354,13 @@ describe("proxy: model allow-list (Phase 2.1)", () => {
       body: JSON.stringify({ model: "gpt-4-turbo", messages: [] }),
     });
     expect(res.status).toBe(403);
-    expect(await jsonError(res)).toBe("model_not_allowed:gpt-4-turbo");
-    // Acceptance: the audit log records the attempted model.
+    expect(await jsonError(res)).toBe("model_not_allowed");
+    // Acceptance: the audit log records the attempted model in a structured
+    // column, not encoded into the reason string.
     const recent = store.recentCalls({ limit: 5, tokenId: id });
-    const denial = recent.find((e) => e.outcome === "denied" && e.reason?.startsWith("model_not_allowed"));
+    const denial = recent.find((e) => e.outcome === "denied" && e.reason === "model_not_allowed");
     expect(denial).toBeDefined();
-    expect(denial?.reason).toBe("model_not_allowed:gpt-4-turbo");
+    expect(denial?.requestedModel).toBe("gpt-4-turbo");
   });
 
   it("does not consume a quota slot when the request is denied for model", async () => {
@@ -406,7 +407,11 @@ describe("proxy: model allow-list (Phase 2.1)", () => {
     expect(res.status).toBe(200);
   });
 
-  it("a mdl-restricted token still passes requests with no body.model field (e.g. listing endpoints)", async () => {
+  it("denies a mdl-restricted POST with a body that has no model field (no-model is suspicious)", async () => {
+    // Behavior-flip from the original "permissive on undefined" semantics:
+    // a model-restricted token cannot reach a POST endpoint without
+    // declaring a model. The broker enforces this rather than depending
+    // on upstream strictness as the security boundary.
     const { jwt } = await mintToken({
       scopes: ["*"],
       models: ["gpt-4o-mini"],
@@ -419,8 +424,42 @@ describe("proxy: model allow-list (Phase 2.1)", () => {
       },
       body: JSON.stringify({ messages: [] }), // no model field
     });
-    // Permissive on undefined model: the restriction is "you can't INVOKE
-    // models outside the allow-list", not "every request must declare a model".
+    expect(res.status).toBe(403);
+    expect(await jsonError(res)).toBe("model_not_allowed");
+  });
+
+  it("denies a mdl-restricted POST when the body fails to parse as JSON", async () => {
+    // Closes the bypass where a stolen token sends malformed JSON to skip
+    // the model check. Send raw text under application/json so Fastify
+    // forwards it to our extractor as-is.
+    const { jwt } = await mintToken({
+      scopes: ["*"],
+      models: ["gpt-4o-mini"],
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/something`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "text/plain",
+      },
+      body: "this is not json at all",
+    });
+    expect(res.status).toBe(403);
+    expect(await jsonError(res)).toBe("model_not_allowed");
+  });
+
+  it("allows a mdl-restricted GET (no body, no model invocable)", async () => {
+    // GET/HEAD requests cannot invoke a model — the broker's restriction is
+    // about what the token can CALL, not what endpoints it can browse. So
+    // a model-restricted token can still GET listing/health endpoints.
+    const { jwt } = await mintToken({
+      scopes: ["*"],
+      models: ["gpt-4o-mini"],
+    });
+    const res = await fetch(`${brokerOrigin}/echo/v1/models`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${jwt}` },
+    });
     expect(res.status).toBe(200);
   });
 });

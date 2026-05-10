@@ -109,17 +109,20 @@ export async function buildServer(
           ? Buffer.from(body)
           : Buffer.from(JSON.stringify(body));
 
-      // Per-token model allow-list (Phase 2.1). The CLI rejects --model on
-      // providers without extractRequestedModel at issue time, so reaching
-      // this branch with a missing extractor is a token forged after a
-      // provider downgrade — fail closed. If the body has no extractable
-      // model field (GET, non-JSON, or the body simply doesn't request a
-      // model), let it through: the restriction is "you cannot INVOKE
-      // models outside the allow-list", not "every request must declare a
-      // model".
+      // Per-token model allow-list (Phase 2.1). Deny-by-default: when `mdl`
+      // is set we require an extractable model that's in the allow-list.
+      // Only `no-body` (GET/HEAD) gets a free pass — those requests cannot
+      // invoke a model. Permissive-on-undefined would let an attacker with
+      // a stolen token bypass the guard by sending malformed JSON, since
+      // the broker's defense would then depend on upstream strictness
+      // rather than being its own boundary.
+      //
+      // SECURITY: this missing-extractor branch is the actual enforcement.
+      // The CLI mirror in `token issue` is a UX guard — do not delete the
+      // runtime check on the assumption it is redundant.
       if (claims.mdl && claims.mdl.length > 0) {
-        if (!provSpec.extractRequestedModel) {
-          return denied(reply, 403, "model_not_allowed:provider_no_introspection", {
+        if (!provSpec.extractRequestMetadata) {
+          return denied(reply, 403, "model_not_allowed", {
             tokenId,
             label: claims.lbl,
             provider,
@@ -129,17 +132,61 @@ export async function buildServer(
             reqBytes: bodyBuf?.byteLength ?? 0,
           }, store);
         }
-        const requestedModel = provSpec.extractRequestedModel(bodyBuf);
-        if (requestedModel !== undefined && !claims.mdl.includes(requestedModel)) {
-          return denied(reply, 403, `model_not_allowed:${requestedModel}`, {
-            tokenId,
-            label: claims.lbl,
-            provider,
-            method: req.method,
-            path: upstreamPath,
-            started,
-            reqBytes: bodyBuf?.byteLength ?? 0,
-          }, store);
+        const extraction = provSpec.extractRequestMetadata(bodyBuf);
+        switch (extraction.kind) {
+          case "no-body":
+            // GET/HEAD or empty body — no model invocable, allow through.
+            break;
+          case "unparseable":
+          case "no-model":
+            return denied(reply, 403, "model_not_allowed", {
+              tokenId,
+              label: claims.lbl,
+              provider,
+              method: req.method,
+              path: upstreamPath,
+              started,
+              reqBytes: bodyBuf?.byteLength ?? 0,
+            }, store);
+          case "ok": {
+            const requested = extraction.meta.model;
+            if (requested === undefined || !claims.mdl.includes(requested)) {
+              return denied(reply, 403, "model_not_allowed", {
+                tokenId,
+                label: claims.lbl,
+                provider,
+                method: req.method,
+                path: upstreamPath,
+                started,
+                reqBytes: bodyBuf?.byteLength ?? 0,
+                requestedModel: requested,
+              }, store);
+            }
+            break;
+          }
+          default: {
+            // Fail-closed default: a future Extraction kind not handled
+            // here must not silently bypass the model check. The `_never`
+            // assignment is also a TypeScript exhaustiveness check —
+            // adding a new kind without updating this switch is a
+            // compile error. The log line surfaces the unexpected value
+            // for debugging if exhaustiveness was somehow bypassed.
+            const _never: never = extraction;
+            void _never;
+            req.log.error(
+              { unexpectedExtraction: extraction },
+              "extractRequestMetadata returned an unhandled kind; failing closed",
+            );
+            return denied(reply, 403, "model_not_allowed", {
+              tokenId,
+              label: claims.lbl,
+              provider,
+              method: req.method,
+              path: upstreamPath,
+              started,
+              reqBytes: bodyBuf?.byteLength ?? 0,
+            }, store);
+          }
         }
       }
 
@@ -362,6 +409,7 @@ function denied(
     path: string;
     started: number;
     reqBytes: number;
+    requestedModel?: string;
   },
   store: StoreLike,
 ) {
@@ -379,6 +427,7 @@ function denied(
     outcome: "denied",
     reason,
   };
+  if (ctx.requestedModel !== undefined) entry.requestedModel = ctx.requestedModel;
   store.appendCall(entry);
   return reply.status(status).send({ error: reason });
 }
