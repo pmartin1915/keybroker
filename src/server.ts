@@ -8,7 +8,7 @@ import { dirname, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BrokerConfig } from "./config.js";
 import { openStore } from "./store.js";
-import type { StoreLike, TagBucket } from "./store-types.js";
+import type { AdminAuditEntry, StoreLike, TagBucket } from "./store-types.js";
 import {
   issueToken,
   scopeAllows,
@@ -304,11 +304,16 @@ export async function buildServer(
       });
       return reply;
     }
-    // Stash on request for any future per-route logging (today we
-    // record nothing — there's no audit log for management calls yet;
-    // future work can add an `admin_audit` table).
-    (req as FastifyRequest & { mgmtTokenId?: string }).mgmtTokenId =
-      verified.tokenId;
+    // Stash token id and label on request for audit logging (c4e).
+    // Both are needed so audit rows include the human-readable label
+    // without a second store lookup — invariant 2 (actor is mgmt JWT,
+    // never the target proxy token id).
+    const augmented = req as FastifyRequest & {
+      mgmtTokenId?: string;
+      mgmtTokenLabel?: string;
+    };
+    augmented.mgmtTokenId = verified.tokenId;
+    augmented.mgmtTokenLabel = verified.claims.lbl;
     return;
   };
 
@@ -321,21 +326,65 @@ export async function buildServer(
     { onRequest: requireManage },
     async (req, reply) => {
       const body = req.body ?? ({} as IssueTokenInput);
+      const aug = req as FastifyRequest & {
+        mgmtTokenId?: string;
+        mgmtTokenLabel?: string;
+      };
+      const actorTokenId = aug.mgmtTokenId ?? "unknown";
+      const actorLabel = aug.mgmtTokenLabel;
       const policy = loadPolicy(config.policyPath);
       const result = await issueTokenFlow(config, store, policy, body);
       if (!result.ok) {
-        // 403 for tag/policy denials (caller's request violates a rule
-        // they cannot satisfy from the request side); 400 for shape
-        // errors. The error code identifies which.
+        // 403 for tag/policy denials; 400 for shape errors.
         const policyErrors = new Set([
           "tag_not_in_allowlist",
           "model_restriction_unsupported",
         ]);
         const status = policyErrors.has(result.error) ? 403 : 400;
+        // Log failed issue attempts — invariant 5 (failed actions get logged too).
+        // paramsJson omits the jwt — invariant 3 (it didn't exist anyway on failure).
+        store.recordAdminAction({
+          ts: new Date().toISOString(),
+          actorTokenId,
+          actorLabel,
+          action: "token.issue",
+          outcome: "failed",
+          reason: result.error,
+          paramsJson: JSON.stringify({
+            label: body.label,
+            provider: body.provider,
+            ttlSeconds: body.ttlSeconds,
+            capUsd: body.capUsd,
+            tags: body.tags,
+            models: body.models,
+          }),
+          sourceIp: req.ip,
+          userAgent: req.headers["user-agent"],
+        } satisfies AdminAuditEntry);
         const payload: { error: string; hint?: string } = { error: result.error };
         if (result.hint !== undefined) payload.hint = result.hint;
         return reply.status(status).send(payload);
       }
+      // paramsJson is a summary only — NEVER includes the resulting jwt
+      // or any secret bytes (invariant 3).
+      store.recordAdminAction({
+        ts: new Date().toISOString(),
+        actorTokenId,
+        actorLabel,
+        action: "token.issue",
+        outcome: "ok",
+        targetTokenId: result.tokenId,
+        paramsJson: JSON.stringify({
+          label: body.label,
+          provider: body.provider,
+          ttlSeconds: body.ttlSeconds,
+          capUsd: body.capUsd,
+          tags: body.tags,
+          models: body.models,
+        }),
+        sourceIp: req.ip,
+        userAgent: req.headers["user-agent"],
+      } satisfies AdminAuditEntry);
       return reply.status(201).send({
         tokenId: result.tokenId,
         jwt: result.jwt,
@@ -355,19 +404,68 @@ export async function buildServer(
     { onRequest: requireManage },
     async (req, reply) => {
       const id = req.params.id;
+      const aug = req as FastifyRequest & {
+        mgmtTokenId?: string;
+        mgmtTokenLabel?: string;
+      };
+      const actorTokenId = aug.mgmtTokenId ?? "unknown";
+      const actorLabel = aug.mgmtTokenLabel;
       const existing = store.getToken(id);
       if (!existing) {
+        // 404 = "never existed" — log as failed (invariant 5).
+        store.recordAdminAction({
+          ts: new Date().toISOString(),
+          actorTokenId,
+          actorLabel,
+          action: "token.revoke",
+          outcome: "failed",
+          reason: "unknown_token",
+          targetTokenId: id,
+          sourceIp: req.ip,
+          userAgent: req.headers["user-agent"],
+        } satisfies AdminAuditEntry);
         return reply.status(404).send({ error: "unknown_token", id });
       }
       if (existing.revoked) {
+        // Already revoked counts as ok — post-condition satisfied (invariant 7 in c4).
+        store.recordAdminAction({
+          ts: new Date().toISOString(),
+          actorTokenId,
+          actorLabel,
+          action: "token.revoke",
+          outcome: "ok",
+          targetTokenId: id,
+          sourceIp: req.ip,
+          userAgent: req.headers["user-agent"],
+        } satisfies AdminAuditEntry);
         return reply.status(200).send({ revoked: true, id, alreadyRevoked: true });
       }
       const ok = store.revokeToken(id);
       if (!ok) {
-        // Race: token vanished between getToken and revokeToken. Treat
-        // as 404 — the post-condition isn't satisfied through our action.
+        // Race: token vanished between getToken and revokeToken.
+        store.recordAdminAction({
+          ts: new Date().toISOString(),
+          actorTokenId,
+          actorLabel,
+          action: "token.revoke",
+          outcome: "failed",
+          reason: "unknown_token",
+          targetTokenId: id,
+          sourceIp: req.ip,
+          userAgent: req.headers["user-agent"],
+        } satisfies AdminAuditEntry);
         return reply.status(404).send({ error: "unknown_token", id });
       }
+      store.recordAdminAction({
+        ts: new Date().toISOString(),
+        actorTokenId,
+        actorLabel,
+        action: "token.revoke",
+        outcome: "ok",
+        targetTokenId: id,
+        sourceIp: req.ip,
+        userAgent: req.headers["user-agent"],
+      } satisfies AdminAuditEntry);
       return reply.status(200).send({ revoked: true, id });
     },
   );
@@ -396,6 +494,12 @@ export async function buildServer(
     async (req, reply) => {
       const body = req.body ?? {};
       const rawFilters = body.filters ?? {};
+      const aug = req as FastifyRequest & {
+        mgmtTokenId?: string;
+        mgmtTokenLabel?: string;
+      };
+      const actorTokenId = aug.mgmtTokenId ?? "unknown";
+      const actorLabel = aug.mgmtTokenLabel;
       const filters: RotationFilters = {};
       if (typeof rawFilters.team === "string" && rawFilters.team !== "")
         filters.team = rawFilters.team;
@@ -411,6 +515,20 @@ export async function buildServer(
         filters.provider = rawFilters.provider;
 
       if (Object.keys(filters).length === 0) {
+        // Audit the failed attempt — invariant 5. Preview/dryRun rotate
+        // do NOT audit (invariant 6), but a no_filters error on any
+        // variant is a real attempt worth recording.
+        store.recordAdminAction({
+          ts: new Date().toISOString(),
+          actorTokenId,
+          actorLabel,
+          action: "token.rotate",
+          outcome: "failed",
+          reason: "no_filters",
+          paramsJson: JSON.stringify({ filters: rawFilters }),
+          sourceIp: req.ip,
+          userAgent: req.headers["user-agent"],
+        } satisfies AdminAuditEntry);
         return reply.status(400).send({
           error: "no_filters",
           hint:
@@ -424,6 +542,7 @@ export async function buildServer(
         (t) => !t.revoked,
       );
 
+      // Preview and dryRun: no writes, no audit (invariant 6).
       if (body.preview === true) {
         return reply.status(200).send({
           filters,
@@ -458,6 +577,7 @@ export async function buildServer(
         });
       }
 
+      // dryRun: no writes, no audit (invariant 6).
       if (body.dryRun === true) {
         return reply.status(200).send({
           filters,
@@ -517,12 +637,58 @@ export async function buildServer(
           noModelsClaim: item.noModelsClaim,
         });
       }
+      // Audit only the real run — paramsJson is the filters summary only,
+      // NEVER the reissued JWTs (invariant 3 + invariant 6).
+      store.recordAdminAction({
+        ts: new Date().toISOString(),
+        actorTokenId,
+        actorLabel,
+        action: "token.rotate",
+        outcome: "ok",
+        targetCount: reissued.length,
+        paramsJson: JSON.stringify({ filters }),
+        sourceIp: req.ip,
+        userAgent: req.headers["user-agent"],
+      } satisfies AdminAuditEntry);
       return reply.status(200).send({
         filters,
         revoked: reissued.length,
         reissued,
         expired: expired.map((t) => ({ id: t.id, label: t.label })),
       });
+    },
+  );
+
+  // Phase 4.0 c4e: GET /admin/audit — cursor-paginated admin action feed.
+  // Gated by requireManage (same as the other /admin/* writes). Default
+  // limit 200, max 500. Returns newest-first; cursor is the id of the
+  // last row so the client can page backwards in time without missing
+  // or duplicating rows. nextBeforeId is included iff rows.length ===
+  // limit (there may be more pages).
+  app.get<{ Querystring: { limit?: string; beforeId?: string } }>(
+    "/admin/audit",
+    { onRequest: requireManage },
+    async (req, reply) => {
+      const rawLimit = parseInt(req.query.limit ?? "200", 10);
+      const limit = Math.min(isNaN(rawLimit) || rawLimit < 1 ? 200 : rawLimit, 500);
+      const rawBefore = req.query.beforeId;
+      const beforeId =
+        rawBefore !== undefined ? parseInt(rawBefore, 10) : undefined;
+      const rows = store.recentAdminAudit({
+        limit,
+        beforeId: beforeId !== undefined && !isNaN(beforeId)
+          ? beforeId
+          : undefined,
+      });
+      const result: { rows: AdminAuditEntry[]; nextBeforeId?: number } = {
+        rows,
+      };
+      if (rows.length === limit && rows.length > 0) {
+        // The last row (oldest in this page) is the cursor for the next page.
+        const lastId = rows[rows.length - 1]?.id;
+        if (lastId !== undefined) result.nextBeforeId = lastId;
+      }
+      return reply.status(200).send(result);
     },
   );
 

@@ -238,7 +238,7 @@ export class MgmtAuthError extends Error {
 }
 
 async function adminFetch<T>(
-  method: "POST" | "DELETE",
+  method: "GET" | "POST" | "DELETE",
   url: string,
   body?: unknown,
 ): Promise<T> {
@@ -371,6 +371,38 @@ export function rotateDryRun(filters: RotateFilters): Promise<RotateDryRun> {
 
 export function rotateExecute(filters: RotateFilters): Promise<RotateResult> {
   return adminFetch<RotateResult>("POST", "/admin/tokens/rotate", { filters });
+}
+
+// Phase 4.0 c4e: mirrors broker `AdminAuditEntry` (src/store-types.ts).
+// Actor is always the brkm_… mgmt JWT jti — never a proxy brk_… id.
+export interface AdminAuditRow {
+  id?: number;
+  ts: string;
+  actorTokenId: string;
+  actorLabel?: string;
+  action: "token.issue" | "token.revoke" | "token.rotate";
+  targetTokenId?: string;
+  targetCount?: number;
+  paramsJson?: string;
+  outcome: "ok" | "failed";
+  reason?: string;
+  sourceIp?: string;
+  userAgent?: string;
+}
+
+/** Fetch the admin action audit feed. Throws `MgmtAuthError` on 401. */
+export function fetchAdminAudit(opts?: {
+  limit?: number;
+  beforeId?: number;
+}): Promise<{ rows: AdminAuditRow[]; nextBeforeId?: number }> {
+  const qs = new URLSearchParams();
+  if (opts?.limit !== undefined) qs.set("limit", String(opts.limit));
+  if (opts?.beforeId !== undefined) qs.set("beforeId", String(opts.beforeId));
+  const tail = qs.toString();
+  return adminFetch<{ rows: AdminAuditRow[]; nextBeforeId?: number }>(
+    "GET",
+    `/admin/audit${tail ? `?${tail}` : ""}`,
+  );
 }
 
 /**

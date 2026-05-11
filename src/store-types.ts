@@ -245,6 +245,61 @@ export interface StoreLike {
    * no samples in window.
    */
   latencyStatsByTokenSince(tokenId: string, ts: string): LatencyStats;
+  /**
+   * Phase 4.0 c4e: record a completed /admin/* write to the audit log.
+   * Best-effort — MUST NOT throw on failure (invariant 4). Implementations
+   * catch internally and log to stderr; the admin action's success is
+   * independent of audit success.
+   */
+  recordAdminAction(entry: AdminAuditEntry): void;
+  /**
+   * Phase 4.0 c4e: return recent admin audit rows, newest first.
+   * `beforeId` enables cursor pagination — when supplied, returns only
+   * rows with id < beforeId (i.e. rows older than that row).
+   */
+  recentAdminAudit(opts: { limit: number; beforeId?: number }): AdminAuditEntry[];
   /** Optional close hook (SQLite handle, etc.). */
   close?(): void;
+}
+
+/**
+ * Phase 4.0 c4e: one row of the admin audit log. Tracks every completed
+ * /admin/* write: who (actorTokenId/actorLabel), what (action + target),
+ * how (paramsJson — summary, never secret bytes), and whether it
+ * succeeded (outcome + reason).
+ *
+ * paramsJson must NEVER contain jwt bytes or any secret material —
+ * invariant 3. Actor is ALWAYS the mgmt JWT id (brkm_…), never the
+ * target proxy token id (brk_…) — invariant 2.
+ */
+export interface AdminAuditEntry {
+  /** Auto-assigned by the store; absent before insertion. */
+  id?: number;
+  /** ISO 8601 UTC timestamp of the action. */
+  ts: string;
+  /** The brkm_… jti of the management JWT that performed the action. */
+  actorTokenId: string;
+  /** Human-readable label from the management JWT claims.lbl. */
+  actorLabel?: string;
+  /** One of the three fixed action types — invariant 1. */
+  action: "token.issue" | "token.revoke" | "token.rotate";
+  /** The brk_… id of the affected token (NULL for rotate / batch). */
+  targetTokenId?: string;
+  /** Count of reissued tokens (rotate only). */
+  targetCount?: number;
+  /**
+   * JSON summary of non-secret request params — invariant 3.
+   * token.issue: {label, provider, ttlSeconds, capUsd, tags, models}.
+   * token.rotate: {filters}.
+   * token.revoke: omitted.
+   */
+  paramsJson?: string;
+  /** Whether the action completed successfully. */
+  outcome: "ok" | "failed";
+  /** Error code when outcome='failed' (the code, never the stack). */
+  reason?: string;
+  /** Requester IP — typically 127.0.0.1; forward-proofs non-loopback. */
+  sourceIp?: string;
+  /** User-Agent string from the HTTP request. */
+  userAgent?: string;
 }

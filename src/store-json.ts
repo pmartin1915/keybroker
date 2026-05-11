@@ -5,9 +5,11 @@ import {
   renameSync,
   appendFileSync,
 } from "node:fs";
+import { dirname, join } from "node:path";
 import { computeLatencyStats } from "./latency-stats.js";
 import type { CallLogEntry } from "./logging.js";
 import type {
+  AdminAuditEntry,
   ConsumeResult,
   DailySpendRow,
   LatencyStats,
@@ -35,12 +37,20 @@ const EMPTY: StoreShape = { version: 1, secrets: {}, tokens: {} };
  * single-file CLI demo workflow (`--store=json`); SQLite is the default.
  */
 export class JsonStore implements StoreLike {
+  // Phase 4.0 c4e: sibling JSONL file for admin audit, mirrors the calls
+  // JSONL pattern — append-only, separate from the secrets/tokens JSON.
+  // Path is derived from logsPath's directory, not the store path, so
+  // both audit files land in the same directory (invariant 8).
+  private readonly adminAuditPath: string;
+
   constructor(
     private readonly path: string,
     private readonly logsPath: string,
     /** When true, refuse all writes. Set after a successful migrate. */
     private readonly readOnly = false,
-  ) {}
+  ) {
+    this.adminAuditPath = join(dirname(this.logsPath), "admin-audit.jsonl");
+  }
 
   private read(): StoreShape {
     if (!existsSync(this.path)) return structuredClone(EMPTY);
@@ -414,6 +424,54 @@ export class JsonStore implements StoreLike {
       return true;
     });
     return filtered.slice(-opts.limit);
+  }
+
+  // Phase 4.0 c4e: best-effort admin audit write. Uses appendFileSync
+  // mirroring appendCall. The id is synthesised from the line count of
+  // the existing file — simple, monotonically increasing within a
+  // single-process store (JsonStore is single-process by contract).
+  // Wrapped in try/catch so disk-full / permission errors never
+  // propagate — invariant 4.
+  recordAdminAction(entry: AdminAuditEntry): void {
+    try {
+      // Derive a synthetic id from the existing line count + 1 so
+      // pagination via beforeId works the same as in SqliteStore.
+      let nextId = 1;
+      if (existsSync(this.adminAuditPath)) {
+        const existing = readFileSync(this.adminAuditPath, "utf8")
+          .trim()
+          .split("\n")
+          .filter(Boolean);
+        nextId = existing.length + 1;
+      }
+      const row: AdminAuditEntry = { ...entry, id: nextId };
+      appendFileSync(this.adminAuditPath, JSON.stringify(row) + "\n");
+    } catch (e) {
+      console.error("[admin-audit] recordAdminAction failed:", e);
+    }
+  }
+
+  recentAdminAudit(opts: { limit: number; beforeId?: number }): AdminAuditEntry[] {
+    if (!existsSync(this.adminAuditPath)) return [];
+    const lines = readFileSync(this.adminAuditPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    const parsed: AdminAuditEntry[] = [];
+    for (const l of lines) {
+      try {
+        parsed.push(JSON.parse(l) as AdminAuditEntry);
+      } catch {
+        // skip malformed lines
+      }
+    }
+    // Reverse for newest-first, apply beforeId filter, then limit.
+    const reversed = parsed.reverse();
+    const filtered =
+      opts.beforeId !== undefined
+        ? reversed.filter((e) => (e.id ?? 0) < opts.beforeId!)
+        : reversed;
+    return filtered.slice(0, opts.limit);
   }
 }
 

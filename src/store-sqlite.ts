@@ -2,6 +2,7 @@ import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { computeLatencyStats } from "./latency-stats.js";
 import type { CallLogEntry } from "./logging.js";
 import type {
+  AdminAuditEntry,
   ConsumeResult,
   DailySpendRow,
   LatencyStats,
@@ -71,6 +72,22 @@ interface CallRow {
   output_tokens: number | null;
 }
 
+// Phase 4.0 c4e: snake_case mirror of AdminAuditEntry for SQLite row reads.
+interface AdminAuditRow {
+  id: number;
+  ts: string;
+  actor_token_id: string;
+  actor_label: string | null;
+  action: string;
+  target_token_id: string | null;
+  target_count: number | null;
+  params_json: string | null;
+  outcome: string;
+  reason: string | null;
+  source_ip: string | null;
+  user_agent: string | null;
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS secrets (
   provider TEXT PRIMARY KEY,
@@ -120,6 +137,23 @@ CREATE TABLE IF NOT EXISTS calls (
 
 CREATE INDEX IF NOT EXISTS calls_token_id_idx ON calls(token_id);
 CREATE INDEX IF NOT EXISTS calls_ts_idx ON calls(ts);
+
+CREATE TABLE IF NOT EXISTS admin_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  actor_token_id TEXT NOT NULL,
+  actor_label TEXT,
+  action TEXT NOT NULL,
+  target_token_id TEXT,
+  target_count INTEGER,
+  params_json TEXT,
+  outcome TEXT NOT NULL,
+  reason TEXT,
+  source_ip TEXT,
+  user_agent TEXT
+);
+CREATE INDEX IF NOT EXISTS admin_audit_ts_idx ON admin_audit(ts);
+CREATE INDEX IF NOT EXISTS admin_audit_actor_idx ON admin_audit(actor_token_id);
 `;
 
 /**
@@ -158,6 +192,10 @@ export class SqliteStore implements StoreLike {
     dailySpendByTagProjectSince: StatementSync;
     dailySpendByTagEnvSince: StatementSync;
     latencyStatsByTokenSince: StatementSync;
+    // Phase 4.0 c4e: admin audit log statements.
+    insertAdminAudit: StatementSync;
+    selectAdminAudit: StatementSync;
+    selectAdminAuditBefore: StatementSync;
   };
 
   constructor(path: string) {
@@ -454,6 +492,31 @@ export class SqliteStore implements StoreLike {
          FROM calls
          WHERE token_id = ? AND ts >= ? AND outcome IN ('ok', 'error')
            AND ttft_ms IS NOT NULL`,
+      ),
+      // Phase 4.0 c4e: admin audit insert + two select variants (with/without
+      // beforeId cursor). selectAdminAuditBefore handles cursor pagination;
+      // selectAdminAudit handles first-page (no cursor). Both return newest
+      // first so the caller gets the most-recent rows without sorting in JS.
+      insertAdminAudit: this.db.prepare(
+        `INSERT INTO admin_audit
+           (ts, actor_token_id, actor_label, action, target_token_id, target_count,
+            params_json, outcome, reason, source_ip, user_agent)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ),
+      selectAdminAudit: this.db.prepare(
+        `SELECT id, ts, actor_token_id, actor_label, action, target_token_id,
+                target_count, params_json, outcome, reason, source_ip, user_agent
+         FROM admin_audit
+         ORDER BY id DESC
+         LIMIT ?`,
+      ),
+      selectAdminAuditBefore: this.db.prepare(
+        `SELECT id, ts, actor_token_id, actor_label, action, target_token_id,
+                target_count, params_json, outcome, reason, source_ip, user_agent
+         FROM admin_audit
+         WHERE id < ?
+         ORDER BY id DESC
+         LIMIT ?`,
       ),
     };
   }
@@ -788,6 +851,39 @@ export class SqliteStore implements StoreLike {
     return rows.reverse().map(rowToCall);
   }
 
+  // Phase 4.0 c4e: best-effort admin audit write. The .run() is wrapped in
+  // try/catch so a disk-full / schema-drift error never propagates to the
+  // caller — invariant 4. The admin action already succeeded by the time
+  // this is called; failing to log it must not turn a 200 into a 500.
+  recordAdminAction(entry: AdminAuditEntry): void {
+    try {
+      this.stmts.insertAdminAudit.run(
+        entry.ts,
+        entry.actorTokenId,
+        entry.actorLabel ?? null,
+        entry.action,
+        entry.targetTokenId ?? null,
+        entry.targetCount ?? null,
+        entry.paramsJson ?? null,
+        entry.outcome,
+        entry.reason ?? null,
+        entry.sourceIp ?? null,
+        entry.userAgent ?? null,
+      );
+    } catch (e) {
+      console.error("[admin-audit] recordAdminAction failed:", e);
+    }
+  }
+
+  recentAdminAudit(opts: { limit: number; beforeId?: number }): AdminAuditEntry[] {
+    const rows = (
+      opts.beforeId !== undefined
+        ? this.stmts.selectAdminAuditBefore.all(opts.beforeId, opts.limit)
+        : this.stmts.selectAdminAudit.all(opts.limit)
+    ) as unknown as AdminAuditRow[];
+    return rows.map(rowToAdminAudit);
+  }
+
   close(): void {
     this.db.close();
   }
@@ -850,6 +946,25 @@ function rowToCall(row: CallRow): CallLogEntry {
   if (row.ttft_ms !== null) entry.ttftMs = row.ttft_ms;
   if (row.tpot_ms_avg !== null) entry.tpotMsAvg = row.tpot_ms_avg;
   if (row.output_tokens !== null) entry.outputTokens = row.output_tokens;
+  return entry;
+}
+
+// Phase 4.0 c4e: map AdminAuditRow (snake_case) to AdminAuditEntry (camelCase).
+function rowToAdminAudit(row: AdminAuditRow): AdminAuditEntry {
+  const entry: AdminAuditEntry = {
+    id: row.id,
+    ts: row.ts,
+    actorTokenId: row.actor_token_id,
+    action: row.action as AdminAuditEntry["action"],
+    outcome: row.outcome as AdminAuditEntry["outcome"],
+  };
+  if (row.actor_label !== null) entry.actorLabel = row.actor_label;
+  if (row.target_token_id !== null) entry.targetTokenId = row.target_token_id;
+  if (row.target_count !== null) entry.targetCount = row.target_count;
+  if (row.params_json !== null) entry.paramsJson = row.params_json;
+  if (row.reason !== null) entry.reason = row.reason;
+  if (row.source_ip !== null) entry.sourceIp = row.source_ip;
+  if (row.user_agent !== null) entry.userAgent = row.user_agent;
   return entry;
 }
 

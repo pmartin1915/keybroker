@@ -428,3 +428,309 @@ describe("POST /admin/tokens/rotate", () => {
     expect(newRec?.models).toEqual(["gpt-4o-mini"]);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 4.0 c4e: admin audit log.
+// ─────────────────────────────────────────────────────────────────────
+
+import type { AdminAuditEntry } from "../src/store-types.js";
+
+describe("admin audit log", () => {
+  // ── Auth gating ────────────────────────────────────────────────────
+
+  it("GET /admin/audit 401s with no Authorization header", async () => {
+    const res = await fetch(`${origin}/admin/audit`);
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("no_management_token");
+  });
+
+  it("GET /admin/audit 401s with a proxy (brk_) token", async () => {
+    const proxyJwt = await issueToken(config.jwtSecret, {
+      tokenId: "audit-proxy-check",
+      provider: "echo",
+      scopes: ["*"],
+      label: "x",
+      ttlSeconds: 60,
+    });
+    const res = await fetch(`${origin}/admin/audit`, {
+      headers: { authorization: `Bearer ${proxyJwt}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  // ── token.issue audit rows ─────────────────────────────────────────
+
+  it("records an ok audit row after POST /admin/tokens succeeds", async () => {
+    const res = await fetch(`${origin}/admin/tokens`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${mgmtJwt}`,
+      },
+      body: JSON.stringify({ provider: "echo", label: "audit-issue-test" }),
+    });
+    expect(res.status).toBe(201);
+    const issued = (await res.json()) as { tokenId: string };
+
+    const auditRes = await fetch(`${origin}/admin/audit?limit=50`, {
+      headers: { authorization: `Bearer ${mgmtJwt}` },
+    });
+    expect(auditRes.status).toBe(200);
+    const auditBody = (await auditRes.json()) as {
+      rows: AdminAuditEntry[];
+    };
+    // Find the row matching this issue action.
+    const row = auditBody.rows.find(
+      (r) =>
+        r.action === "token.issue" &&
+        r.targetTokenId === issued.tokenId &&
+        r.outcome === "ok",
+    );
+    expect(row).toBeDefined();
+    expect(row?.actorTokenId).toBe("mgmt-test");
+    expect(row?.actorLabel).toBe("admin-test");
+  });
+
+  it("paramsJson of an issue row does NOT contain jwt bytes (invariant 3)", async () => {
+    const res = await fetch(`${origin}/admin/tokens`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${mgmtJwt}`,
+      },
+      body: JSON.stringify({ provider: "echo", label: "audit-params-check" }),
+    });
+    expect(res.status).toBe(201);
+    const issued = (await res.json()) as { tokenId: string };
+
+    const auditRes = await fetch(`${origin}/admin/audit?limit=50`, {
+      headers: { authorization: `Bearer ${mgmtJwt}` },
+    });
+    const auditBody = (await auditRes.json()) as { rows: AdminAuditEntry[] };
+    const row = auditBody.rows.find(
+      (r) => r.action === "token.issue" && r.targetTokenId === issued.tokenId,
+    );
+    expect(row).toBeDefined();
+    // paramsJson must never include the resulting JWT.
+    expect(row?.paramsJson).not.toContain("jwt");
+    expect(row?.paramsJson).not.toContain("brk_");
+  });
+
+  it("records a failed audit row when POST /admin/tokens fails (unknown provider)", async () => {
+    await fetch(`${origin}/admin/tokens`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${mgmtJwt}`,
+      },
+      body: JSON.stringify({ provider: "no-such-provider", label: "audit-fail" }),
+    });
+
+    const auditRes = await fetch(`${origin}/admin/audit?limit=50`, {
+      headers: { authorization: `Bearer ${mgmtJwt}` },
+    });
+    const auditBody = (await auditRes.json()) as { rows: AdminAuditEntry[] };
+    const row = auditBody.rows.find(
+      (r) =>
+        r.action === "token.issue" &&
+        r.outcome === "failed" &&
+        r.reason === "unknown_provider",
+    );
+    expect(row).toBeDefined();
+    expect(row?.actorTokenId).toBe("mgmt-test");
+  });
+
+  // ── token.revoke audit rows ────────────────────────────────────────
+
+  it("records an ok audit row after DELETE /admin/tokens/:id revokes", async () => {
+    const rec = makeToken({ label: "audit-revoke-test" });
+    store.putToken(rec);
+    await fetch(`${origin}/admin/tokens/${rec.id}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${mgmtJwt}` },
+    });
+
+    const auditRes = await fetch(`${origin}/admin/audit?limit=50`, {
+      headers: { authorization: `Bearer ${mgmtJwt}` },
+    });
+    const auditBody = (await auditRes.json()) as { rows: AdminAuditEntry[] };
+    const row = auditBody.rows.find(
+      (r) =>
+        r.action === "token.revoke" &&
+        r.targetTokenId === rec.id &&
+        r.outcome === "ok",
+    );
+    expect(row).toBeDefined();
+    expect(row?.actorTokenId).toBe("mgmt-test");
+  });
+
+  it("records a failed audit row when DELETE /admin/tokens/:id 404s (unknown id)", async () => {
+    await fetch(`${origin}/admin/tokens/audit-unknown-id`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${mgmtJwt}` },
+    });
+
+    const auditRes = await fetch(`${origin}/admin/audit?limit=50`, {
+      headers: { authorization: `Bearer ${mgmtJwt}` },
+    });
+    const auditBody = (await auditRes.json()) as { rows: AdminAuditEntry[] };
+    const row = auditBody.rows.find(
+      (r) =>
+        r.action === "token.revoke" &&
+        r.targetTokenId === "audit-unknown-id" &&
+        r.outcome === "failed" &&
+        r.reason === "unknown_token",
+    );
+    expect(row).toBeDefined();
+  });
+
+  // ── token.rotate audit rows ────────────────────────────────────────
+
+  it("records a token.rotate audit row after a real-run rotate", async () => {
+    store.putToken(
+      makeToken({ id: "audit-rot-a", tagTeam: "auditteam", label: "ara" }),
+    );
+    store.putToken(
+      makeToken({ id: "audit-rot-b", tagTeam: "auditteam", label: "arb" }),
+    );
+
+    const res = await fetch(`${origin}/admin/tokens/rotate`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${mgmtJwt}`,
+      },
+      body: JSON.stringify({ filters: { team: "auditteam" } }),
+    });
+    expect(res.status).toBe(200);
+    const rotBody = (await res.json()) as { reissued: unknown[] };
+
+    const auditRes = await fetch(`${origin}/admin/audit?limit=50`, {
+      headers: { authorization: `Bearer ${mgmtJwt}` },
+    });
+    const auditBody = (await auditRes.json()) as { rows: AdminAuditEntry[] };
+    const row = auditBody.rows.find(
+      (r) => r.action === "token.rotate" && r.outcome === "ok",
+    );
+    expect(row).toBeDefined();
+    expect(row?.targetCount).toBe(rotBody.reissued.length);
+    expect(row?.actorTokenId).toBe("mgmt-test");
+    // paramsJson should reference the filters, never the new JWTs.
+    expect(row?.paramsJson).toContain("auditteam");
+    expect(row?.paramsJson).not.toContain("jwt");
+  });
+
+  it("preview rotate does NOT produce an audit row (invariant 6)", async () => {
+    store.putToken(
+      makeToken({ id: "audit-prev-a", tagTeam: "previewteam", label: "pva" }),
+    );
+
+    // Snapshot audit count before.
+    const before = await fetch(`${origin}/admin/audit?limit=200`, {
+      headers: { authorization: `Bearer ${mgmtJwt}` },
+    });
+    const beforeBody = (await before.json()) as { rows: AdminAuditEntry[] };
+    const countBefore = beforeBody.rows.length;
+
+    await fetch(`${origin}/admin/tokens/rotate`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${mgmtJwt}`,
+      },
+      body: JSON.stringify({
+        filters: { team: "previewteam" },
+        preview: true,
+      }),
+    });
+
+    const after = await fetch(`${origin}/admin/audit?limit=200`, {
+      headers: { authorization: `Bearer ${mgmtJwt}` },
+    });
+    const afterBody = (await after.json()) as { rows: AdminAuditEntry[] };
+    // No new rotate row should have been added.
+    expect(afterBody.rows.length).toBe(countBefore);
+  });
+
+  it("dryRun rotate does NOT produce an audit row (invariant 6)", async () => {
+    store.putToken(
+      makeToken({ id: "audit-dry-a", tagTeam: "dryrunteam", label: "dra" }),
+    );
+
+    const before = await fetch(`${origin}/admin/audit?limit=200`, {
+      headers: { authorization: `Bearer ${mgmtJwt}` },
+    });
+    const beforeBody = (await before.json()) as { rows: AdminAuditEntry[] };
+    const countBefore = beforeBody.rows.length;
+
+    await fetch(`${origin}/admin/tokens/rotate`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${mgmtJwt}`,
+      },
+      body: JSON.stringify({
+        filters: { team: "dryrunteam" },
+        dryRun: true,
+      }),
+    });
+
+    const after = await fetch(`${origin}/admin/audit?limit=200`, {
+      headers: { authorization: `Bearer ${mgmtJwt}` },
+    });
+    const afterBody = (await after.json()) as { rows: AdminAuditEntry[] };
+    expect(afterBody.rows.length).toBe(countBefore);
+  });
+
+  // ── Pagination ─────────────────────────────────────────────────────
+
+  it("beforeId cursor pagination: no overlap between pages", async () => {
+    // Issue 3 fresh tokens so we have at least 3 new issue audit rows
+    // to paginate through.
+    const issued: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const res = await fetch(`${origin}/admin/tokens`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${mgmtJwt}`,
+        },
+        body: JSON.stringify({ provider: "echo", label: `page-tok-${i}` }),
+      });
+      const b = (await res.json()) as { tokenId: string };
+      issued.push(b.tokenId);
+    }
+
+    // First page: limit=2, no cursor — should return newest rows first.
+    const page1Res = await fetch(`${origin}/admin/audit?limit=2`, {
+      headers: { authorization: `Bearer ${mgmtJwt}` },
+    });
+    const page1 = (await page1Res.json()) as {
+      rows: AdminAuditEntry[];
+      nextBeforeId?: number;
+    };
+    expect(page1.rows).toHaveLength(2);
+    expect(page1.nextBeforeId).toBeDefined();
+
+    // Second page: use the cursor from page 1.
+    const page2Res = await fetch(
+      `${origin}/admin/audit?limit=2&beforeId=${page1.nextBeforeId}`,
+      { headers: { authorization: `Bearer ${mgmtJwt}` } },
+    );
+    const page2 = (await page2Res.json()) as { rows: AdminAuditEntry[] };
+    expect(page2.rows.length).toBeGreaterThan(0);
+
+    // No row id should appear in both pages.
+    const ids1 = new Set(page1.rows.map((r) => r.id));
+    for (const r of page2.rows) {
+      expect(ids1.has(r.id)).toBe(false);
+    }
+
+    // All page-2 rows must have id < page-1's cursor.
+    const cursor = page1.nextBeforeId!;
+    for (const r of page2.rows) {
+      expect((r.id ?? 0) < cursor).toBe(true);
+    }
+  });
+});
