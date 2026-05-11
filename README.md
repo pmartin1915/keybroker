@@ -87,7 +87,7 @@ The echo upstream's response will show you exactly what the broker forwarded, in
 | Quota             | `--max-calls N`. Atomic decrement on every call. 0 → 429.          |
 | Spend cap         | `--cap 50` (USD). Pre-flight estimate + post-call reconciliation from the audit log. Denies `cap_exceeded_estimate` or `cap_exceeded`. |
 | Expiry            | `--ttl <seconds>`. JWT `exp` + server-side check.                  |
-| Revocation        | `keybroker token revoke <id>` — server-side flag, takes effect immediately. `revoke-all --machine <name>` for bulk rotation. |
+| Revocation        | `keybroker token revoke <id>` — server-side flag, takes effect immediately. `revoke-all --machine <name>` for bulk revoke; `rotate-all --team/--project/--env/--machine/--provider [--preview\|--dry-run]` revokes + reissues with identical claims; `reissue-batch --from-revoked --since 24h` re-mints already-revoked tokens. |
 | Machine           | `--machine` (default `os.hostname()`). Every audit entry carries `mch`. Filter tokens and logs by machine. |
 | Tags              | `--team`, `--project`, `--env` for FinOps attribution. Validated against `policy.json` `tag_allowlist` (per-tag, optional). Carried into every audit row for spend roll-ups. |
 | Fleet policy      | `~/.keybroker/policy.json`: `forbidden_models` (glob deny-list) + `allowed_providers` + `tag_allowlist` (per-tag allow-list) + `scanner` (egress secret-scan config). Hot-reloads without restart. |

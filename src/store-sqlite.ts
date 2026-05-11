@@ -37,6 +37,7 @@ interface TokenRow {
   tag_team: string | null;
   tag_project: string | null;
   tag_env: string | null;
+  models: string | null;
 }
 
 interface SecretRow {
@@ -196,8 +197,8 @@ export class SqliteStore implements StoreLike {
         `SELECT provider, created_at FROM secrets ORDER BY provider`,
       ),
       putToken: this.db.prepare(
-        `INSERT INTO tokens (id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd, tag_team, tag_project, tag_env)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO tokens (id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd, tag_team, tag_project, tag_env, models)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            provider = excluded.provider,
            scopes = excluded.scopes,
@@ -211,18 +212,19 @@ export class SqliteStore implements StoreLike {
            cap_usd = excluded.cap_usd,
            tag_team = excluded.tag_team,
            tag_project = excluded.tag_project,
-           tag_env = excluded.tag_env`,
+           tag_env = excluded.tag_env,
+           models = excluded.models`,
       ),
       getToken: this.db.prepare(
-        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd, tag_team, tag_project, tag_env
+        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd, tag_team, tag_project, tag_env, models
          FROM tokens WHERE id = ?`,
       ),
       listTokens: this.db.prepare(
-        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd, tag_team, tag_project, tag_env
+        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd, tag_team, tag_project, tag_env, models
          FROM tokens ORDER BY created_at`,
       ),
       listTokensByMachine: this.db.prepare(
-        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd, tag_team, tag_project, tag_env
+        `SELECT id, provider, scopes, remaining, used, expires_at, created_at, label, revoked, machine, cap_usd, tag_team, tag_project, tag_env, models
          FROM tokens WHERE machine = ? ORDER BY created_at`,
       ),
       // Single-statement atomic check-and-decrement. Returns 1 row updated
@@ -494,6 +496,7 @@ export class SqliteStore implements StoreLike {
       rec.tagTeam ?? null,
       rec.tagProject ?? null,
       rec.tagEnv ?? null,
+      rec.models && rec.models.length > 0 ? JSON.stringify(rec.models) : null,
     );
   }
 
@@ -716,6 +719,10 @@ export class SqliteStore implements StoreLike {
     addColumnIfMissing(db, "tokens", "tag_team", "TEXT");
     addColumnIfMissing(db, "tokens", "tag_project", "TEXT");
     addColumnIfMissing(db, "tokens", "tag_env", "TEXT");
+    // Phase 3.8: models persisted at issue time for rotate-all parity.
+    // JSON-encoded string array, NULL when no restriction. Pre-3.8
+    // records have no value here — rotation will warn.
+    addColumnIfMissing(db, "tokens", "models", "TEXT");
     addColumnIfMissing(db, "calls", "tag_team", "TEXT");
     addColumnIfMissing(db, "calls", "tag_project", "TEXT");
     addColumnIfMissing(db, "calls", "tag_env", "TEXT");
@@ -803,6 +810,18 @@ function rowToToken(row: TokenRow): TokenRecord {
   if (row.tag_team !== null) rec.tagTeam = row.tag_team;
   if (row.tag_project !== null) rec.tagProject = row.tag_project;
   if (row.tag_env !== null) rec.tagEnv = row.tag_env;
+  if (row.models !== null) {
+    try {
+      const parsed = JSON.parse(row.models) as unknown;
+      if (Array.isArray(parsed) && parsed.every((m) => typeof m === "string")) {
+        rec.models = parsed as string[];
+      }
+    } catch {
+      // Corrupted JSON — drop silently so a damaged row doesn't crash
+      // list/rotate paths. Same posture as the JSON-store malformed-
+      // line handling.
+    }
+  }
   return rec;
 }
 

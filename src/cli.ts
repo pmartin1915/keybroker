@@ -33,6 +33,13 @@ import type { TagBucket } from "./store-types.js";
 import { getKeychain, KC_JWT_SECRET, KC_MASTER_KEY } from "./keychain.js";
 import { normalizeMachine } from "./hostname.js";
 import { loadPolicy, policyDeniesTag, type TagKey } from "./policy.js";
+import {
+  applyRotationFilters,
+  buildReissueArgs,
+  computeRotationPreview,
+  tokenClaimSummary,
+  type RotationFilters,
+} from "./rotate.js";
 
 function parseStoreMode(s: string | undefined): StoreMode {
   if (!s) return "auto";
@@ -400,6 +407,9 @@ token
       if (tags.team !== undefined) rec.tagTeam = tags.team;
       if (tags.project !== undefined) rec.tagProject = tags.project;
       if (tags.env !== undefined) rec.tagEnv = tags.env;
+      // Phase 3.8: persist `models` so `rotate-all` can preserve the
+      // mdl claim across a rotation without holding the JWT.
+      if (models !== undefined) rec.models = models;
       store.putToken(rec);
       const jwt = await issueToken(cfg.jwtSecret, {
         tokenId: id,
@@ -556,6 +566,98 @@ token
       }
     }
     console.error(`done — ${revoked}/${candidates.length} revoked.`);
+  });
+
+// Phase 3.8: rotate-all = revoke matching + reissue with identical
+// claims. The fire-drill UX: leaked credential / contractor offboard /
+// scope drift detected → one command churns the entire affected set
+// without forcing the operator to recreate token-by-token.
+//
+// Selection is filter-AND (every passed filter must match), and at
+// least one selection filter is required — refusing to rotate the
+// entire fleet with one command is a deliberate guardrail. The
+// reissue preserves provider, scopes, label, machine, capUsd, tags,
+// and the *remaining* TTL of the old token (so rotation never
+// extends lifetime). The `mdl` claim is preserved when the source
+// TokenRecord has `models` populated; pre-3.8 records carry no
+// `models` column and the new token will be reissued without the
+// model restriction — we warn in that case.
+token
+  .command("rotate-all")
+  .description(
+    "Bulk-revoke + reissue every active token matching the given filters " +
+      "(team / project / env / machine / provider). Filter-AND. At least " +
+      "one filter is required.",
+  )
+  .option("--team <name>", "filter by team tag (case-sensitive)")
+  .option("--project <name>", "filter by project tag (case-sensitive)")
+  .option("--env <name>", "filter by env tag (case-sensitive)")
+  .option(
+    "--machine <name>",
+    "filter by machine attribution (case-insensitive — normalized)",
+  )
+  .option("--provider <name>", "filter by provider (e.g. openai)")
+  .option(
+    "--preview",
+    "print counts only (active, by machine, by tag) and exit. No revoke, no reissue.",
+    false,
+  )
+  .option(
+    "--dry-run",
+    "print the full plan (would-revoke list + reissue claim summary) and exit. No revoke, no reissue.",
+    false,
+  )
+  .option(
+    "--yes",
+    "skip the interactive confirmation. Required for non-interactive use.",
+    false,
+  )
+  .action(async (opts: RotateAllOpts) => {
+    await rotateAll(opts);
+  });
+
+// Phase 3.8: reissue-batch reissues already-revoked tokens with
+// identical claims. Use case: a `revoke-all --machine <m>` happened
+// (laptop-stolen) and after recovery the operator wants the affected
+// users to come back online without each filing a fresh request.
+// Filters mirror rotate-all (AND); the additional --since shorthand
+// picks the revoked-but-recent window. We use createdAt as the
+// "recency" signal because the broker doesn't currently track revoke
+// timestamps (a future schema bump could add `revoked_at`, but
+// createdAt is sufficient for the common laptop-stolen flow where
+// rotation happens within hours of revoke).
+token
+  .command("reissue-batch")
+  .description(
+    "Reissue already-revoked tokens with identical claims (except iat/jti). " +
+      "Filters AND; --since narrows by createdAt.",
+  )
+  .requiredOption(
+    "--since <shorthand>",
+    "duration shorthand (e.g. 24h, 7d) — only revoked tokens whose createdAt is within the window are considered",
+  )
+  .option(
+    "--from-revoked",
+    "the marker flag from the plan; semantically a no-op (reissue-batch always pulls from revoked tokens). Present for explicit intent.",
+    false,
+  )
+  .option("--team <name>", "filter by team tag")
+  .option("--project <name>", "filter by project tag")
+  .option("--env <name>", "filter by env tag")
+  .option("--machine <name>", "filter by machine attribution (normalized)")
+  .option("--provider <name>", "filter by provider")
+  .option(
+    "--dry-run",
+    "print the would-reissue list without writing new tokens.",
+    false,
+  )
+  .option(
+    "--yes",
+    "skip the interactive confirmation. Required for non-interactive use.",
+    false,
+  )
+  .action(async (opts: ReissueBatchOpts) => {
+    await reissueBatch(opts);
   });
 
 program
@@ -867,6 +969,325 @@ program
       `point clients at http://${host}:${port}/<provider>/... and use a brk_ token as the bearer.`,
     );
   });
+
+// Phase 3.8: option types separated from the inline action handlers so
+// the `rotateAll` and `reissueBatch` implementations are testable
+// and the commander signatures stay readable.
+interface RotateAllOpts {
+  team?: string;
+  project?: string;
+  env?: string;
+  machine?: string;
+  provider?: string;
+  preview: boolean;
+  dryRun: boolean;
+  yes: boolean;
+}
+
+interface ReissueBatchOpts {
+  since: string;
+  fromRevoked: boolean;
+  team?: string;
+  project?: string;
+  env?: string;
+  machine?: string;
+  provider?: string;
+  dryRun: boolean;
+  yes: boolean;
+}
+
+async function confirmYes(prompt: string): Promise<boolean> {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stderr,
+  });
+  try {
+    const answer = await rl.question(prompt);
+    return answer.trim() === "yes";
+  } finally {
+    rl.close();
+  }
+}
+
+async function rotateAll(opts: RotateAllOpts): Promise<void> {
+  const filters: RotationFilters = {};
+  if (opts.team !== undefined && opts.team !== "") filters.team = opts.team;
+  if (opts.project !== undefined && opts.project !== "")
+    filters.project = opts.project;
+  if (opts.env !== undefined && opts.env !== "") filters.env = opts.env;
+  const normMachine = normalizeMachine(opts.machine);
+  if (normMachine !== undefined) filters.machine = normMachine;
+  if (opts.provider !== undefined && opts.provider !== "")
+    filters.provider = opts.provider;
+
+  // Guardrail: refuse a no-filter invocation. The full-fleet rotate
+  // case is intentionally not a single command — if the operator
+  // wants it, they can pass `--provider <p>` per provider, or use
+  // `revoke-all --machine <m>` per machine. Cutting every token in
+  // one keystroke is the kind of thing that gets done by accident.
+  if (Object.keys(filters).length === 0) {
+    console.error(
+      "rotate-all requires at least one filter (--team / --project / --env / --machine / --provider). " +
+        "No-filter rotation is intentionally not supported — issue per-filter invocations instead.",
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const cfg = await loadConfig();
+  const store = openStore(cfg, { mode: storeMode() });
+  const all = store.listTokens();
+  const matched = applyRotationFilters(all, filters).filter((t) => !t.revoked);
+
+  if (matched.length === 0) {
+    console.log(`(no active tokens match filters: ${JSON.stringify(filters)})`);
+    return;
+  }
+
+  // --preview: counts only. No claim details, no reissue plan. The
+  // caller is sizing blast radius, not reviewing claims.
+  if (opts.preview) {
+    const preview = computeRotationPreview(matched);
+    console.log(`active matched: ${preview.total}`);
+    console.log(`by machine:`);
+    for (const [k, v] of Object.entries(preview.byMachine).sort()) {
+      console.log(`  ${k}: ${v}`);
+    }
+    if (Object.keys(preview.byTeam).length > 0) {
+      console.log(`by team:`);
+      for (const [k, v] of Object.entries(preview.byTeam).sort()) {
+        console.log(`  ${k}: ${v}`);
+      }
+    }
+    if (Object.keys(preview.byProject).length > 0) {
+      console.log(`by project:`);
+      for (const [k, v] of Object.entries(preview.byProject).sort()) {
+        console.log(`  ${k}: ${v}`);
+      }
+    }
+    if (Object.keys(preview.byEnv).length > 0) {
+      console.log(`by env:`);
+      for (const [k, v] of Object.entries(preview.byEnv).sort()) {
+        console.log(`  ${k}: ${v}`);
+      }
+    }
+    return;
+  }
+
+  // Build the reissue plan up front so dry-run and the real run share
+  // a single source of truth. Tokens already expired are dropped from
+  // the plan; they're surfaced separately so the operator knows why
+  // the count is smaller than the matched count.
+  const plan: Array<{
+    rec: TokenRecord;
+    newId: string;
+    args: Parameters<typeof issueToken>[1];
+    noModelsClaim: boolean;
+  }> = [];
+  const expired: TokenRecord[] = [];
+  for (const rec of matched) {
+    const newId = newTokenId();
+    const built = buildReissueArgs(rec, newId);
+    if (!built) {
+      expired.push(rec);
+      continue;
+    }
+    plan.push({ rec, newId, args: built.args, noModelsClaim: built.noModelsClaim });
+  }
+
+  console.error(
+    `rotate plan: ${plan.length} reissue(s), ${expired.length} skipped (already expired).`,
+  );
+  for (const { rec, newId } of plan) {
+    console.error(`  - revoke ${rec.id}  →  reissue ${newId}`);
+    console.error(`      ${tokenClaimSummary(rec)}`);
+  }
+  if (expired.length > 0) {
+    console.error(`skipped (expired):`);
+    for (const t of expired) console.error(`  - ${t.id}  label=${t.label}`);
+  }
+
+  // Phase 3.8 caveat: rotate is a security action. Pre-3.8 records
+  // carry no `models` column; reissuing such a token *loses* its
+  // model restriction. Loud warning, then require --yes regardless.
+  const lossyCount = plan.filter((p) => p.noModelsClaim).length;
+  if (lossyCount > 0) {
+    console.error(
+      `WARNING: ${lossyCount} token(s) were issued before Phase 3.8 and have no persisted ` +
+        `model restriction. If they originally had --model, the reissued token will be ` +
+        `unrestricted on model. Issue replacements manually for those.`,
+    );
+  }
+
+  if (opts.dryRun) {
+    console.log("(dry-run — no changes written)");
+    return;
+  }
+  if (!opts.yes) {
+    const ok = await confirmYes("type 'yes' to proceed: ");
+    if (!ok) {
+      console.error("aborted.");
+      return;
+    }
+  }
+
+  // Real run. Order: revoke FIRST so a crash mid-loop leaves the
+  // fleet in the "everyone's keys are dead" state rather than the
+  // "old keys still valid alongside new ones" state. Safer default.
+  let revoked = 0;
+  let reissued = 0;
+  for (const { rec, args } of plan) {
+    if (!store.revokeToken(rec.id)) continue;
+    revoked++;
+    // Mirror the issue path's TokenRecord shape.
+    const newRec: TokenRecord = {
+      id: args.tokenId,
+      provider: args.provider,
+      scopes: args.scopes,
+      remaining: rec.remaining,
+      used: 0,
+      expiresAt: args.ttlSeconds > 0
+        ? Math.floor(Date.now() / 1000) + args.ttlSeconds
+        : 0,
+      createdAt: new Date().toISOString(),
+      label: args.label,
+      revoked: false,
+    };
+    if (args.machine !== undefined) newRec.machine = args.machine;
+    if (args.capUsd !== undefined) newRec.capUsd = args.capUsd;
+    if (args.tags?.team !== undefined) newRec.tagTeam = args.tags.team;
+    if (args.tags?.project !== undefined) newRec.tagProject = args.tags.project;
+    if (args.tags?.env !== undefined) newRec.tagEnv = args.tags.env;
+    if (args.models !== undefined) newRec.models = args.models;
+    store.putToken(newRec);
+    const jwt = await issueToken(cfg.jwtSecret, args);
+    // Output: old-id, new-id, new JWT on separate stdout lines so the
+    // operator can pipe and grep. Each block separated by a blank line
+    // to keep diff-friendly.
+    console.log(`# revoked ${rec.id}  →  reissued ${args.tokenId}`);
+    console.log(jwt);
+    console.log("");
+    reissued++;
+  }
+  console.error(
+    `done — ${revoked}/${plan.length} revoked, ${reissued}/${plan.length} reissued.`,
+  );
+}
+
+async function reissueBatch(opts: ReissueBatchOpts): Promise<void> {
+  const sinceTs = parseSinceShorthand(opts.since);
+  if (sinceTs === undefined) {
+    console.error(
+      `invalid --since shorthand: ${opts.since} (expected <n>(s|m|h|d), e.g. 24h or 7d).`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  const filters: RotationFilters = {};
+  if (opts.team !== undefined && opts.team !== "") filters.team = opts.team;
+  if (opts.project !== undefined && opts.project !== "")
+    filters.project = opts.project;
+  if (opts.env !== undefined && opts.env !== "") filters.env = opts.env;
+  const normMachine = normalizeMachine(opts.machine);
+  if (normMachine !== undefined) filters.machine = normMachine;
+  if (opts.provider !== undefined && opts.provider !== "")
+    filters.provider = opts.provider;
+
+  const cfg = await loadConfig();
+  const store = openStore(cfg, { mode: storeMode() });
+  const all = store.listTokens();
+  // Window: revoked AND createdAt >= sinceTs. createdAt is the closest
+  // proxy for "recently active" we have — see the rationale on the
+  // command description.
+  const candidates = applyRotationFilters(all, filters).filter(
+    (t) => t.revoked && t.createdAt >= sinceTs,
+  );
+
+  if (candidates.length === 0) {
+    console.log(
+      `(no revoked tokens since ${sinceTs} match filters: ${JSON.stringify(filters)})`,
+    );
+    return;
+  }
+
+  const plan: Array<{
+    rec: TokenRecord;
+    newId: string;
+    args: Parameters<typeof issueToken>[1];
+    noModelsClaim: boolean;
+  }> = [];
+  const expired: TokenRecord[] = [];
+  for (const rec of candidates) {
+    const newId = newTokenId();
+    const built = buildReissueArgs(rec, newId);
+    if (!built) {
+      expired.push(rec);
+      continue;
+    }
+    plan.push({ rec, newId, args: built.args, noModelsClaim: built.noModelsClaim });
+  }
+
+  console.error(
+    `reissue plan: ${plan.length} reissue(s), ${expired.length} skipped (already expired).`,
+  );
+  for (const { rec, newId } of plan) {
+    console.error(`  - source ${rec.id}  →  reissue ${newId}`);
+    console.error(`      ${tokenClaimSummary(rec)}`);
+  }
+  if (expired.length > 0) {
+    console.error(`skipped (expired):`);
+    for (const t of expired) console.error(`  - ${t.id}  label=${t.label}`);
+  }
+  const lossyCount = plan.filter((p) => p.noModelsClaim).length;
+  if (lossyCount > 0) {
+    console.error(
+      `WARNING: ${lossyCount} token(s) were issued before Phase 3.8 and have no persisted ` +
+        `model restriction. The reissued token will be unrestricted on model.`,
+    );
+  }
+
+  if (opts.dryRun) {
+    console.log("(dry-run — no changes written)");
+    return;
+  }
+  if (!opts.yes) {
+    const ok = await confirmYes("type 'yes' to proceed: ");
+    if (!ok) {
+      console.error("aborted.");
+      return;
+    }
+  }
+
+  let reissued = 0;
+  for (const { rec, args } of plan) {
+    const newRec: TokenRecord = {
+      id: args.tokenId,
+      provider: args.provider,
+      scopes: args.scopes,
+      remaining: rec.remaining,
+      used: 0,
+      expiresAt: args.ttlSeconds > 0
+        ? Math.floor(Date.now() / 1000) + args.ttlSeconds
+        : 0,
+      createdAt: new Date().toISOString(),
+      label: args.label,
+      revoked: false,
+    };
+    if (args.machine !== undefined) newRec.machine = args.machine;
+    if (args.capUsd !== undefined) newRec.capUsd = args.capUsd;
+    if (args.tags?.team !== undefined) newRec.tagTeam = args.tags.team;
+    if (args.tags?.project !== undefined) newRec.tagProject = args.tags.project;
+    if (args.tags?.env !== undefined) newRec.tagEnv = args.tags.env;
+    if (args.models !== undefined) newRec.models = args.models;
+    store.putToken(newRec);
+    const jwt = await issueToken(cfg.jwtSecret, args);
+    console.log(`# source ${rec.id}  →  reissued ${args.tokenId}`);
+    console.log(jwt);
+    console.log("");
+    reissued++;
+  }
+  console.error(`done — ${reissued}/${plan.length} reissued.`);
+}
 
 program.parseAsync(process.argv).catch((e) => {
   console.error(e);

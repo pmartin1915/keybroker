@@ -50,6 +50,16 @@ export interface TokenRecord {
   tagTeam?: string;
   tagProject?: string;
   tagEnv?: string;
+  /**
+   * Phase 3.8: model allow-list recorded at issue time. Optional, mirror
+   * of the signed `mdl` claim. Same posture as `capUsd` and the tag
+   * fields — the broker NEVER reads this for enforcement (the JWT is
+   * the source of truth); it exists so `rotate-all` / `reissue-batch`
+   * can preserve the model restriction across a rotation without
+   * holding the bearer JWT. Records issued before Phase 3.8 won't
+   * have this populated; rotating such a token will print a warning.
+   */
+  models?: string[];
 }
 
 export type ConsumeResult =
