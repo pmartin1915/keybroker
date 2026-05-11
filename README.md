@@ -90,7 +90,8 @@ The echo upstream's response will show you exactly what the broker forwarded, in
 | Revocation        | `keybroker token revoke <id>` — server-side flag, takes effect immediately. `revoke-all --machine <name>` for bulk rotation. |
 | Machine           | `--machine` (default `os.hostname()`). Every audit entry carries `mch`. Filter tokens and logs by machine. |
 | Tags              | `--team`, `--project`, `--env` for FinOps attribution. Validated against `policy.json` `tag_allowlist` (per-tag, optional). Carried into every audit row for spend roll-ups. |
-| Fleet policy      | `~/.keybroker/policy.json`: `forbidden_models` (glob deny-list) + `allowed_providers` + `tag_allowlist` (per-tag allow-list). Hot-reloads without restart. |
+| Fleet policy      | `~/.keybroker/policy.json`: `forbidden_models` (glob deny-list) + `allowed_providers` + `tag_allowlist` (per-tag allow-list) + `scanner` (egress secret-scan config). Hot-reloads without restart. |
+| Egress scanner    | Inline regex scan of every request body before egress. Catches AWS keys, GitHub PATs (`ghp_`/`gho_`), Slack bot tokens, Stripe live keys. On hit: 403 with detector name, audit row `outcome: "egress_blocked"`. Default-on; disable with `"scanner": {"enabled": false}` in `policy.json`. Audit row carries the detector name only — never the matched substring. |
 | Audit             | Every call (allowed or denied) appended to SQLite `calls` table with token id, label, status, latency, requested model, machine, tags, estimated and actual cost. |
 | Spend rollups     | `GET /metrics/spend?bucket=team\|project\|env&since=24h` and `keybroker metrics spend --by team --since 24h` aggregate the audit log by tag for FinOps dashboards. |
 | Burn forecast     | `GET /forecast/tokens` and `GET /forecast/tags?bucket=team` (and `keybroker forecast`) least-squares-fit recent daily spend to project days-until-cap per token and burn-rate-ranked tag leaderboards. |

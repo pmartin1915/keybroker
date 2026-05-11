@@ -11,8 +11,22 @@ export interface CallLogEntry {
   reqBytes: number;
   /** Bytes received from upstream. */
   respBytes: number;
-  /** Empty unless an outcome != "ok" occurred. */
-  outcome: "ok" | "denied" | "error";
+  /**
+   * Empty unless an outcome != "ok" occurred.
+   *
+   * Values:
+   *   - `"ok"`: upstream returned successfully.
+   *   - `"denied"`: token/scope/policy/model check refused the call.
+   *     `reason` carries the specific deny kind (`scope_denied`,
+   *     `model_forbidden`, etc.).
+   *   - `"error"`: upstream returned non-2xx or the proxy itself failed
+   *     mid-stream. `reason` is the upstream status or a short label.
+   *   - `"egress_blocked"` (Phase 3.6): inline scanner caught a secret
+   *     in the request body. The call was NOT dialled out. `reason`
+   *     carries the detector name (e.g. `"aws_access_key"`) and never
+   *     the matched substring.
+   */
+  outcome: "ok" | "denied" | "error" | "egress_blocked";
   reason?: string;
   /**
    * Model the client requested in the body (Phase 2.1). Populated on

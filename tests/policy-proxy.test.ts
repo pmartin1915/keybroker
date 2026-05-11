@@ -420,3 +420,160 @@ describe("policy + per-token mdl interaction", () => {
     expect(await jsonError(res)).toBe("model_forbidden");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 3.6 — inline secret scanner end-to-end.
+// ---------------------------------------------------------------------------
+
+describe("policy: scanner (Phase 3.6)", () => {
+  it("blocks a request whose body contains an AWS access key (default-on)", async () => {
+    // No policy file → scanner defaults to enabled with all built-ins.
+    clearPolicy();
+    const { id, jwt } = await mintToken();
+    const res = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: "key is AKIAIOSFODNN7EXAMPLE" }],
+      }),
+    });
+    expect(res.status).toBe(403);
+    const j = (await res.json()) as { error?: string; detector?: string };
+    expect(j.error).toBe("egress_blocked");
+    expect(j.detector).toBe("aws_access_key");
+
+    const recent = store.recentCalls({ limit: 5, tokenId: id });
+    const block = recent.find((e) => e.outcome === "egress_blocked");
+    expect(block).toBeDefined();
+    expect(block?.reason).toBe("aws_access_key");
+    expect(block?.status).toBe(403);
+  });
+
+  it("does NOT include the matched substring in the audit row or response", async () => {
+    clearPolicy();
+    const secret = "AKIAIOSFODNN7EXAMPLE";
+    const { id, jwt } = await mintToken();
+    const res = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ messages: [{ content: secret }] }),
+    });
+    const bodyText = await res.text();
+    expect(bodyText).not.toContain(secret);
+    expect(bodyText).not.toContain("AKIA");
+
+    const recent = store.recentCalls({ limit: 5, tokenId: id });
+    const block = recent.find((e) => e.outcome === "egress_blocked");
+    expect(block).toBeDefined();
+    expect(block?.reason).toBe("aws_access_key");
+    // No CallLogEntry field carries body content; assert by serializing
+    // the row and grep-ing for the secret.
+    expect(JSON.stringify(block)).not.toContain(secret);
+  });
+
+  it("does not consume a quota slot when the scanner blocks", async () => {
+    clearPolicy();
+    const { id, jwt } = await mintToken({ maxCalls: 3 });
+    const res = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ secret: "ghp_" + "a".repeat(36) }),
+    });
+    expect(res.status).toBe(403);
+    const tokenRow = store.listTokens().find((t) => t.id === id);
+    // Same posture as policy denials — block before quota consumed.
+    expect(tokenRow?.remaining).toBe(3);
+  });
+
+  it("allows a benign body to pass through to upstream", async () => {
+    clearPolicy();
+    const { jwt } = await mintToken();
+    const res = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: "what is the weather today" }],
+      }),
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("can be disabled via policy.scanner.enabled=false", async () => {
+    writePolicy({ scanner: { enabled: false } });
+    const { jwt } = await mintToken();
+    const res = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ messages: [{ content: "AKIAIOSFODNN7EXAMPLE" }] }),
+    });
+    // With scanner off, the leaked key flows through to (echo) upstream.
+    expect(res.status).toBe(200);
+  });
+
+  it("honors a narrowed `detectors` allow-list (only github_pat enabled)", async () => {
+    writePolicy({ scanner: { enabled: true, detectors: ["github_pat"] } });
+    const { jwt } = await mintToken();
+
+    // AWS key should NOT be caught (not in the allow-list).
+    const r1 = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ s: "AKIAIOSFODNN7EXAMPLE" }),
+    });
+    expect(r1.status).toBe(200);
+
+    // GitHub PAT IS caught.
+    const r2 = await fetch(`${brokerOrigin}/echo/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ s: "ghp_" + "b".repeat(36) }),
+    });
+    expect(r2.status).toBe(403);
+    const j = (await r2.json()) as { detector?: string };
+    expect(j.detector).toBe("github_pat");
+  });
+
+  it("scanner runs after provider_forbidden (no egress audit for misrouted requests)", async () => {
+    writePolicy({ allowed_providers: ["echo"] });
+    const { id, jwt } = await mintToken({ provider: "openai" });
+    const res = await fetch(`${brokerOrigin}/openai/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ leak: "AKIAIOSFODNN7EXAMPLE" }),
+    });
+    expect(res.status).toBe(403);
+    // Outcome should be "denied" with reason "provider_forbidden" — NOT
+    // egress_blocked. The provider gate fires first; the body is never
+    // scanned because the request is refused upstream of egress.
+    const recent = store.recentCalls({ limit: 5, tokenId: id });
+    const last = recent[0];
+    expect(last?.outcome).toBe("denied");
+    expect(last?.reason).toBe("provider_forbidden");
+  });
+});

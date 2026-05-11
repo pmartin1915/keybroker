@@ -51,16 +51,41 @@ export interface TagAllowlist {
 
 export type TagKey = "team" | "project" | "env";
 
+/**
+ * Phase 3.6 — inline scanner configuration.
+ *
+ * Default posture is **on with all built-in detectors**: if `policy.json`
+ * has no `scanner` key (or the file is absent), `enabled` is true and
+ * `detectors` is undefined (meaning "all built-ins"). Operators opt OUT
+ * with `"scanner": { "enabled": false }`. This matches the plan's
+ * strategic positioning — egress-blocked is a first-class outcome that
+ * should be on by default, not buried behind opt-in.
+ */
+export interface ScannerConfig {
+  /** Master switch. Defaults to true. */
+  readonly enabled: boolean;
+  /**
+   * Allow-list of detector names to run. `undefined` (the default) means
+   * "all built-ins". Unknown names are logged and ignored at request
+   * time so a typo can't take the whole scanner offline.
+   */
+  readonly detectors?: readonly string[];
+}
+
 export interface Policy {
   forbiddenModels: readonly string[];
   allowedProviders: readonly string[];
   tagAllowlist: TagAllowlist;
+  scanner: ScannerConfig;
 }
+
+const DEFAULT_SCANNER: ScannerConfig = { enabled: true };
 
 const EMPTY: Policy = {
   forbiddenModels: [],
   allowedProviders: [],
   tagAllowlist: {},
+  scanner: DEFAULT_SCANNER,
 };
 
 const CACHE_TTL_MS = 1000;
@@ -112,7 +137,29 @@ function normalize(raw: unknown): Policy {
     forbiddenModels: stringArray(obj.forbidden_models),
     allowedProviders: stringArray(obj.allowed_providers),
     tagAllowlist: tagAllowlistFromRaw(obj.tag_allowlist),
+    scanner: scannerConfigFromRaw(obj.scanner),
   };
+}
+
+function scannerConfigFromRaw(v: unknown): ScannerConfig {
+  // Missing or non-object: default-on with all built-ins. Fail-OPEN
+  // semantics here mean "scanner runs when policy is misconfigured" —
+  // the opposite of the policy file's overall fail-open behavior, but
+  // intentional: a malformed `scanner` key shouldn't disable the
+  // headline differentiator.
+  if (!v || typeof v !== "object" || Array.isArray(v)) return DEFAULT_SCANNER;
+  const obj = v as Record<string, unknown>;
+  const enabled = typeof obj.enabled === "boolean" ? obj.enabled : true;
+  const detectors = Array.isArray(obj.detectors)
+    ? stringArray(obj.detectors)
+    : undefined;
+  // Distinguish "key absent" from "empty array": both currently collapse
+  // to "all built-ins" at the resolver, but we preserve the array shape
+  // so a future "explicit empty = nothing" semantic could land without
+  // a normalize change.
+  return detectors === undefined
+    ? { enabled }
+    : { enabled, detectors };
 }
 
 function stringArray(v: unknown): readonly string[] {

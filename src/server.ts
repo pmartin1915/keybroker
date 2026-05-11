@@ -16,6 +16,7 @@ import {
   type Policy,
 } from "./policy.js";
 import { matchesAny } from "./glob-match.js";
+import { resolveDetectors, scanBytes } from "./scanner.js";
 import {
   estimateOutputCostUsd,
   actualCostUsd as actualCostUsdFor,
@@ -264,6 +265,36 @@ export async function buildServer(
         : typeof body === "string"
           ? Buffer.from(body)
           : Buffer.from(JSON.stringify(body));
+
+      // Phase 3.6: inline secret scanner. Runs after provider deny
+      // (provider_forbidden → no egress, so scanning would add noise)
+      // and before the model gate (so a leaked secret blocks even when
+      // the requested model is allowed). The bodyBuf we just built is
+      // the same bytes that would be forwarded upstream — re-serialized
+      // for object bodies, byte-identical for string bodies. Re-
+      // serialization preserves the secret values themselves, which is
+      // what the regexes target.
+      //
+      // SECURITY: `reason` carries the detector name only — NEVER the
+      // matched substring. The matched bytes are the literal secret we
+      // are blocking; logging them would defeat the scanner's purpose.
+      const scannerDetectors = resolveDetectors(
+        policy.scanner.enabled,
+        policy.scanner.detectors,
+      );
+      const scanHit = scanBytes(bodyBuf, scannerDetectors);
+      if (scanHit) {
+        return blockedEgress(reply, scanHit.detector, {
+          tokenId,
+          label: claims.lbl,
+          provider,
+          method: req.method,
+          path: upstreamPath,
+          started,
+          reqBytes: bodyBuf?.byteLength ?? 0,
+          ...auditAttribution,
+        }, store);
+      }
 
       // Combined model gate:
       //   - Policy `forbidden_models` (Phase 2.4): system-wide deny-list,
@@ -808,6 +839,55 @@ function denied(
   applyTagAttribution(entry, ctx.claims);
   store.appendCall(entry);
   return reply.status(status).send({ error: reason });
+}
+
+/**
+ * Phase 3.6: terminate the request because the inline scanner caught a
+ * secret in the body. Distinct from `denied()` so the audit row's
+ * `outcome` is `"egress_blocked"` (not `"denied"`), making FinOps and
+ * SRE queries trivially partitionable: "show me the leaks the broker
+ * caught this week" is `WHERE outcome = 'egress_blocked'`, regardless
+ * of which detector fired.
+ *
+ * The response body shape (`{error, detector}`) is what the dispatcher
+ * and dashboard surface to operators; the audit row's `reason` carries
+ * the same detector name. **Neither path ever carries the matched
+ * substring.**
+ */
+function blockedEgress(
+  reply: FastifyReply,
+  detector: string,
+  ctx: {
+    tokenId: string;
+    label: string;
+    provider: string;
+    method: string;
+    path: string;
+    started: number;
+    reqBytes: number;
+    machine?: string;
+    claims?: BrokerClaims;
+  },
+  store: StoreLike,
+) {
+  const entry: CallLogEntry = {
+    ts: new Date().toISOString(),
+    tokenId: ctx.tokenId,
+    label: ctx.label,
+    provider: ctx.provider,
+    method: ctx.method,
+    path: ctx.path,
+    status: 403,
+    durationMs: Date.now() - ctx.started,
+    reqBytes: ctx.reqBytes,
+    respBytes: 0,
+    outcome: "egress_blocked",
+    reason: detector,
+  };
+  if (ctx.machine !== undefined) entry.machine = ctx.machine;
+  applyTagAttribution(entry, ctx.claims);
+  store.appendCall(entry);
+  return reply.status(403).send({ error: "egress_blocked", detector });
 }
 
 /**

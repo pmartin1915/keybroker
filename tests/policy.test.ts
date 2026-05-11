@@ -124,6 +124,7 @@ function emptyPolicy(over: Partial<Policy> = {}): Policy {
     forbiddenModels: [],
     allowedProviders: [],
     tagAllowlist: {},
+    scanner: { enabled: true },
     ...over,
   };
 }
