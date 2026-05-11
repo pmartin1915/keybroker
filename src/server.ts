@@ -147,6 +147,53 @@ export async function buildServer(
     return store.latencyStatsByTokenSince(tokenId, sinceTs);
   });
 
+  // Phase 4.0 c2: token list for the control plane. Same trust posture
+  // as the /metrics/* routes (open on 127.0.0.1; intended for the
+  // operator's own UI / curl). Each record is augmented with
+  // `spendUsd` from `sumCostUsdByToken` so the dashboard can render a
+  // cap-vs-spend bar without a second round trip. `?machine=` filters
+  // server-side via the existing `listTokens` option; client-side
+  // filtering by tag / provider is the caller's responsibility (the
+  // expected fleet size is small enough that filtering in the
+  // browser is fine).
+  app.get<{
+    Querystring: { machine?: string };
+  }>("/tokens", async (req) => {
+    const opts: { machine?: string } = {};
+    if (req.query.machine !== undefined) opts.machine = req.query.machine;
+    const tokens = store.listTokens(opts);
+    return tokens.map((t) => ({ ...t, spendUsd: store.sumCostUsdByToken(t.id) }));
+  });
+
+  // Phase 4.0 c2: recent audit rows for the control plane. Mirrors the
+  // CLI's `keybroker audit` command surface (limit + optional token /
+  // machine filters). The store orders by recency descending; the
+  // route caps `limit` at 1000 the same way `/metrics/spend` does
+  // (the dashboard renders progressively; a misbehaving caller can't
+  // exhaust the broker by passing `limit=1_000_000`).
+  app.get<{
+    Querystring: { limit?: string; token?: string; machine?: string };
+  }>("/audit", async (req, reply) => {
+    let limit = 100;
+    const limitRaw = req.query.limit;
+    if (limitRaw !== undefined) {
+      const n = Number(limitRaw);
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0 || n > 1000) {
+        return reply.status(400).send({
+          error: "invalid_limit",
+          hint: "limit must be an integer in 1..1000",
+        });
+      }
+      limit = n;
+    }
+    const opts: { limit: number; tokenId?: string; machine?: string } = {
+      limit,
+    };
+    if (req.query.token !== undefined) opts.tokenId = req.query.token;
+    if (req.query.machine !== undefined) opts.machine = req.query.machine;
+    return store.recentCalls(opts);
+  });
+
   // Phase 3.5: linear-regression burn forecast. Two routes — per-token
   // (with cap projection) and per-tag (slope-only leaderboard). Same
   // trust posture as /health and /metrics/spend: open on 127.0.0.1.

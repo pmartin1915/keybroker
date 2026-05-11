@@ -1,18 +1,22 @@
 import { useState } from "react";
 import { Dashboard } from "./components/Dashboard.js";
+import { TokensScreen } from "./components/TokensScreen.js";
+import { AuditScreen } from "./components/AuditScreen.js";
 
-type Screen = "dashboard";
+type Screen = "dashboard" | "tokens" | "audit";
 
 interface NavItem {
   id: Screen;
   label: string;
 }
 
-const NAV: NavItem[] = [{ id: "dashboard", label: "Dashboard" }];
+const NAV: NavItem[] = [
+  { id: "dashboard", label: "Dashboard" },
+  { id: "tokens", label: "Tokens" },
+  { id: "audit", label: "Audit" },
+];
 
 const FUTURE_NAV: { label: string; phase: string }[] = [
-  { label: "Tokens", phase: "4.0 c2" },
-  { label: "Audit", phase: "4.0 c2" },
   { label: "Forecast", phase: "4.0 c3" },
   { label: "Policy", phase: "4.0 c3" },
   { label: "Shadow AI", phase: "4.0 c3" },
@@ -137,12 +141,14 @@ export default function App() {
             color: "var(--text-muted)",
           }}
         >
-          Phase 4.0 · foundation
+          Phase 4.0 · c2 read-only
         </div>
       </aside>
 
       <main style={{ flex: 1, overflow: "auto", background: "var(--bg-ink)" }}>
         {screen === "dashboard" && <Dashboard />}
+        {screen === "tokens" && <TokensScreen />}
+        {screen === "audit" && <AuditScreen />}
       </main>
     </div>
   );
