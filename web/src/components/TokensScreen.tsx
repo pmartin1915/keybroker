@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchTokens, type TokenRow } from "../api/client.js";
+import {
+  fetchTokens,
+  revokeProxyToken,
+  MgmtAuthError,
+  type TokenRow,
+} from "../api/client.js";
+import { MgmtTokenModal } from "./MgmtTokenModal.js";
+import { IssueTokenModal } from "./IssueTokenModal.js";
 
 const REFRESH_MS = 15_000;
 
@@ -21,6 +28,15 @@ const fmtExpiry = (epoch: number): string => {
 
 type Filter = "all" | "active" | "revoked";
 
+// Phase 4.0 c4: which write action initiated the auth prompt. Tracks
+// so an auth retry can resume the original intent (open the issue
+// modal once the token's saved, or revoke the previously-selected
+// row). `null` = no auth flow in progress.
+type PendingAction =
+  | { kind: "issue" }
+  | { kind: "revoke"; tokenId: string }
+  | null;
+
 export function TokensScreen() {
   const [rows, setRows] = useState<TokenRow[]>([]);
   const [loading, setLoading] = useState(true);
@@ -28,6 +44,11 @@ export function TokensScreen() {
   const [filter, setFilter] = useState<Filter>("active");
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
+  const [refreshTick, setRefreshTick] = useState(0);
+  const [issueOpen, setIssueOpen] = useState(false);
+  const [authPrompt, setAuthPrompt] = useState<{ reason: string } | null>(null);
+  const [pending, setPending] = useState<PendingAction>(null);
+  const [revokeError, setRevokeError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -50,7 +71,44 @@ export function TokensScreen() {
       cancelled = true;
       clearInterval(t);
     };
-  }, []);
+  }, [refreshTick]);
+
+  const forceRefresh = () => setRefreshTick((n) => n + 1);
+
+  const openIssue = () => {
+    setPending({ kind: "issue" });
+    setIssueOpen(true);
+  };
+
+  const handleRevoke = async (tokenId: string) => {
+    setRevokeError(null);
+    try {
+      await revokeProxyToken(tokenId);
+      forceRefresh();
+    } catch (e) {
+      if (e instanceof MgmtAuthError) {
+        setPending({ kind: "revoke", tokenId });
+        setAuthPrompt({ reason: e.message });
+        return;
+      }
+      setRevokeError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const onAuthConfirmed = () => {
+    setAuthPrompt(null);
+    if (pending?.kind === "issue") {
+      setIssueOpen(true);
+    } else if (pending?.kind === "revoke") {
+      void handleRevoke(pending.tokenId);
+    }
+  };
+
+  const onIssueAuthNeeded = (reason: string) => {
+    setIssueOpen(false);
+    setPending({ kind: "issue" });
+    setAuthPrompt({ reason });
+  };
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -112,8 +170,40 @@ export function TokensScreen() {
             }}
           />
           <FilterPills filter={filter} setFilter={setFilter} />
+          <button
+            onClick={openIssue}
+            style={{
+              background: "var(--accent)",
+              color: "var(--bg-ink)",
+              border: "none",
+              padding: "8px 14px",
+              borderRadius: "var(--radius-sm)",
+              fontSize: 13,
+              fontWeight: 700,
+              cursor: "pointer",
+              fontFamily: "inherit",
+            }}
+          >
+            + Issue token
+          </button>
         </div>
       </header>
+
+      {revokeError ? (
+        <div
+          style={{
+            background: "var(--bg-surface)",
+            border: "1px solid var(--danger)",
+            borderRadius: "var(--radius)",
+            padding: 12,
+            color: "var(--danger)",
+            fontSize: 12,
+            fontFamily: "var(--font-mono)",
+          }}
+        >
+          revoke failed: {revokeError}
+        </div>
+      ) : null}
 
       {error ? (
         <div
@@ -170,7 +260,35 @@ export function TokensScreen() {
       </div>
 
       {selectedRow ? (
-        <TokenDetail row={selectedRow} onClose={() => setSelected(null)} />
+        <TokenDetail
+          row={selectedRow}
+          onClose={() => setSelected(null)}
+          onRevoke={() => void handleRevoke(selectedRow.id)}
+        />
+      ) : null}
+
+      {issueOpen ? (
+        <IssueTokenModal
+          onClose={() => {
+            setIssueOpen(false);
+            setPending(null);
+          }}
+          onIssued={() => {
+            forceRefresh();
+          }}
+          onNeedsAuth={onIssueAuthNeeded}
+        />
+      ) : null}
+
+      {authPrompt ? (
+        <MgmtTokenModal
+          initialReason={authPrompt.reason}
+          onConfirmed={onAuthConfirmed}
+          onCancel={() => {
+            setAuthPrompt(null);
+            setPending(null);
+          }}
+        />
       ) : null}
     </div>
   );
@@ -321,7 +439,16 @@ function TokenRowView({ row, onClick }: { row: TokenRow; onClick: () => void }) 
   );
 }
 
-function TokenDetail({ row, onClose }: { row: TokenRow; onClose: () => void }) {
+function TokenDetail({
+  row,
+  onClose,
+  onRevoke,
+}: {
+  row: TokenRow;
+  onClose: () => void;
+  onRevoke: () => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
   return (
     <div
       style={{
@@ -382,6 +509,85 @@ function TokenDetail({ row, onClose }: { row: TokenRow; onClose: () => void }) {
       <DetailRow label="Remaining" value={row.remaining === -1 ? "unlimited" : String(row.remaining)} mono />
       <DetailRow label="Expires" value={fmtExpiry(row.expiresAt)} mono />
       <DetailRow label="Created" value={new Date(row.createdAt).toLocaleString()} mono />
+
+      {/* Phase 4.0 c4: revoke affordance. Two-step confirm — first
+          click swaps to a danger-tinted "Confirm revoke" button. */}
+      {!row.revoked ? (
+        <div
+          style={{
+            marginTop: "auto",
+            paddingTop: 16,
+            borderTop: "1px solid var(--border-subtle)",
+            display: "flex",
+            flexDirection: "column",
+            gap: 8,
+          }}
+        >
+          {confirming ? (
+            <>
+              <span style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                Revoke {row.label}? This is immediate and cannot be undone.
+              </span>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={() => setConfirming(false)}
+                  style={{
+                    background: "transparent",
+                    color: "var(--text-secondary)",
+                    border: "1px solid var(--border-subtle)",
+                    padding: "8px 14px",
+                    borderRadius: "var(--radius-sm)",
+                    fontSize: 12,
+                    fontWeight: 600,
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                    flex: 1,
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    setConfirming(false);
+                    onRevoke();
+                  }}
+                  style={{
+                    background: "var(--danger)",
+                    color: "var(--bg-ink)",
+                    border: "none",
+                    padding: "8px 14px",
+                    borderRadius: "var(--radius-sm)",
+                    fontSize: 12,
+                    fontWeight: 700,
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                    flex: 1,
+                  }}
+                >
+                  Confirm revoke
+                </button>
+              </div>
+            </>
+          ) : (
+            <button
+              onClick={() => setConfirming(true)}
+              style={{
+                background: "transparent",
+                color: "var(--danger)",
+                border: "1px solid var(--danger)",
+                padding: "8px 14px",
+                borderRadius: "var(--radius-sm)",
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: "pointer",
+                fontFamily: "inherit",
+              }}
+            >
+              Revoke token
+            </button>
+          )}
+        </div>
+      ) : null}
     </div>
   );
 }

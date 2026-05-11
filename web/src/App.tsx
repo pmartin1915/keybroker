@@ -27,8 +27,11 @@ const NAV: NavItem[] = [
   { id: "shadow", label: "Shadow AI" },
 ];
 
+// Phase 4.0 c4: Issue + Revoke are now wired into the Tokens screen.
+// Rotate-all UX is still pending (admin route exists; UI defers to a
+// later commit — the prototype's blast-radius preview needs care).
 const FUTURE_NAV: { label: string; phase: string }[] = [
-  { label: "Issue / rotate", phase: "4.0 c4" },
+  { label: "Rotate-all UX", phase: "4.0 c4+" },
 ];
 
 export default function App() {
@@ -150,7 +153,7 @@ export default function App() {
             color: "var(--text-muted)",
           }}
         >
-          Phase 4.0 · c3 read-only complete
+          Phase 4.0 · c4 issue + revoke live
         </div>
       </aside>
 

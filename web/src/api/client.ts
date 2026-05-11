@@ -175,3 +175,236 @@ export function fetchTagForecast(
 export function fetchPolicy(): Promise<PolicySnapshot> {
   return getJson<PolicySnapshot>("/policy");
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 4.0 c4: management surface. Admin routes mutate state, so they
+// sit behind a separate signing secret (`config.mgmtSecret`) and the
+// client is expected to present a `brkm_` JWT minted via
+// `keybroker token mgmt --issue`.
+//
+// The token lives in sessionStorage so a refresh keeps it but closing
+// the tab drops it — short blast radius if a session is left open on
+// a shared machine. We never persist it to localStorage and never log
+// it. The actual JWT bytes leave the page only via the Authorization
+// header on outbound /admin/* requests.
+// ─────────────────────────────────────────────────────────────────────
+
+const MGMT_TOKEN_STORAGE_KEY = "keybroker.mgmtToken";
+
+export function getMgmtToken(): string | undefined {
+  try {
+    const raw = sessionStorage.getItem(MGMT_TOKEN_STORAGE_KEY);
+    if (!raw) return undefined;
+    // Defence-in-depth: only return tokens with the expected prefix so a
+    // stale localStorage value (or a manually-set garbage one) doesn't
+    // surface as an Authorization header.
+    return raw.startsWith("brkm_") ? raw : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function setMgmtToken(token: string): void {
+  try {
+    sessionStorage.setItem(MGMT_TOKEN_STORAGE_KEY, token);
+  } catch {
+    // sessionStorage might be disabled (private mode, certain embeds).
+    // Silently drop — the screen will prompt for the token next time.
+  }
+}
+
+export function clearMgmtToken(): void {
+  try {
+    sessionStorage.removeItem(MGMT_TOKEN_STORAGE_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Phase 4.0 c4: structured error thrown when an admin call needs a
+ * management token (either none is presented or the broker rejected
+ * the one we sent). Screens catch this specifically and surface the
+ * "set management token" prompt; everything else gets generic error
+ * rendering.
+ */
+export class MgmtAuthError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "MgmtAuthError";
+    this.status = status;
+  }
+}
+
+async function adminFetch<T>(
+  method: "POST" | "DELETE",
+  url: string,
+  body?: unknown,
+): Promise<T> {
+  const tok = getMgmtToken();
+  if (!tok) {
+    throw new MgmtAuthError("no management token set", 401);
+  }
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${tok}`,
+    accept: "application/json",
+  };
+  if (body !== undefined) headers["content-type"] = "application/json";
+  const res = await fetch(url, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  if (res.status === 401) {
+    // The cached token is bad; force a re-prompt on the next attempt.
+    clearMgmtToken();
+    const detail = (await res.json().catch(() => ({}))) as {
+      error?: string;
+      reason?: string;
+    };
+    throw new MgmtAuthError(
+      detail.error ?? "invalid_management_token",
+      res.status,
+    );
+  }
+  if (!res.ok) {
+    const detail = (await res.json().catch(() => ({}))) as {
+      error?: string;
+      hint?: string;
+    };
+    const tag = detail.error ?? `${res.status} ${res.statusText}`;
+    const hint = detail.hint ? ` — ${detail.hint}` : "";
+    throw new Error(`${method} ${url} failed: ${tag}${hint}`);
+  }
+  return (await res.json()) as T;
+}
+
+export interface IssueTokenBody {
+  provider: string;
+  scopes?: string[];
+  label?: string;
+  ttlSeconds?: number;
+  maxCalls?: number;
+  models?: string[];
+  machine?: string;
+  capUsd?: number;
+  tags?: { team?: string; project?: string; env?: string };
+}
+
+export interface IssueTokenResponse {
+  tokenId: string;
+  jwt: string;
+  record: TokenRow;
+}
+
+export function issueProxyToken(body: IssueTokenBody): Promise<IssueTokenResponse> {
+  return adminFetch<IssueTokenResponse>("POST", "/admin/tokens", body);
+}
+
+export interface RevokeTokenResponse {
+  revoked: true;
+  id: string;
+  alreadyRevoked?: boolean;
+}
+
+export function revokeProxyToken(id: string): Promise<RevokeTokenResponse> {
+  return adminFetch<RevokeTokenResponse>("DELETE", `/admin/tokens/${encodeURIComponent(id)}`);
+}
+
+export interface RotateFilters {
+  team?: string;
+  project?: string;
+  env?: string;
+  machine?: string;
+  provider?: string;
+}
+
+export interface RotatePreview {
+  filters: RotateFilters;
+  preview: {
+    total: number;
+    byMachine: Record<string, number>;
+    byTeam: Record<string, number>;
+    byProject: Record<string, number>;
+    byEnv: Record<string, number>;
+  };
+}
+
+export interface RotateDryRun {
+  filters: RotateFilters;
+  plan: Array<{
+    oldId: string;
+    newId: string;
+    label: string;
+    noModelsClaim: boolean;
+  }>;
+  expired: Array<{ id: string; label: string }>;
+}
+
+export interface RotateResult {
+  filters: RotateFilters;
+  revoked: number;
+  reissued: Array<{
+    oldId: string;
+    newId: string;
+    label: string;
+    jwt: string;
+    noModelsClaim: boolean;
+  }>;
+  expired: Array<{ id: string; label: string }>;
+}
+
+export function rotatePreview(filters: RotateFilters): Promise<RotatePreview> {
+  return adminFetch<RotatePreview>("POST", "/admin/tokens/rotate", {
+    filters,
+    preview: true,
+  });
+}
+
+export function rotateDryRun(filters: RotateFilters): Promise<RotateDryRun> {
+  return adminFetch<RotateDryRun>("POST", "/admin/tokens/rotate", {
+    filters,
+    dryRun: true,
+  });
+}
+
+export function rotateExecute(filters: RotateFilters): Promise<RotateResult> {
+  return adminFetch<RotateResult>("POST", "/admin/tokens/rotate", { filters });
+}
+
+/**
+ * Phase 4.0 c4: validate a management token by hitting an admin route
+ * with a guaranteed-no-op body. We use POST /admin/tokens/rotate with
+ * an empty filters object, which the broker rejects with 400
+ * `no_filters` when auth passes — confirming the token is valid
+ * without mutating anything. A 401 means the token is bad.
+ */
+export async function probeMgmtToken(token: string): Promise<
+  { ok: true } | { ok: false; reason: string }
+> {
+  try {
+    const res = await fetch("/admin/tokens/rotate", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify({ filters: {} }),
+    });
+    if (res.status === 401) {
+      const body = (await res.json().catch(() => ({}))) as { error?: string };
+      return { ok: false, reason: body.error ?? "invalid_management_token" };
+    }
+    if (res.status === 400) {
+      // Expected: `no_filters` — confirms auth passed.
+      return { ok: true };
+    }
+    // Any other status means something unexpected happened; treat as
+    // not-ok so we don't lock in a token under suspicious server state.
+    return { ok: false, reason: `unexpected_${res.status}` };
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.message : String(e) };
+  }
+}
