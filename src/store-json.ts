@@ -5,10 +5,12 @@ import {
   renameSync,
   appendFileSync,
 } from "node:fs";
+import { computeLatencyStats } from "./latency-stats.js";
 import type { CallLogEntry } from "./logging.js";
 import type {
   ConsumeResult,
   DailySpendRow,
+  LatencyStats,
   ListTokensOptions,
   RecentCallsOptions,
   SecretRecord,
@@ -362,6 +364,34 @@ export class JsonStore implements StoreLike {
       }
     }
     return out;
+  }
+
+  latencyStatsByTokenSince(tokenId: string, ts: string): LatencyStats {
+    if (!existsSync(this.logsPath)) return { sampleCount: 0 };
+    const lines = readFileSync(this.logsPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean);
+    const ttfts: number[] = [];
+    const tpots: number[] = [];
+    for (const l of lines) {
+      try {
+        const e = JSON.parse(l) as CallLogEntry;
+        if (e.tokenId !== tokenId) continue;
+        if (e.ts < ts) continue;
+        if (e.outcome !== "ok" && e.outcome !== "error") continue;
+        // Mirror SQLite's `ttft_ms IS NOT NULL` filter — rows without
+        // a TTFT sample (denied / pre-flight error) don't contribute.
+        if (typeof e.ttftMs !== "number" || !Number.isFinite(e.ttftMs)) continue;
+        ttfts.push(e.ttftMs);
+        if (typeof e.tpotMsAvg === "number" && Number.isFinite(e.tpotMsAvg)) {
+          tpots.push(e.tpotMsAvg);
+        }
+      } catch {
+        // skip malformed lines
+      }
+    }
+    return computeLatencyStats(ttfts, tpots);
   }
 
   recentCalls(opts: RecentCallsOptions): CallLogEntry[] {

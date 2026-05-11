@@ -109,6 +109,40 @@ export async function buildServer(
     return store.topTagsBySpend(bucket as TagBucket, sinceTs, limit);
   });
 
+  // Phase 3.7: latency dashboard endpoint. Per-token p50/p95 of TTFT
+  // and TPOT-mean over a `since` window. Same trust posture as the
+  // other dashboard routes (open on 127.0.0.1; the operator's UI
+  // curls it). Required params: `token` and `since`. `token` is
+  // validated only for shape (`brk_…` or token-id form) so a typo'd
+  // ID returns `sampleCount: 0` rather than a 4xx — the dashboard's
+  // "no data" panel is the better UX than a route-level error.
+  app.get<{
+    Querystring: { token?: string; since?: string };
+  }>("/metrics/latency", async (req, reply) => {
+    const tokenId = req.query.token;
+    if (!tokenId) {
+      return reply.status(400).send({
+        error: "missing_token",
+        hint: "pass token=<id> (the jti of an issued token)",
+      });
+    }
+    const sinceRaw = req.query.since;
+    if (!sinceRaw) {
+      return reply.status(400).send({
+        error: "missing_since",
+        hint: "pass since=<n>(s|m|h|d), e.g. since=24h",
+      });
+    }
+    const sinceTs = parseSinceShorthand(sinceRaw);
+    if (sinceTs === undefined) {
+      return reply.status(400).send({
+        error: "invalid_since",
+        hint: "pass since=<n>(s|m|h|d), e.g. since=24h or since=7d",
+      });
+    }
+    return store.latencyStatsByTokenSince(tokenId, sinceTs);
+  });
+
   // Phase 3.5: linear-regression burn forecast. Two routes — per-token
   // (with cap projection) and per-tag (slope-only leaderboard). Same
   // trust posture as /health and /metrics/spend: open on 127.0.0.1.
@@ -662,8 +696,24 @@ export async function buildServer(
         const RESP_TAIL_CAP = 256 * 1024;
         const respTail: Buffer[] = [];
         let respTailBytes = 0;
+        // Phase 3.7: TTFT/TPOT capture. `firstByteAt` is the wall clock
+        // at the first chunk emerging from the upstream body stream —
+        // not the moment undici resolved the request promise. undici's
+        // promise resolves once headers arrive, which for OpenAI/
+        // Anthropic typically precedes the first body byte (prefill).
+        // Measuring at the Transform sees the actual content latency
+        // that the dispatcher / dashboard cares about. `finishedAt`
+        // closes the stream; `tpot_ms_avg` falls out of the two plus
+        // the upstream-reported `output_tokens`. Both stay undefined
+        // when the stream emits zero chunks (no body — odd but
+        // possible on HEAD or upstream errors); the audit row then
+        // records `respBytes === 0` and no latency columns, matching
+        // the IS NOT NULL filter on the stats query.
+        let firstByteAt: number | undefined;
+        let finishedAt: number | undefined;
         const counter = new Transform({
           transform(chunk: Buffer, _enc, cb) {
+            if (firstByteAt === undefined) firstByteAt = Date.now();
             respBytes += chunk.byteLength;
             respTail.push(chunk);
             respTailBytes += chunk.byteLength;
@@ -672,6 +722,13 @@ export async function buildServer(
               respTailBytes -= dropped?.byteLength ?? 0;
             }
             cb(null, chunk);
+          },
+          flush(cb) {
+            // `finished()` fires after this; capture the high-water
+            // here to ensure tpot has both endpoints even if a stream-
+            // error races the finalize promise.
+            finishedAt = Date.now();
+            cb();
           },
         });
 
@@ -696,28 +753,48 @@ export async function buildServer(
           if (machine !== undefined) entry.machine = machine;
           applyTagAttribution(entry, claims);
           if (estimatedCostUsd !== undefined) entry.estimatedCostUsd = estimatedCostUsd;
-          // Try to reconcile actual cost from upstream usage. Only
-          // priced models (i.e. those for which we already produced an
-          // estimate, or any model the pricing table knows about) get an
-          // actual; an unpriced model returning usage still can't be
-          // converted to dollars. We re-check via actualCostUsdFor so we
-          // catch the audit-only case where a non-capped token used a
-          // priced model.
-          if (requestedModelForCost !== undefined && respTail.length > 0) {
+          // Phase 3.7: latency split. TTFT is what we measured at the
+          // Transform; TPOT-mean needs `output_tokens` from upstream
+          // usage, so we attempt the parse here regardless of whether
+          // `requestedModelForCost` is set (a non-LLM provider with no
+          // model can still return usage; conversely a priced model
+          // without usage produces no TPOT). The usage parse is best-
+          // effort: a malformed tail leaves all three latency columns
+          // intact except `tpotMsAvg`/`outputTokens`.
+          let usage: { inputTokens: number; outputTokens: number } | undefined;
+          if (respTail.length > 0) {
             try {
-              const usage = parseUsageFromUpstream(Buffer.concat(respTail, respTailBytes));
-              if (usage) {
-                const actual = actualCostUsdFor({
-                  model: requestedModelForCost,
-                  inputTokens: usage.inputTokens,
-                  outputTokens: usage.outputTokens,
-                });
-                if (actual !== undefined) entry.actualCostUsd = actual;
-              }
+              usage = parseUsageFromUpstream(
+                Buffer.concat(respTail, respTailBytes),
+              );
             } catch {
-              // Best-effort: a parse failure leaves actualCostUsd unset
-              // and the cap accounting falls back to the pre-flight
-              // estimate, which already counted toward the cap.
+              // Best-effort parse — leave usage undefined.
+            }
+          }
+          if (usage) {
+            if (usage.outputTokens > 0) entry.outputTokens = usage.outputTokens;
+            if (requestedModelForCost !== undefined) {
+              const actual = actualCostUsdFor({
+                model: requestedModelForCost,
+                inputTokens: usage.inputTokens,
+                outputTokens: usage.outputTokens,
+              });
+              if (actual !== undefined) entry.actualCostUsd = actual;
+            }
+          }
+          if (firstByteAt !== undefined) {
+            // TTFT can be 0 on extremely fast localhost upstreams; clamp
+            // to >=0 to absorb any clock-step weirdness without
+            // producing a negative audit column.
+            entry.ttftMs = Math.max(0, firstByteAt - started);
+            if (
+              finishedAt !== undefined &&
+              entry.outputTokens !== undefined &&
+              entry.outputTokens > 0 &&
+              finishedAt >= firstByteAt
+            ) {
+              entry.tpotMsAvg =
+                (finishedAt - firstByteAt) / entry.outputTokens;
             }
           }
           store.appendCall(entry);

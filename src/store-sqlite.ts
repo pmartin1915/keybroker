@@ -1,8 +1,10 @@
 import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { computeLatencyStats } from "./latency-stats.js";
 import type { CallLogEntry } from "./logging.js";
 import type {
   ConsumeResult,
   DailySpendRow,
+  LatencyStats,
   ListTokensOptions,
   RecentCallsOptions,
   SecretRecord,
@@ -63,6 +65,9 @@ interface CallRow {
   tag_team: string | null;
   tag_project: string | null;
   tag_env: string | null;
+  ttft_ms: number | null;
+  tpot_ms_avg: number | null;
+  output_tokens: number | null;
 }
 
 const SCHEMA = `
@@ -151,6 +156,7 @@ export class SqliteStore implements StoreLike {
     dailySpendByTagTeamSince: StatementSync;
     dailySpendByTagProjectSince: StatementSync;
     dailySpendByTagEnvSince: StatementSync;
+    latencyStatsByTokenSince: StatementSync;
   };
 
   constructor(path: string) {
@@ -235,13 +241,14 @@ export class SqliteStore implements StoreLike {
       revoke: this.db.prepare(`UPDATE tokens SET revoked = 1 WHERE id = ?`),
       insertCall: this.db.prepare(
         `INSERT INTO calls
-           (ts, token_id, label, provider, method, path, status, duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine, estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (ts, token_id, label, provider, method, path, status, duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine, estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env, ttft_ms, tpot_ms_avg, output_tokens)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       selectCalls: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
                 duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
-                estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env
+                estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env,
+                ttft_ms, tpot_ms_avg, output_tokens
          FROM calls
          ORDER BY id DESC
          LIMIT ?`,
@@ -249,7 +256,8 @@ export class SqliteStore implements StoreLike {
       selectCallsByToken: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
                 duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
-                estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env
+                estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env,
+                ttft_ms, tpot_ms_avg, output_tokens
          FROM calls
          WHERE token_id = ?
          ORDER BY id DESC
@@ -258,7 +266,8 @@ export class SqliteStore implements StoreLike {
       selectCallsByMachine: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
                 duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
-                estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env
+                estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env,
+                ttft_ms, tpot_ms_avg, output_tokens
          FROM calls
          WHERE machine = ?
          ORDER BY id DESC
@@ -267,7 +276,8 @@ export class SqliteStore implements StoreLike {
       selectCallsByTokenAndMachine: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
                 duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
-                estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env
+                estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env,
+                ttft_ms, tpot_ms_avg, output_tokens
          FROM calls
          WHERE token_id = ? AND machine = ?
          ORDER BY id DESC
@@ -428,6 +438,21 @@ export class SqliteStore implements StoreLike {
          GROUP BY day, tag_env
          ORDER BY day ASC, key ASC`,
       ),
+      // Phase 3.7: pull the per-call latency columns for a single token
+      // since `ts`. We project the raw values rather than aggregating in
+      // SQL — node:sqlite has no native percentile_cont(), and rolling
+      // our own median/p95 in JS keeps the SQLite/JSON backends
+      // bit-identical. The IS NOT NULL filters drop denied /
+      // egress_blocked / pre-flight-error rows (which never reached
+      // upstream and have no measurable TTFT), so the resulting sample
+      // is "calls that actually streamed bytes". Same outcome filter as
+      // the spend queries — denied calls don't contribute.
+      latencyStatsByTokenSince: this.db.prepare(
+        `SELECT ttft_ms, tpot_ms_avg, output_tokens
+         FROM calls
+         WHERE token_id = ? AND ts >= ? AND outcome IN ('ok', 'error')
+           AND ttft_ms IS NOT NULL`,
+      ),
     };
   }
 
@@ -534,6 +559,9 @@ export class SqliteStore implements StoreLike {
       entry.tagTeam ?? null,
       entry.tagProject ?? null,
       entry.tagEnv ?? null,
+      entry.ttftMs ?? null,
+      entry.tpotMsAvg ?? null,
+      entry.outputTokens ?? null,
     );
   }
 
@@ -605,6 +633,27 @@ export class SqliteStore implements StoreLike {
     return rows.map((r) => ({ day: r.day, usd: r.usd ?? 0 }));
   }
 
+  latencyStatsByTokenSince(tokenId: string, ts: string): LatencyStats {
+    const rows = this.stmts.latencyStatsByTokenSince.all(tokenId, ts) as Array<{
+      ttft_ms: number | null;
+      tpot_ms_avg: number | null;
+      output_tokens: number | null;
+    }>;
+    // node:sqlite has no percentile aggregate, and rolling p50/p95
+    // server-side via window functions would still need a JS path for
+    // the JSON store. Computing here keeps the two backends bit-
+    // identical. Sample sizes here are bounded by the audit-retention
+    // window the operator chose (no built-in retention yet; user
+    // typically queries last 24h to last 14d).
+    const ttfts: number[] = [];
+    const tpots: number[] = [];
+    for (const r of rows) {
+      if (r.ttft_ms !== null) ttfts.push(r.ttft_ms);
+      if (r.tpot_ms_avg !== null) tpots.push(r.tpot_ms_avg);
+    }
+    return computeLatencyStats(ttfts, tpots);
+  }
+
   dailySpendByTagSince(bucket: TagBucket, ts: string): TagDailySpendRow[] {
     const stmt = this.tagDailyStmt(bucket);
     const rows = stmt.all(ts) as Array<{
@@ -670,6 +719,14 @@ export class SqliteStore implements StoreLike {
     addColumnIfMissing(db, "calls", "tag_team", "TEXT");
     addColumnIfMissing(db, "calls", "tag_project", "TEXT");
     addColumnIfMissing(db, "calls", "tag_env", "TEXT");
+    // Phase 3.7: latency split. REAL because tpot_ms_avg is fractional
+    // (mean of integer chunk-deltas / output_tokens); ttft_ms could
+    // technically be INTEGER but REAL keeps the trio uniform and
+    // future-proofs against sub-millisecond timestamps (hrtime).
+    // output_tokens is INTEGER — it's a count.
+    addColumnIfMissing(db, "calls", "ttft_ms", "REAL");
+    addColumnIfMissing(db, "calls", "tpot_ms_avg", "REAL");
+    addColumnIfMissing(db, "calls", "output_tokens", "INTEGER");
     // Indexes for the Phase 2.3 filters. Created post-ALTER so the
     // referenced columns are guaranteed to exist on pre-2.3 DBs that
     // have just been migrated.
@@ -771,6 +828,9 @@ function rowToCall(row: CallRow): CallLogEntry {
   if (row.tag_team !== null) entry.tagTeam = row.tag_team;
   if (row.tag_project !== null) entry.tagProject = row.tag_project;
   if (row.tag_env !== null) entry.tagEnv = row.tag_env;
+  if (row.ttft_ms !== null) entry.ttftMs = row.ttft_ms;
+  if (row.tpot_ms_avg !== null) entry.tpotMsAvg = row.tpot_ms_avg;
+  if (row.output_tokens !== null) entry.outputTokens = row.output_tokens;
   return entry;
 }
 

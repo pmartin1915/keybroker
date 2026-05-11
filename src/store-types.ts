@@ -118,6 +118,32 @@ export interface TagDailySpendRow {
 }
 
 /**
+ * Phase 3.7: p50/p95 latency snapshot for a token over a time window.
+ * The two metrics partition the response timeline cleanly:
+ *   - TTFT (time-to-first-byte): prefill latency — how long the model
+ *     took to start emitting tokens. Dominated by queueing + KV-cache
+ *     work on the upstream side; insensitive to output length.
+ *   - TPOT (time-per-output-token, mean): decode latency per token —
+ *     `(finish - firstByte) / outputTokens`. Sensitive to model size
+ *     and concurrent load; the canonical "is the upstream slow?"
+ *     signal. Stored as a *mean* per call (computed at audit time);
+ *     the percentile here is over per-call means, NOT per-chunk
+ *     inter-arrival times — that would require chunk-level retention
+ *     the broker doesn't keep.
+ * `sampleCount` is the number of calls that produced a usable TTFT
+ * sample in the window (denied / pre-flight-failed rows have no
+ * sample). The percentiles are undefined when sampleCount === 0 so
+ * the caller can render "no data" rather than a spurious 0.
+ */
+export interface LatencyStats {
+  sampleCount: number;
+  p50TtftMs?: number;
+  p95TtftMs?: number;
+  p50TpotMsAvg?: number;
+  p95TpotMsAvg?: number;
+}
+
+/**
  * Storage interface implemented by JsonStore (legacy) and SqliteStore (default).
  * `consumeToken` MUST be atomic across concurrent processes.
  */
@@ -200,6 +226,15 @@ export interface StoreLike {
    * `sumCostUsdByTagSince` (a phantom "" bucket would dominate).
    */
   dailySpendByTagSince(bucket: TagBucket, ts: string): TagDailySpendRow[];
+  /**
+   * Phase 3.7: p50/p95 of TTFT and TPOT-mean for a single token since
+   * `ts`. Filters mirror `sumCostUsdByToken`: only `ok` / `error`
+   * outcomes contribute, and rows without a TTFT sample (denied /
+   * egress_blocked / pre-flight error — `respBytes === 0`) are
+   * excluded. Returns `sampleCount: 0` (and percentiles undefined) when
+   * no samples in window.
+   */
+  latencyStatsByTokenSince(tokenId: string, ts: string): LatencyStats;
   /** Optional close hook (SQLite handle, etc.). */
   close?(): void;
 }

@@ -65,4 +65,31 @@ export interface CallLogEntry {
   tagTeam?: string;
   tagProject?: string;
   tagEnv?: string;
+  /**
+   * Phase 3.7: latency split. Three optional fields so the schema is
+   * back-compat with pre-3.7 rows (denied / error / pre-migration).
+   *
+   *   - `ttftMs`: time-to-first-byte, measured from request-send to
+   *     the first chunk emitted by the upstream body stream. For non-
+   *     streaming responses (single buffered chunk) this still
+   *     measures the prefill latency reported by undici. Absent when
+   *     the request never reached upstream (denied / egress_blocked /
+   *     pre-flight error) — i.e. the same rows where `respBytes === 0`.
+   *   - `tpotMsAvg`: mean inter-token latency over the streaming
+   *     portion, computed as `(finishTime - firstByteTime) /
+   *     outputTokens`. Absent when `outputTokens` is undefined or
+   *     zero (single-byte responses divide-by-zero into Infinity;
+   *     skipping is cleaner than emitting a sentinel).
+   *   - `outputTokens`: completion-tokens / output_tokens reported by
+   *     the upstream usage event. Same provenance as `actualCostUsd`
+   *     — populated only when `parseUsageFromUpstream` returns a hit.
+   *
+   * The trio is the input for the prototype's stacked-bar waterfall
+   * (prefill / decode / total). FinOps p50/p95 dashboards run over
+   * `ttftMs` and `tpotMsAvg` columns directly (Phase 3.7's
+   * /metrics/latency endpoint).
+   */
+  ttftMs?: number;
+  tpotMsAvg?: number;
+  outputTokens?: number;
 }
