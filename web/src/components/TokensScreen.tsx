@@ -7,6 +7,7 @@ import {
 } from "../api/client.js";
 import { MgmtTokenModal } from "./MgmtTokenModal.js";
 import { IssueTokenModal } from "./IssueTokenModal.js";
+import { RotateTokensModal } from "./RotateTokensModal.js";
 
 const REFRESH_MS = 15_000;
 
@@ -35,6 +36,7 @@ type Filter = "all" | "active" | "revoked";
 type PendingAction =
   | { kind: "issue" }
   | { kind: "revoke"; tokenId: string }
+  | { kind: "rotate" }
   | null;
 
 export function TokensScreen() {
@@ -46,6 +48,7 @@ export function TokensScreen() {
   const [selected, setSelected] = useState<string | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
   const [issueOpen, setIssueOpen] = useState(false);
+  const [rotateOpen, setRotateOpen] = useState(false);
   const [authPrompt, setAuthPrompt] = useState<{ reason: string } | null>(null);
   const [pending, setPending] = useState<PendingAction>(null);
   const [revokeError, setRevokeError] = useState<string | null>(null);
@@ -80,6 +83,11 @@ export function TokensScreen() {
     setIssueOpen(true);
   };
 
+  const openRotate = () => {
+    setPending({ kind: "rotate" });
+    setRotateOpen(true);
+  };
+
   const handleRevoke = async (tokenId: string) => {
     setRevokeError(null);
     try {
@@ -101,12 +109,20 @@ export function TokensScreen() {
       setIssueOpen(true);
     } else if (pending?.kind === "revoke") {
       void handleRevoke(pending.tokenId);
+    } else if (pending?.kind === "rotate") {
+      setRotateOpen(true);
     }
   };
 
   const onIssueAuthNeeded = (reason: string) => {
     setIssueOpen(false);
     setPending({ kind: "issue" });
+    setAuthPrompt({ reason });
+  };
+
+  const onRotateAuthNeeded = (reason: string) => {
+    setRotateOpen(false);
+    setPending({ kind: "rotate" });
     setAuthPrompt({ reason });
   };
 
@@ -170,6 +186,22 @@ export function TokensScreen() {
             }}
           />
           <FilterPills filter={filter} setFilter={setFilter} />
+          <button
+            onClick={openRotate}
+            style={{
+              background: "transparent",
+              color: "var(--text-secondary)",
+              border: "1px solid var(--border-subtle)",
+              padding: "8px 14px",
+              borderRadius: "var(--radius-sm)",
+              fontSize: 13,
+              fontWeight: 600,
+              cursor: "pointer",
+              fontFamily: "inherit",
+            }}
+          >
+            Rotate matched…
+          </button>
           <button
             onClick={openIssue}
             style={{
@@ -277,6 +309,19 @@ export function TokensScreen() {
             forceRefresh();
           }}
           onNeedsAuth={onIssueAuthNeeded}
+        />
+      ) : null}
+
+      {rotateOpen ? (
+        <RotateTokensModal
+          onClose={() => {
+            setRotateOpen(false);
+            setPending(null);
+          }}
+          onExecuted={() => {
+            forceRefresh();
+          }}
+          onNeedsAuth={onRotateAuthNeeded}
         />
       ) : null}
 
