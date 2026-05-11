@@ -111,18 +111,27 @@ your app  ──Authorization: Bearer brk_xxx──►  keybroker  ──Authori
 
 Tokens are HS256 JWTs (`jose`). The broker verifies the signature, then re-checks the server-side record (allowing revocation and atomic quota / spend decrement that JWT alone can't provide).
 
-## Control plane prototype
+## Control plane
 
-A single-file browser prototype ships in `Prototype.html` (React 18, no build step, localStorage persistence). It demonstrates the FinOps + security narrative with:
+Phase 4.0 (in progress) replaces the original `Prototype.html` with a bundled Vite + React 18 app under `web/`, served by the broker at `/ui`. The first commit ships the Dashboard wired to real `/health` and `/metrics/spend` data; Tokens / Audit / Forecast / Policy / Shadow AI screens land in follow-up commits.
 
-- Dashboard with cost attribution by team/project and behavioral anomaly cards
-- Token management with tag-based filtering, issue/revoke, and bulk rotation
-- Audit log with per-call replay (prompt + completion)
-- Fleet policy editor with diff preview
-- Shadow AI scan with secret-leak detection simulation
-- Forecast / burn report showing which tokens and teams hit cap first
+```sh
+# from the repo root
+npm run web:install   # one-time: install web/ deps
+npm run web:build     # build web/dist (gitignored)
+npm run serve         # broker now serves the UI at http://127.0.0.1:7843/ui/
+```
 
-Open `Prototype.html` in any modern browser to try it. Data is synthetic and clearly labeled as such.
+If you hit `/ui/` before building, the broker serves a one-page hint telling you which command to run — no 5xx, no broken page.
+
+For development with hot reload:
+
+```sh
+npm run serve         # terminal 1: broker on :7843
+npm run web:dev       # terminal 2: Vite dev server proxies /health, /metrics, /forecast to the broker
+```
+
+The original synthetic prototype is still in `Prototype.html` for reference; it will be deleted when Phase 4.0 reaches feature parity.
 
 ## Adding a provider
 

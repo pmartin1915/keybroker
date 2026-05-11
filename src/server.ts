@@ -1,7 +1,11 @@
 import Fastify, { type FastifyRequest, type FastifyReply } from "fastify";
+import fastifyStatic from "@fastify/static";
 import { request as undiciRequest } from "undici";
 import { Transform } from "node:stream";
 import { finished } from "node:stream/promises";
+import { existsSync } from "node:fs";
+import { dirname, resolve as pathResolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { BrokerConfig } from "./config.js";
 import { openStore } from "./store.js";
 import type { StoreLike, TagBucket } from "./store-types.js";
@@ -194,6 +198,30 @@ export async function buildServer(
     }
     return forecastTags(store, bucket as TagBucket, since, top);
   });
+
+  // Phase 4.0: serve the bundled React control plane at /ui. The web/
+  // package builds into web/dist (gitignored). When dist exists we mount
+  // @fastify/static rooted there; when it doesn't (fresh clone or skipped
+  // build) we serve a single-page hint instead so /ui never 5xxs. The
+  // route order matters: static must register before `/:provider/*`
+  // because the catch-all would otherwise match /ui as `provider=ui`.
+  const webDistDir = resolveWebDistDir();
+  if (webDistDir) {
+    await app.register(fastifyStatic, {
+      root: webDistDir,
+      prefix: "/ui/",
+      decorateReply: false,
+    });
+    // Fastify-static serves /ui/<asset>. Add an alias so a bare /ui
+    // (no trailing slash) lands on the SPA entry point too.
+    app.get("/ui", async (_req, reply) => reply.redirect("/ui/", 302));
+  } else {
+    app.get("/ui", async (_req, reply) => reply.redirect("/ui/", 302));
+    app.get("/ui/*", async (_req, reply) => {
+      reply.type("text/html; charset=utf-8");
+      return UI_NOT_BUILT_HTML;
+    });
+  }
 
   app.all<{ Params: { provider: string; "*": string } }>(
     "/:provider/*",
@@ -1158,3 +1186,39 @@ export function forecastTags(
   });
   return rows.slice(0, top);
 }
+
+/**
+ * Phase 4.0: locate `web/dist` relative to this source file's runtime
+ * location. The project runs via tsx (no compile step), so __dirname-ish
+ * lookup uses import.meta.url. Returns the absolute path if the bundle
+ * has been built (index.html present), otherwise undefined — the server
+ * then mounts a "not built" hint at /ui/*.
+ */
+function resolveWebDistDir(): string | undefined {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const candidate = pathResolve(here, "..", "web", "dist");
+    if (existsSync(pathResolve(candidate, "index.html"))) return candidate;
+  } catch {
+    // import.meta.url not file:// (rare) — fall through to undefined.
+  }
+  return undefined;
+}
+
+const UI_NOT_BUILT_HTML = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Keybroker — UI not built</title>
+<style>
+  body{margin:0;background:#0b0c0f;color:#e8e9ec;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+       display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px}
+  main{max-width:520px;background:#1a1d26;border:1px solid #2a2e3b;border-radius:10px;padding:28px 32px}
+  h1{margin:0 0 12px;font-size:20px;letter-spacing:-0.02em}
+  p{color:#9aa0b2;font-size:14px;line-height:1.5;margin:0 0 12px}
+  code{background:#222635;border-radius:4px;padding:2px 6px;font-family:"SF Mono",Monaco,monospace;font-size:13px;color:#c8f560}
+</style></head>
+<body><main>
+  <h1>Keybroker UI not built</h1>
+  <p>The control-plane bundle is not present at <code>web/dist/</code>.</p>
+  <p>From the repo root, run:</p>
+  <p><code>cd web &amp;&amp; npm install &amp;&amp; npm run build</code></p>
+  <p>Then refresh this page.</p>
+</main></body></html>`;
