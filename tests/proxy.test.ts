@@ -158,6 +158,7 @@ beforeAll(async () => {
     host: "127.0.0.1",
     masterKeyHex,
     jwtSecret,
+    mgmtSecret: jwtSecret,
   };
   // Touch a config file so anything that re-loads finds it.
   writeFileSync(

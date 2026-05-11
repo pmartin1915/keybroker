@@ -1112,6 +1112,7 @@ describe("SqliteStore: openStore mode=auto guard", () => {
         host: "127.0.0.1",
         masterKeyHex: "00".repeat(32),
         jwtSecret: "x",
+        mgmtSecret: "x",
       };
       expect(() => openStore(cfg, { mode: "auto" })).toThrow(/keybroker migrate/);
     } finally {

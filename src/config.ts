@@ -5,8 +5,10 @@ import {
   getKeychain,
   KC_JWT_SECRET,
   KC_MASTER_KEY,
+  KC_MGMT_SECRET,
   type Keychain,
 } from "./keychain.js";
+import { generateJwtSecret } from "./crypto.js";
 
 export interface BrokerConfig {
   dataDir: string;
@@ -25,6 +27,14 @@ export interface BrokerConfig {
   masterKeyHex: string;
   /** Symmetric secret used to sign/verify JWT tokens. */
   jwtSecret: string;
+  /**
+   * Phase 4.0 c4: symmetric secret used to sign/verify *management*
+   * JWTs (the ones that authorize POST/DELETE on /admin/*). Distinct
+   * from `jwtSecret` so the read/proxy axis and the write/admin axis
+   * have independent blast radii. Lazy-generated on first load if
+   * the keychain has no entry yet — see `loadConfig`.
+   */
+  mgmtSecret: string;
 }
 
 const DEFAULT_DATA_DIR =
@@ -78,6 +88,7 @@ export async function loadConfig(
 
   let masterKeyHex = await kc.get(KC_MASTER_KEY);
   let jwtSecret = await kc.get(KC_JWT_SECRET);
+  let mgmtSecret = await kc.get(KC_MGMT_SECRET);
 
   // Back-compat: legacy installs (Phase ≤1.2) kept secrets in config.json.
   // Read them, warn, and prompt for migration. Don't auto-write to the
@@ -98,6 +109,16 @@ export async function loadConfig(
     );
   }
 
+  // Phase 4.0 c4: lazy-create the management secret on first load. New
+  // installs (`init` after c4) generate it up front; old installs get a
+  // freshly minted secret here without having to re-run init. The
+  // secret never leaves the keychain unless an operator runs `token
+  // mgmt --issue` to mint a JWT signed with it.
+  if (!mgmtSecret) {
+    mgmtSecret = generateJwtSecret();
+    await kc.set(KC_MGMT_SECRET, mgmtSecret);
+  }
+
   return {
     dataDir: dir,
     jsonStorePath: join(dir, "store.json"),
@@ -109,5 +130,6 @@ export async function loadConfig(
     host: raw.host ?? process.env.KEYBROKER_HOST ?? "127.0.0.1",
     masterKeyHex,
     jwtSecret,
+    mgmtSecret,
   };
 }

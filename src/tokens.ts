@@ -64,6 +64,28 @@ export interface BrokerTagClaim {
 export const TOKEN_PREFIX = "brk_";
 
 /**
+ * Phase 4.0 c4: prefix for management JWTs. Distinct from `brk_` so a
+ * leaked proxy token can never accidentally be presented as an admin
+ * token (and vice versa), and so the wire format makes it visually
+ * obvious which axis is at stake. Management JWTs sign with the
+ * separate `mgmtSecret` from `BrokerConfig` — even compromising the
+ * proxy-side `jwtSecret` does not let an attacker mint admin tokens.
+ */
+export const MGMT_TOKEN_PREFIX = "brkm_";
+
+/**
+ * Phase 4.0 c4: claim shape for management JWTs. Intentionally minimal —
+ * the management surface has exactly one capability today ("everything
+ * under /admin/*"), so we encode it as `scope: "manage"` for forward
+ * compat (a future c5 might split read-only management from rotate).
+ * `lbl` is free-form for operator audit ("ci-runner", "dashboard").
+ */
+export interface ManagementClaims extends JWTPayload {
+  scope: "manage";
+  lbl: string;
+}
+
+/**
  * Phase 3.3: cap on a single tag value. Generous enough for slugs and
  * short human names, tight enough that a malicious caller can't bloat
  * the audit log or the JWT itself.
@@ -234,6 +256,62 @@ export async function verifyToken(
           return { error: "malformed_claims" };
         }
       }
+    }
+    return { tokenId: claims.jti, claims };
+  } catch (e) {
+    return { error: (e as Error).message };
+  }
+}
+
+/**
+ * Phase 4.0 c4: mint a management JWT signed with the separate
+ * `mgmtSecret`. The body carries a fixed `scope: "manage"` claim plus
+ * a free-form label for audit. TTL is mandatory and bounded by the
+ * caller (the CLI defaults to 8h) — management tokens should always
+ * expire so a misplaced session-storage entry doesn't grant forever.
+ */
+export async function issueManagementToken(
+  mgmtSecret: string,
+  args: { tokenId: string; label: string; ttlSeconds: number },
+): Promise<string> {
+  if (args.ttlSeconds <= 0) {
+    throw new Error(
+      "issueManagementToken: ttlSeconds must be > 0 (management tokens must expire)",
+    );
+  }
+  const key = new TextEncoder().encode(mgmtSecret);
+  const jwt = await new SignJWT({ scope: "manage", lbl: args.label })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuer("keybroker-mgmt")
+    .setSubject(args.tokenId)
+    .setJti(args.tokenId)
+    .setIssuedAt()
+    .setExpirationTime(Math.floor(Date.now() / 1000) + args.ttlSeconds)
+    .sign(key);
+  return MGMT_TOKEN_PREFIX + jwt;
+}
+
+/**
+ * Phase 4.0 c4: verify a management JWT. The issuer claim is checked
+ * against `keybroker-mgmt` (NOT `keybroker`) so a proxy JWT minted with
+ * the proxy secret cannot mascarade as an admin token even on the off
+ * chance that an operator reused secrets across keychain entries — a
+ * defence-in-depth measure on top of the separate signing key.
+ */
+export async function verifyManagementToken(
+  mgmtSecret: string,
+  raw: string,
+): Promise<{ tokenId: string; claims: ManagementClaims } | { error: string }> {
+  if (!raw.startsWith(MGMT_TOKEN_PREFIX)) {
+    return { error: "missing_prefix" };
+  }
+  const jwt = raw.slice(MGMT_TOKEN_PREFIX.length);
+  const key = new TextEncoder().encode(mgmtSecret);
+  try {
+    const { payload } = await jwtVerify(jwt, key, { issuer: "keybroker-mgmt" });
+    const claims = payload as ManagementClaims;
+    if (!claims.jti || claims.scope !== "manage" || typeof claims.lbl !== "string") {
+      return { error: "malformed_claims" };
     }
     return { tokenId: claims.jti, claims };
   } catch (e) {

@@ -133,6 +133,7 @@ beforeAll(async () => {
     host: "127.0.0.1",
     masterKeyHex,
     jwtSecret,
+    mgmtSecret: jwtSecret,
   };
   writeFileSync(
     config.configPath,

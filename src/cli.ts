@@ -19,7 +19,11 @@ import {
   type StoreMode,
   type TokenRecord,
 } from "./store.js";
-import { issueToken, MAX_TAG_VALUE_LEN } from "./tokens.js";
+import {
+  issueToken,
+  issueManagementToken,
+  MAX_TAG_VALUE_LEN,
+} from "./tokens.js";
 import { PROVIDERS, getProvider } from "./providers/index.js";
 import {
   buildServer,
@@ -30,7 +34,12 @@ import {
   type TagForecastRow,
 } from "./server.js";
 import type { TagBucket } from "./store-types.js";
-import { getKeychain, KC_JWT_SECRET, KC_MASTER_KEY } from "./keychain.js";
+import {
+  getKeychain,
+  KC_JWT_SECRET,
+  KC_MASTER_KEY,
+  KC_MGMT_SECRET,
+} from "./keychain.js";
 import { normalizeMachine } from "./hostname.js";
 import { loadPolicy, policyDeniesTag, type TagKey } from "./policy.js";
 import {
@@ -107,8 +116,10 @@ program
       }
       const masterKeyHex = generateMasterKeyHex();
       const jwtSecret = generateJwtSecret();
+      const mgmtSecret = generateJwtSecret();
       await kc.set(KC_MASTER_KEY, masterKeyHex);
       await kc.set(KC_JWT_SECRET, jwtSecret);
+      await kc.set(KC_MGMT_SECRET, mgmtSecret);
       writeFileSync(
         configPath,
         JSON.stringify({ port: 8787, host: "127.0.0.1" }, null, 2),
@@ -118,7 +129,7 @@ program
       console.log(`data dir:    ${dir}`);
       console.log(`port:        8787 (override with KEYBROKER_PORT)`);
       console.log(
-        `secrets:     stored in OS keychain under service "keybroker" (accounts: ${KC_MASTER_KEY}, ${KC_JWT_SECRET}).`,
+        `secrets:     stored in OS keychain under service "keybroker" (accounts: ${KC_MASTER_KEY}, ${KC_JWT_SECRET}, ${KC_MGMT_SECRET}).`,
       );
     },
   );
@@ -436,6 +447,63 @@ token
       );
     },
   );
+
+// Phase 4.0 c4: mint a management JWT for the `/admin/*` routes. The
+// secret signing key lives in the OS keychain (KC_MGMT_SECRET, separate
+// from the proxy JWT secret) so an operator who can run the CLI can
+// mint admin tokens, but a leaked proxy token never grants admin rights
+// and vice versa. The minted JWT is the only thing the dashboard / curl
+// caller ever holds — it caches in sessionStorage and never touches
+// disk. TTL defaults to 8h to match a typical workday.
+token
+  .command("mgmt")
+  .description(
+    "Mint a management JWT for the broker's /admin/* routes (issue/revoke/rotate over HTTP).",
+  )
+  .requiredOption(
+    "--issue",
+    "mint a new management token (positional flag for future symmetry with --revoke/--list)",
+  )
+  .option(
+    "--label <label>",
+    "free-form label recorded on the token for audit (e.g. 'dashboard', 'ci-runner').",
+    "mgmt",
+  )
+  .option(
+    "--ttl <seconds>",
+    "seconds until expiry. Management tokens MUST expire; the lower the better.",
+    "28800",
+  )
+  .action(async (opts: { issue: boolean; label: string; ttl: string }) => {
+    const cfg = await loadConfig();
+    const ttl = Number(opts.ttl);
+    if (!Number.isFinite(ttl) || !Number.isInteger(ttl) || ttl <= 0) {
+      console.error(
+        `invalid --ttl: ${opts.ttl} (must be a positive integer, in seconds)`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    if (opts.label.length === 0 || opts.label.length > MAX_TAG_VALUE_LEN) {
+      console.error(
+        `invalid --label: must be 1..${MAX_TAG_VALUE_LEN} characters.`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    const id = newTokenId();
+    const jwt = await issueManagementToken(cfg.mgmtSecret, {
+      tokenId: id,
+      label: opts.label,
+      ttlSeconds: ttl,
+    });
+    console.log(jwt);
+    console.error(
+      `\nissued management token ${id} (label=${opts.label}, ttl=${ttl}s).\n` +
+        `Use as: Authorization: Bearer <token>\n` +
+        `Routes: POST /admin/tokens, DELETE /admin/tokens/:id, POST /admin/tokens/rotate`,
+    );
+  });
 
 token
   .command("list")

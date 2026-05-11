@@ -9,7 +9,24 @@ import { fileURLToPath } from "node:url";
 import type { BrokerConfig } from "./config.js";
 import { openStore } from "./store.js";
 import type { StoreLike, TagBucket } from "./store-types.js";
-import { scopeAllows, verifyToken, type BrokerClaims } from "./tokens.js";
+import {
+  issueToken,
+  scopeAllows,
+  verifyToken,
+  verifyManagementToken,
+  MGMT_TOKEN_PREFIX,
+  type BrokerClaims,
+} from "./tokens.js";
+import { issueTokenFlow, type IssueTokenInput } from "./issue.js";
+import {
+  applyRotationFilters,
+  buildReissueArgs,
+  computeRotationPreview,
+  type RotationFilters,
+} from "./rotate.js";
+import { newTokenId } from "./store.js";
+import { normalizeMachine } from "./hostname.js";
+import type { TokenRecord } from "./store-types.js";
 import { decrypt } from "./crypto.js";
 import { getProvider } from "./providers/index.js";
 import type { CallLogEntry } from "./logging.js";
@@ -254,6 +271,260 @@ export async function buildServer(
     }
     return forecastTags(store, bucket as TagBucket, since, top);
   });
+
+  // Phase 4.0 c4: management routes. Distinct posture from every other
+  // route on the broker — these are the only HTTP endpoints that
+  // *mint* or *destroy* tokens, so they sit behind a separate signing
+  // secret (`config.mgmtSecret`, prefix `brkm_`). The `requireManage`
+  // pre-handler is mounted as Fastify's `onRequest` hook scoped to
+  // `/admin/*` via the route options object — Fastify doesn't have a
+  // built-in router-level middleware for arbitrary prefixes, so we
+  // attach the hook to each admin route individually.
+  //
+  // Trust model recap (Phase 4.0 c4 decision):
+  //   - read endpoints (/health, /metrics/*, /tokens, /audit, /policy,
+  //     /forecast/*) are open on 127.0.0.1 — the loopback boundary is
+  //     the trust boundary for *observation*.
+  //   - write endpoints (/admin/*) require a management JWT — the
+  //     trust boundary for *mutation* is "can you prove the operator
+  //     ran `keybroker token mgmt --issue` recently?". The CLI is the
+  //     only thing with the keychain entry; everything else borrows
+  //     time-limited bearer tokens.
+  const requireManage = async (req: FastifyRequest, reply: FastifyReply) => {
+    const presented = extractPresentedManagementToken(req);
+    if (!presented) {
+      reply.status(401).send({ error: "no_management_token" });
+      return reply;
+    }
+    const verified = await verifyManagementToken(config.mgmtSecret, presented);
+    if ("error" in verified) {
+      reply.status(401).send({
+        error: "invalid_management_token",
+        reason: verified.error,
+      });
+      return reply;
+    }
+    // Stash on request for any future per-route logging (today we
+    // record nothing — there's no audit log for management calls yet;
+    // future work can add an `admin_audit` table).
+    (req as FastifyRequest & { mgmtTokenId?: string }).mgmtTokenId =
+      verified.tokenId;
+    return;
+  };
+
+  // POST /admin/tokens — issue a new proxy token.
+  // Body shape mirrors the CLI's `token issue` flags. Validation
+  // delegates to `issueTokenFlow` so the CLI and the route stay in
+  // lockstep on what counts as a valid request.
+  app.post<{ Body: IssueTokenInput }>(
+    "/admin/tokens",
+    { onRequest: requireManage },
+    async (req, reply) => {
+      const body = req.body ?? ({} as IssueTokenInput);
+      const policy = loadPolicy(config.policyPath);
+      const result = await issueTokenFlow(config, store, policy, body);
+      if (!result.ok) {
+        // 403 for tag/policy denials (caller's request violates a rule
+        // they cannot satisfy from the request side); 400 for shape
+        // errors. The error code identifies which.
+        const policyErrors = new Set([
+          "tag_not_in_allowlist",
+          "model_restriction_unsupported",
+        ]);
+        const status = policyErrors.has(result.error) ? 403 : 400;
+        const payload: { error: string; hint?: string } = { error: result.error };
+        if (result.hint !== undefined) payload.hint = result.hint;
+        return reply.status(status).send(payload);
+      }
+      return reply.status(201).send({
+        tokenId: result.tokenId,
+        jwt: result.jwt,
+        record: result.record,
+      });
+    },
+  );
+
+  // DELETE /admin/tokens/:id — revoke a token. Returns 200 on success,
+  // 404 when the id is unknown. Same semantics as `keybroker token
+  // revoke`. Idempotent: revoking an already-revoked token returns
+  // 200 (the post-condition "token is revoked" is satisfied either
+  // way; surfacing 404 only for "never existed" gives the dashboard
+  // a clean retry posture).
+  app.delete<{ Params: { id: string } }>(
+    "/admin/tokens/:id",
+    { onRequest: requireManage },
+    async (req, reply) => {
+      const id = req.params.id;
+      const existing = store.getToken(id);
+      if (!existing) {
+        return reply.status(404).send({ error: "unknown_token", id });
+      }
+      if (existing.revoked) {
+        return reply.status(200).send({ revoked: true, id, alreadyRevoked: true });
+      }
+      const ok = store.revokeToken(id);
+      if (!ok) {
+        // Race: token vanished between getToken and revokeToken. Treat
+        // as 404 — the post-condition isn't satisfied through our action.
+        return reply.status(404).send({ error: "unknown_token", id });
+      }
+      return reply.status(200).send({ revoked: true, id });
+    },
+  );
+
+  // POST /admin/tokens/rotate — bulk revoke + reissue with identical
+  // claims. Mirrors `keybroker rotate-all` (Phase 3.8). Body shape:
+  //   {
+  //     "filters": { "team": "...", "project": "...", "env": "...",
+  //                  "machine": "...", "provider": "..." },
+  //     "preview": false,   // counts only; no plan, no writes
+  //     "dryRun":  false    // build plan only; no writes
+  //   }
+  // At least one filter is required (same guardrail as the CLI). The
+  // response in preview mode is `RotationPreview`; in dry-run mode
+  // it's the planned reissue list; in real-run mode it's the executed
+  // list with the new JWTs included.
+  app.post<{
+    Body: {
+      filters?: RotationFilters;
+      preview?: boolean;
+      dryRun?: boolean;
+    };
+  }>(
+    "/admin/tokens/rotate",
+    { onRequest: requireManage },
+    async (req, reply) => {
+      const body = req.body ?? {};
+      const rawFilters = body.filters ?? {};
+      const filters: RotationFilters = {};
+      if (typeof rawFilters.team === "string" && rawFilters.team !== "")
+        filters.team = rawFilters.team;
+      if (typeof rawFilters.project === "string" && rawFilters.project !== "")
+        filters.project = rawFilters.project;
+      if (typeof rawFilters.env === "string" && rawFilters.env !== "")
+        filters.env = rawFilters.env;
+      if (typeof rawFilters.machine === "string" && rawFilters.machine !== "") {
+        const norm = normalizeMachine(rawFilters.machine);
+        if (norm !== undefined) filters.machine = norm;
+      }
+      if (typeof rawFilters.provider === "string" && rawFilters.provider !== "")
+        filters.provider = rawFilters.provider;
+
+      if (Object.keys(filters).length === 0) {
+        return reply.status(400).send({
+          error: "no_filters",
+          hint:
+            "rotate requires at least one filter (team / project / env / machine / provider) — " +
+            "no-filter rotation is intentionally not supported.",
+        });
+      }
+
+      const all = store.listTokens();
+      const matched = applyRotationFilters(all, filters).filter(
+        (t) => !t.revoked,
+      );
+
+      if (body.preview === true) {
+        return reply.status(200).send({
+          filters,
+          preview: computeRotationPreview(matched),
+        });
+      }
+
+      // Build the reissue plan up front. Expired tokens are skipped
+      // and surfaced separately so callers can see what was elided.
+      type PlanItem = {
+        oldId: string;
+        newId: string;
+        label: string;
+        args: Parameters<typeof issueToken>[1];
+        noModelsClaim: boolean;
+      };
+      const plan: PlanItem[] = [];
+      const expired: TokenRecord[] = [];
+      for (const rec of matched) {
+        const newId = newTokenId();
+        const built = buildReissueArgs(rec, newId);
+        if (!built) {
+          expired.push(rec);
+          continue;
+        }
+        plan.push({
+          oldId: rec.id,
+          newId,
+          label: rec.label,
+          args: built.args,
+          noModelsClaim: built.noModelsClaim,
+        });
+      }
+
+      if (body.dryRun === true) {
+        return reply.status(200).send({
+          filters,
+          plan: plan.map((p) => ({
+            oldId: p.oldId,
+            newId: p.newId,
+            label: p.label,
+            noModelsClaim: p.noModelsClaim,
+          })),
+          expired: expired.map((t) => ({ id: t.id, label: t.label })),
+        });
+      }
+
+      // Real run — revoke FIRST, then reissue. Same ordering as the CLI
+      // (Phase 3.8 decision: a crash mid-loop leaves the fleet in the
+      // "everyone's keys are dead" state rather than the "old keys still
+      // valid alongside new ones" state).
+      const reissued: Array<{
+        oldId: string;
+        newId: string;
+        label: string;
+        jwt: string;
+        noModelsClaim: boolean;
+      }> = [];
+      for (const item of plan) {
+        const old = store.getToken(item.oldId);
+        if (!old || !store.revokeToken(item.oldId)) continue;
+        const newRec: TokenRecord = {
+          id: item.args.tokenId,
+          provider: item.args.provider,
+          scopes: item.args.scopes,
+          remaining: old.remaining,
+          used: 0,
+          expiresAt:
+            item.args.ttlSeconds > 0
+              ? Math.floor(Date.now() / 1000) + item.args.ttlSeconds
+              : 0,
+          createdAt: new Date().toISOString(),
+          label: item.args.label,
+          revoked: false,
+        };
+        if (item.args.machine !== undefined) newRec.machine = item.args.machine;
+        if (item.args.capUsd !== undefined) newRec.capUsd = item.args.capUsd;
+        if (item.args.tags?.team !== undefined)
+          newRec.tagTeam = item.args.tags.team;
+        if (item.args.tags?.project !== undefined)
+          newRec.tagProject = item.args.tags.project;
+        if (item.args.tags?.env !== undefined) newRec.tagEnv = item.args.tags.env;
+        if (item.args.models !== undefined) newRec.models = item.args.models;
+        store.putToken(newRec);
+        const jwt = await issueToken(config.jwtSecret, item.args);
+        reissued.push({
+          oldId: item.oldId,
+          newId: item.args.tokenId,
+          label: item.args.label,
+          jwt,
+          noModelsClaim: item.noModelsClaim,
+        });
+      }
+      return reply.status(200).send({
+        filters,
+        revoked: reissued.length,
+        reissued,
+        expired: expired.map((t) => ({ id: t.id, label: t.label })),
+      });
+    },
+  );
 
   // Phase 4.0: serve the bundled React control plane at /ui. The web/
   // package builds into web/dist (gitignored). When dist exists we mount
@@ -952,6 +1223,30 @@ function extractPresentedToken(req: FastifyRequest): string | undefined {
   }
   const xkey = req.headers["x-api-key"];
   if (typeof xkey === "string" && xkey.startsWith("brk_")) return xkey.trim();
+  return undefined;
+}
+
+/**
+ * Phase 4.0 c4: pull the management JWT from the request. We require
+ * the `brkm_` prefix on both extraction paths (Authorization-Bearer
+ * and the bare header) so the prefix invariant is the same whether
+ * the caller wraps it as a Bearer or not. Proxy tokens (`brk_`) are
+ * NOT accepted here — even if a proxy JWT somehow got presented at
+ * `/admin/*`, the prefix check rejects it before signature verification
+ * touches the wrong secret.
+ */
+function extractPresentedManagementToken(
+  req: FastifyRequest,
+): string | undefined {
+  const auth = req.headers.authorization;
+  if (auth) {
+    if (auth.startsWith("Bearer ")) {
+      const tok = auth.slice("Bearer ".length).trim();
+      if (tok.startsWith(MGMT_TOKEN_PREFIX)) return tok;
+      return undefined;
+    }
+    if (auth.startsWith(MGMT_TOKEN_PREFIX)) return auth.trim();
+  }
   return undefined;
 }
 

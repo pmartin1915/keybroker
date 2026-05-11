@@ -28,6 +28,15 @@ export const SERVICE_NAME = "keybroker";
 /** Account names used inside the keychain service. */
 export const KC_MASTER_KEY = "master_key";
 export const KC_JWT_SECRET = "jwt_secret";
+/**
+ * Phase 4.0 c4: signing secret for management JWTs (issue/revoke/rotate
+ * over HTTP). Distinct from `KC_JWT_SECRET` so leaking a proxy token
+ * never confers issue-rights, and rotating one secret never invalidates
+ * the other. Lazy-generated on first `loadConfig()` for back-compat
+ * with pre-c4 installs (so an existing operator doesn't have to re-run
+ * `init` just to get the admin routes).
+ */
+export const KC_MGMT_SECRET = "mgmt_secret";
 
 export class KeytarKeychain implements Keychain {
   constructor(private readonly service: string = SERVICE_NAME) {}
