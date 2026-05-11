@@ -172,6 +172,26 @@ describe("GET /tokens", () => {
   });
 });
 
+describe("GET /policy", () => {
+  it("returns the active policy snapshot", async () => {
+    const res = await fetch(`${origin}/policy`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      forbiddenModels?: unknown;
+      allowedProviders?: unknown;
+      tagAllowlist?: unknown;
+      scanner?: { enabled?: unknown };
+    };
+    // The test seeds no policy.json, so the broker falls back to the
+    // empty-policy defaults defined in src/policy.ts. The scanner is
+    // default-on (Phase 3.6 invariant) regardless of file presence.
+    expect(Array.isArray(body.forbiddenModels)).toBe(true);
+    expect(Array.isArray(body.allowedProviders)).toBe(true);
+    expect(typeof body.tagAllowlist).toBe("object");
+    expect(body.scanner?.enabled).toBe(true);
+  });
+});
+
 describe("GET /audit", () => {
   it("returns recent calls in recency order", async () => {
     const res = await fetch(`${origin}/audit`);

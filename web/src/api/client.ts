@@ -70,6 +70,45 @@ export interface AuditRow {
   outputTokens?: number;
 }
 
+// Phase 4.0 c3: mirrors broker `TokenForecastRow` (src/server.ts).
+export interface TokenForecastRow {
+  tokenId: string;
+  label: string;
+  provider: string;
+  slopeUsdPerDay: number;
+  interceptUsd: number;
+  currentUsd: number;
+  daysUntilCap?: number;
+  projectedCapBreachDate?: string;
+  capUsd?: number;
+  machine?: string;
+  tagTeam?: string;
+  tagProject?: string;
+  tagEnv?: string;
+}
+
+export interface TagForecastRow {
+  key: string;
+  slopeUsdPerDay: number;
+  currentUsd: number;
+}
+
+export interface ScannerConfig {
+  enabled: boolean;
+  detectors?: readonly string[];
+}
+
+export interface PolicySnapshot {
+  forbiddenModels: readonly string[];
+  allowedProviders: readonly string[];
+  tagAllowlist: {
+    team?: readonly string[];
+    project?: readonly string[];
+    env?: readonly string[];
+  };
+  scanner: ScannerConfig;
+}
+
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { headers: { accept: "application/json" } });
   if (!res.ok) {
@@ -110,4 +149,29 @@ export function fetchAudit(opts?: {
   if (opts?.machine) qs.set("machine", opts.machine);
   const tail = qs.toString();
   return getJson<AuditRow[]>(`/audit${tail ? `?${tail}` : ""}`);
+}
+
+export function fetchTokenForecast(opts?: {
+  since?: string;
+  top?: number;
+}): Promise<TokenForecastRow[]> {
+  const qs = new URLSearchParams();
+  if (opts?.since) qs.set("since", opts.since);
+  if (opts?.top !== undefined) qs.set("top", String(opts.top));
+  const tail = qs.toString();
+  return getJson<TokenForecastRow[]>(`/forecast/tokens${tail ? `?${tail}` : ""}`);
+}
+
+export function fetchTagForecast(
+  bucket: TagBucket,
+  opts?: { since?: string; top?: number },
+): Promise<TagForecastRow[]> {
+  const qs = new URLSearchParams({ bucket });
+  if (opts?.since) qs.set("since", opts.since);
+  if (opts?.top !== undefined) qs.set("top", String(opts.top));
+  return getJson<TagForecastRow[]>(`/forecast/tags?${qs}`);
+}
+
+export function fetchPolicy(): Promise<PolicySnapshot> {
+  return getJson<PolicySnapshot>("/policy");
 }

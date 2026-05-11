@@ -1,9 +1,17 @@
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import { Dashboard } from "./components/Dashboard.js";
 import { TokensScreen } from "./components/TokensScreen.js";
 import { AuditScreen } from "./components/AuditScreen.js";
+import { PolicyScreen } from "./components/PolicyScreen.js";
+import { ShadowAIScreen } from "./components/ShadowAIScreen.js";
 
-type Screen = "dashboard" | "tokens" | "audit";
+// Forecast pulls in Recharts (and through it d3-shape, d3-scale, etc.) —
+// ~400 KB ungzipped. Lazy-load so the other five screens don't pay for it.
+const ForecastScreen = lazy(() =>
+  import("./components/ForecastScreen.js").then((m) => ({ default: m.ForecastScreen })),
+);
+
+type Screen = "dashboard" | "tokens" | "audit" | "forecast" | "policy" | "shadow";
 
 interface NavItem {
   id: Screen;
@@ -14,12 +22,13 @@ const NAV: NavItem[] = [
   { id: "dashboard", label: "Dashboard" },
   { id: "tokens", label: "Tokens" },
   { id: "audit", label: "Audit" },
+  { id: "forecast", label: "Forecast" },
+  { id: "policy", label: "Policy" },
+  { id: "shadow", label: "Shadow AI" },
 ];
 
 const FUTURE_NAV: { label: string; phase: string }[] = [
-  { label: "Forecast", phase: "4.0 c3" },
-  { label: "Policy", phase: "4.0 c3" },
-  { label: "Shadow AI", phase: "4.0 c3" },
+  { label: "Issue / rotate", phase: "4.0 c4" },
 ];
 
 export default function App() {
@@ -141,7 +150,7 @@ export default function App() {
             color: "var(--text-muted)",
           }}
         >
-          Phase 4.0 · c2 read-only
+          Phase 4.0 · c3 read-only complete
         </div>
       </aside>
 
@@ -149,6 +158,13 @@ export default function App() {
         {screen === "dashboard" && <Dashboard />}
         {screen === "tokens" && <TokensScreen />}
         {screen === "audit" && <AuditScreen />}
+        {screen === "forecast" && (
+          <Suspense fallback={<div style={{ padding: 32, fontSize: 13, color: "var(--text-muted)" }}>loading chart bundle…</div>}>
+            <ForecastScreen />
+          </Suspense>
+        )}
+        {screen === "policy" && <PolicyScreen />}
+        {screen === "shadow" && <ShadowAIScreen />}
       </main>
     </div>
   );

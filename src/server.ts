@@ -194,6 +194,15 @@ export async function buildServer(
     return store.recentCalls(opts);
   });
 
+  // Phase 4.0 c3: read-only policy view for the control plane. Returns
+  // the same `Policy` shape `loadPolicy` resolves at request time, so
+  // the UI surfaces exactly what the broker enforces. No edit
+  // affordance here — write operations are deferred to Phase 4.0 c4
+  // pending the management-auth decision.
+  app.get("/policy", async () => {
+    return loadPolicy(config.policyPath);
+  });
+
   // Phase 3.5: linear-regression burn forecast. Two routes — per-token
   // (with cap projection) and per-tag (slope-only leaderboard). Same
   // trust posture as /health and /metrics/spend: open on 127.0.0.1.
