@@ -8,6 +8,7 @@ import {
 import { MgmtTokenModal } from "./MgmtTokenModal.js";
 import { IssueTokenModal } from "./IssueTokenModal.js";
 import { RotateTokensModal } from "./RotateTokensModal.js";
+import { BulkRevokeModal } from "./BulkRevokeModal.js";
 
 const REFRESH_MS = 15_000;
 
@@ -37,6 +38,7 @@ type PendingAction =
   | { kind: "issue" }
   | { kind: "revoke"; tokenId: string }
   | { kind: "rotate" }
+  | { kind: "bulkRevoke"; tokenIds: string[] }
   | null;
 
 export function TokensScreen() {
@@ -49,6 +51,8 @@ export function TokensScreen() {
   const [refreshTick, setRefreshTick] = useState(0);
   const [issueOpen, setIssueOpen] = useState(false);
   const [rotateOpen, setRotateOpen] = useState(false);
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [authPrompt, setAuthPrompt] = useState<{ reason: string } | null>(null);
   const [pending, setPending] = useState<PendingAction>(null);
   const [revokeError, setRevokeError] = useState<string | null>(null);
@@ -88,6 +92,24 @@ export function TokensScreen() {
     setRotateOpen(true);
   };
 
+  const openBulkRevoke = () => {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    setPending({ kind: "bulkRevoke", tokenIds: ids });
+    setBulkOpen(true);
+  };
+
+  const toggleSelect = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const clearSelection = () => setSelectedIds(new Set());
+
   const handleRevoke = async (tokenId: string) => {
     setRevokeError(null);
     try {
@@ -111,6 +133,8 @@ export function TokensScreen() {
       void handleRevoke(pending.tokenId);
     } else if (pending?.kind === "rotate") {
       setRotateOpen(true);
+    } else if (pending?.kind === "bulkRevoke") {
+      setBulkOpen(true);
     }
   };
 
@@ -123,6 +147,14 @@ export function TokensScreen() {
   const onRotateAuthNeeded = (reason: string) => {
     setRotateOpen(false);
     setPending({ kind: "rotate" });
+    setAuthPrompt({ reason });
+  };
+
+  const onBulkAuthNeeded = (reason: string) => {
+    setBulkOpen(false);
+    setPending((prev) =>
+      prev && prev.kind === "bulkRevoke" ? prev : { kind: "bulkRevoke", tokenIds: Array.from(selectedIds) },
+    );
     setAuthPrompt({ reason });
   };
 
@@ -148,6 +180,28 @@ export function TokensScreen() {
   }, [rows, filter, query]);
 
   const selectedRow = selected ? rows.find((r) => r.id === selected) ?? null : null;
+  const selectedTokens = useMemo(
+    () => rows.filter((r) => selectedIds.has(r.id) && !r.revoked),
+    [rows, selectedIds],
+  );
+  const visibleSelectable = useMemo(
+    () => filtered.filter((r) => !r.revoked),
+    [filtered],
+  );
+  const allVisibleSelected =
+    visibleSelectable.length > 0 &&
+    visibleSelectable.every((r) => selectedIds.has(r.id));
+  const toggleSelectAllVisible = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allVisibleSelected) {
+        for (const r of visibleSelectable) next.delete(r.id);
+      } else {
+        for (const r of visibleSelectable) next.add(r.id);
+      }
+      return next;
+    });
+  };
 
   return (
     <div style={{ padding: 32, display: "flex", flexDirection: "column", gap: 20 }}>
@@ -186,6 +240,41 @@ export function TokensScreen() {
             }}
           />
           <FilterPills filter={filter} setFilter={setFilter} />
+          {selectedTokens.length > 0 ? (
+            <>
+              <button
+                onClick={openBulkRevoke}
+                style={{
+                  background: "transparent",
+                  color: "var(--danger)",
+                  border: "1px solid var(--danger)",
+                  padding: "8px 14px",
+                  borderRadius: "var(--radius-sm)",
+                  fontSize: 13,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                }}
+              >
+                Revoke {selectedTokens.length} selected…
+              </button>
+              <button
+                onClick={clearSelection}
+                style={{
+                  background: "transparent",
+                  color: "var(--text-muted)",
+                  border: "none",
+                  padding: "8px 6px",
+                  fontSize: 12,
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                }}
+                aria-label="clear selection"
+              >
+                clear
+              </button>
+            </>
+          ) : null}
           <button
             onClick={openRotate}
             style={{
@@ -264,7 +353,7 @@ export function TokensScreen() {
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "1.4fr 0.8fr 1fr 0.6fr 1fr 0.7fr",
+            gridTemplateColumns: "36px 1.4fr 0.8fr 1fr 0.6fr 1fr 0.7fr",
             padding: "10px 16px",
             background: "var(--bg-paper)",
             borderBottom: "1px solid var(--border-subtle)",
@@ -273,8 +362,17 @@ export function TokensScreen() {
             color: "var(--text-secondary)",
             textTransform: "uppercase",
             letterSpacing: "0.08em",
+            alignItems: "center",
           }}
         >
+          <input
+            type="checkbox"
+            checked={allVisibleSelected}
+            onChange={toggleSelectAllVisible}
+            disabled={visibleSelectable.length === 0}
+            aria-label="select all visible"
+            style={{ cursor: visibleSelectable.length === 0 ? "default" : "pointer" }}
+          />
           <span>Label / id</span>
           <span>Provider</span>
           <span>Tags · machine</span>
@@ -287,7 +385,15 @@ export function TokensScreen() {
         ) : filtered.length === 0 ? (
           <div style={{ padding: 24, fontSize: 13, color: "var(--text-muted)" }}>no tokens match</div>
         ) : (
-          filtered.map((r) => <TokenRowView key={r.id} row={r} onClick={() => setSelected(r.id)} />)
+          filtered.map((r) => (
+            <TokenRowView
+              key={r.id}
+              row={r}
+              selected={selectedIds.has(r.id)}
+              onToggleSelect={() => toggleSelect(r.id)}
+              onClick={() => setSelected(r.id)}
+            />
+          ))
         )}
       </div>
 
@@ -322,6 +428,21 @@ export function TokensScreen() {
             forceRefresh();
           }}
           onNeedsAuth={onRotateAuthNeeded}
+        />
+      ) : null}
+
+      {bulkOpen && selectedTokens.length > 0 ? (
+        <BulkRevokeModal
+          tokens={selectedTokens}
+          onClose={() => {
+            setBulkOpen(false);
+            setPending(null);
+          }}
+          onExecuted={() => {
+            forceRefresh();
+            clearSelection();
+          }}
+          onNeedsAuth={onBulkAuthNeeded}
         />
       ) : null}
 
@@ -403,7 +524,17 @@ function TagPill({ label, value }: { label: string; value: string }) {
   );
 }
 
-function TokenRowView({ row, onClick }: { row: TokenRow; onClick: () => void }) {
+function TokenRowView({
+  row,
+  selected,
+  onToggleSelect,
+  onClick,
+}: {
+  row: TokenRow;
+  selected: boolean;
+  onToggleSelect: () => void;
+  onClick: () => void;
+}) {
   const cap = row.capUsd;
   const spendPct = cap && cap > 0 ? Math.min(100, (row.spendUsd / cap) * 100) : 0;
   const overCap = cap !== undefined && row.spendUsd > cap;
@@ -412,15 +543,32 @@ function TokenRowView({ row, onClick }: { row: TokenRow; onClick: () => void }) 
       onClick={onClick}
       style={{
         display: "grid",
-        gridTemplateColumns: "1.4fr 0.8fr 1fr 0.6fr 1fr 0.7fr",
+        gridTemplateColumns: "36px 1.4fr 0.8fr 1fr 0.6fr 1fr 0.7fr",
         padding: "12px 16px",
         borderBottom: "1px solid var(--border-subtle)",
         fontSize: 12,
         alignItems: "center",
         cursor: "pointer",
-        background: row.revoked ? "rgba(225, 78, 78, 0.04)" : "transparent",
+        background: row.revoked
+          ? "rgba(225, 78, 78, 0.04)"
+          : selected
+          ? "rgba(255, 255, 255, 0.03)"
+          : "transparent",
       }}
     >
+      <span onClick={(e) => e.stopPropagation()} style={{ display: "flex", alignItems: "center" }}>
+        {row.revoked ? (
+          <span aria-hidden="true" style={{ width: 13, height: 13, display: "inline-block" }} />
+        ) : (
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={onToggleSelect}
+            aria-label={`select ${row.label}`}
+            style={{ cursor: "pointer" }}
+          />
+        )}
+      </span>
       <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
         <span style={{ fontWeight: 600, color: "var(--text-primary)" }} className="truncate">
           {row.label}
