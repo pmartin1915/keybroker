@@ -21,12 +21,18 @@ export function HelpOverlay() {
       <Text bold color="cyan">Keybindings</Text>
       <Box flexDirection="column" marginTop={1}>
         <Text><Text color="yellow">1</Text> Dashboard      <Text color="yellow">4</Text> Forecast (c6)</Text>
-        <Text><Text color="yellow">2</Text> Tokens   (c2)  <Text color="yellow">5</Text> Policy   (c6)</Text>
+        <Text><Text color="yellow">2</Text> Tokens         <Text color="yellow">5</Text> Policy   (c6)</Text>
         <Text><Text color="yellow">3</Text> Audit    (c3)  <Text color="yellow">6</Text> Shadow AI (c6)</Text>
       </Box>
       <Box marginTop={1}>
         <Text>
           <Text color="yellow">r</Text> refresh    <Text color="yellow">?</Text> toggle help    <Text color="yellow">q</Text> quit
+        </Text>
+      </Box>
+      <Box marginTop={1} flexDirection="column">
+        <Text color="gray">Tokens screen:</Text>
+        <Text>
+          <Text color="yellow">↑↓</Text> move  <Text color="yellow">Enter</Text> detail  <Text color="yellow">f</Text> filter  <Text color="yellow">/</Text> search  <Text color="yellow">c</Text> clear  <Text color="yellow">Esc</Text> close
         </Text>
       </Box>
       <Box marginTop={1}>

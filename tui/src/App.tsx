@@ -2,8 +2,10 @@ import React, { useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import type { BrokerClient } from "./api/client.js";
 import { Dashboard } from "./components/Dashboard.js";
+import { TokensScreen } from "./components/TokensScreen.js";
 import { PlaceholderScreen } from "./components/PlaceholderScreen.js";
 import { HelpOverlay } from "./components/HelpOverlay.js";
+import { FocusProvider, useFocusCapture } from "./focus.js";
 
 // Screen vocabulary mirrors web/src/App.tsx — keep the order stable so the
 // number keys (1..6) map predictably across the two surfaces.
@@ -21,15 +23,15 @@ interface NavItem {
 // screens; q quits; ? shows help. Modals (c4+) will own focus exclusively.
 const NAV: NavItem[] = [
   { id: "dashboard", label: "Dashboard", hotkey: "1", status: "live" },
-  { id: "tokens", label: "Tokens", hotkey: "2", status: "stub" },
+  { id: "tokens", label: "Tokens", hotkey: "2", status: "live" },
   { id: "audit", label: "Audit", hotkey: "3", status: "stub" },
   { id: "forecast", label: "Forecast", hotkey: "4", status: "stub" },
   { id: "policy", label: "Policy", hotkey: "5", status: "stub" },
   { id: "shadow", label: "Shadow AI", hotkey: "6", status: "stub" },
 ];
 
-const STUB_LANDING: Record<Exclude<Screen, "dashboard">, string> = {
-  tokens: "Phase 4.1 c2",
+// c2 lit Tokens; the remaining four are stubs.
+const STUB_LANDING: Record<Exclude<Screen, "dashboard" | "tokens">, string> = {
   audit: "Phase 4.1 c3",
   forecast: "Phase 4.1 c6",
   policy: "Phase 4.1 c6",
@@ -37,26 +39,41 @@ const STUB_LANDING: Record<Exclude<Screen, "dashboard">, string> = {
 };
 
 export function App({ client }: { client: BrokerClient }) {
+  return (
+    <FocusProvider>
+      <AppInner client={client} />
+    </FocusProvider>
+  );
+}
+
+function AppInner({ client }: { client: BrokerClient }) {
   const { exit } = useApp();
   const [screen, setScreen] = useState<Screen>("dashboard");
   const [helpOpen, setHelpOpen] = useState(false);
+  const { capture } = useFocusCapture();
 
-  useInput((input, key) => {
-    if (helpOpen) {
-      if (key.escape || input === "?" || input === "q") setHelpOpen(false);
-      return;
-    }
-    if (input === "q" || (key.ctrl && input === "c")) {
-      exit();
-      return;
-    }
-    if (input === "?") {
-      setHelpOpen(true);
-      return;
-    }
-    const target = NAV.find((n) => n.hotkey === input);
-    if (target) setScreen(target.id);
-  });
+  // Phase 4.1 c2: when a child has captured input (search-mode TextInput
+  // or detail overlay), suspend all App-level hotkeys so digits and `q`
+  // don't double-fire as nav while typing.
+  useInput(
+    (input, key) => {
+      if (helpOpen) {
+        if (key.escape || input === "?" || input === "q") setHelpOpen(false);
+        return;
+      }
+      if (input === "q" || (key.ctrl && input === "c")) {
+        exit();
+        return;
+      }
+      if (input === "?") {
+        setHelpOpen(true);
+        return;
+      }
+      const target = NAV.find((n) => n.hotkey === input);
+      if (target) setScreen(target.id);
+    },
+    { isActive: !capture },
+  );
 
   return (
     <Box flexDirection="column" minHeight={20}>
@@ -64,10 +81,12 @@ export function App({ client }: { client: BrokerClient }) {
       <Box flexDirection="column" paddingX={1} paddingY={1}>
         {screen === "dashboard" ? (
           <Dashboard client={client} />
+        ) : screen === "tokens" ? (
+          <TokensScreen client={client} />
         ) : (
           <PlaceholderScreen
             title={NAV.find((n) => n.id === screen)?.label ?? screen}
-            shipsIn={STUB_LANDING[screen as Exclude<Screen, "dashboard">]}
+            shipsIn={STUB_LANDING[screen as Exclude<Screen, "dashboard" | "tokens">]}
           />
         )}
       </Box>
