@@ -68,6 +68,17 @@ export const PRICING: PriceRule[] = [
     inputUsdPerMTok: 3,
     outputUsdPerMTok: 15,
   },
+
+  // Google Gemini — list prices as of May 2026. 2.5 Flash output rate
+  // is the thinking-on tier (the default; non-thinking is $0.30/M but
+  // we'd rather over-estimate than let a thinking call nick the cap).
+  { pattern: "gemini-2.5-flash*", inputUsdPerMTok: 0.3, outputUsdPerMTok: 2.5 },
+  { pattern: "gemini-2.5-pro*", inputUsdPerMTok: 1.25, outputUsdPerMTok: 10 },
+
+  // Mistral La Plateforme — list prices as of May 2026.
+  { pattern: "mistral-large*", inputUsdPerMTok: 2, outputUsdPerMTok: 6 },
+  { pattern: "mistral-small*", inputUsdPerMTok: 0.2, outputUsdPerMTok: 0.6 },
+  { pattern: "codestral-latest*", inputUsdPerMTok: 0.3, outputUsdPerMTok: 0.9 },
 ];
 
 /**

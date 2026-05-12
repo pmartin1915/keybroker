@@ -38,6 +38,18 @@ describe("priceForModel: glob lookup ordering", () => {
   it("PRICING table is non-empty (regression: don't ship an empty fleet)", () => {
     expect(PRICING.length).toBeGreaterThan(0);
   });
+
+  it("prices the gemini/mistral models the dispatcher actually mints for", () => {
+    // Phase 3.2 c4 smoke (2026-05-11) found capped dispatcher tokens were
+    // 403ing as `cap_unpriced_model` because these patterns were missing.
+    // The dispatcher hardcodes a $5 cap on every mint — any unpriced model
+    // here silently breaks broker routing for that provider.
+    expect(priceForModel("gemini-2.5-flash")).toBeDefined();
+    expect(priceForModel("gemini-2.5-pro")).toBeDefined();
+    expect(priceForModel("mistral-large-latest")).toBeDefined();
+    expect(priceForModel("mistral-small-latest")).toBeDefined();
+    expect(priceForModel("codestral-latest")).toBeDefined();
+  });
 });
 
 describe("estimateOutputCostUsd: pre-flight estimate", () => {
