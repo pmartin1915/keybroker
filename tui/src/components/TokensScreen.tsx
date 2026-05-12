@@ -15,8 +15,9 @@ import { useFocusCapture } from "../focus.js";
 import { MgmtTokenPrompt } from "./MgmtTokenPrompt.js";
 import { IssueTokenForm, IssuedReveal } from "./IssueTokenForm.js";
 import { RotateTokensFlow, type RotateStep, type RotateResumeAt } from "./RotateTokensFlow.js";
+import { BulkRevokeFlow, type BulkPhase, type BulkOutcome } from "./BulkRevokeFlow.js";
 
-// Phase 4.1 c2 / c4 / c5a — Tokens screen.
+// Phase 4.1 c2 / c4 / c5 — Tokens screen.
 //
 // Filter focus model (locked in memory/decision_phase_4_1_c1.md "c2
 // filter focus model"):
@@ -29,6 +30,10 @@ import { RotateTokensFlow, type RotateStep, type RotateResumeAt } from "./Rotate
 //   Esc        close detail panel
 //   i          (c4) issue new token — prompts for mgmt JWT if needed
 //   R          (c5a) rotate matched tokens — 4-step ceremony
+//   space      (c5b) toggle selection on cursor row
+//   a          (c5b) toggle-all visible active rows
+//   X          (c5b) bulk revoke selected (when selection non-empty)
+//   Esc        (c5b) clears selection when non-empty and no modal/detail open
 //
 // Detail-panel hotkeys (c4):
 //   x          revoke this token (inline two-step y/n confirm)
@@ -46,7 +51,12 @@ import { RotateTokensFlow, type RotateStep, type RotateResumeAt } from "./Rotate
 type PendingAction =
   | { kind: "issue" }
   | { kind: "revoke"; tokenId: string; label: string }
-  | { kind: "rotate"; filters: RotateFilters; resumeAt: RotateResumeAt };
+  | { kind: "rotate"; filters: RotateFilters; resumeAt: RotateResumeAt }
+  | {
+      kind: "bulkRevoke";
+      remainingIds: string[];
+      outcomesSoFar: Record<string, BulkOutcome>;
+    };
 
 type ModalState =
   | { kind: "none" }
@@ -56,7 +66,14 @@ type ModalState =
   | { kind: "rotateFilter"; initial: RotateFilters }
   | { kind: "rotatePreview"; filters: RotateFilters; data: RotatePreview }
   | { kind: "rotateDryRun"; filters: RotateFilters; data: RotateDryRun }
-  | { kind: "rotateReveal"; result: RotateResult };
+  | { kind: "rotateReveal"; result: RotateResult }
+  | { kind: "bulkRevokeConfirm"; tokens: TokenRow[] }
+  | {
+      kind: "bulkRevokeRunning";
+      tokens: TokenRow[];
+      outcomes: Record<string, BulkOutcome>;
+    }
+  | { kind: "bulkRevokeDone"; outcomes: Record<string, BulkOutcome> };
 
 type StatusFilter = "active" | "revoked" | "all";
 const STATUS_CYCLE: StatusFilter[] = ["active", "revoked", "all"];
@@ -112,6 +129,10 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
   const [modal, setModal] = useState<ModalState>({ kind: "none" });
   const [revokeConfirming, setRevokeConfirming] = useState(false);
   const [revokeError, setRevokeError] = useState<string | null>(null);
+  // c5b: multi-select state. Persists across status/query changes
+  // (web 4d invariant 2). Revoked rows are not selectable (4d invariant
+  // 1); the toggle helpers below enforce that.
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const focus = useFocusCapture();
 
   // The /-search input, detail panel, and any modal own stdin while
@@ -202,6 +223,58 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
     setModal({ kind: "rotateFilter", initial: {} });
   };
 
+  // c5b: selection helpers. Active-row-only guards enforce 4d invariant 1
+  // (revoked rows are not selectable) — both the toggle and the toggle-all
+  // refuse to add a revoked id.
+  const toggleSelection = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        const row = state.rows.find((r) => r.id === id);
+        if (row && !row.revoked) next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const toggleSelectAllVisibleActive = () => {
+    const visibleActive = filtered.filter((r) => !r.revoked).map((r) => r.id);
+    if (visibleActive.length === 0) return;
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      const allSelected = visibleActive.every((id) => next.has(id));
+      if (allSelected) {
+        for (const id of visibleActive) next.delete(id);
+      } else {
+        for (const id of visibleActive) next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const openBulkRevoke = () => {
+    // Resolve selection against the current (latest-fetched) rows. Any
+    // row revoked-since-selection drops out — the count shown in the
+    // confirm phase will reflect the actually-revokable set (web 4d
+    // invariant 1 maintained at the modal boundary too).
+    const tokens = state.rows.filter((r) => selectedIds.has(r.id) && !r.revoked);
+    if (tokens.length === 0) return;
+    if (!client.hasMgmtToken()) {
+      setModal({
+        kind: "mgmtPrompt",
+        pending: {
+          kind: "bulkRevoke",
+          remainingIds: tokens.map((t) => t.id),
+          outcomesSoFar: {},
+        },
+      });
+      return;
+    }
+    setModal({ kind: "bulkRevokeConfirm", tokens });
+  };
+
   const performRevoke = async (tokenId: string, label: string) => {
     setRevokeError(null);
     try {
@@ -238,6 +311,32 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
       // shortcut. The resumeAt field is preserved on the pending shape
       // for future-proofing / telemetry.
       setModal({ kind: "rotateFilter", initial: pending.filters });
+      return;
+    }
+    if (pending.kind === "bulkRevoke") {
+      // c5b: resume the loop with the un-attempted tail. We rebuild the
+      // tokens array against the *current* state.rows (a row revoked
+      // behind the scenes drops out — the loop would have hit
+      // alreadyRevoked anyway, but skipping it pre-auth is cleaner).
+      // outcomesSoFar carries forward so already-revoked rows render
+      // with their final badge alongside the resumed pending rows.
+      const tokens = state.rows.filter(
+        (r) => pending.remainingIds.includes(r.id) && !r.revoked,
+      );
+      if (tokens.length === 0) {
+        // Nothing left to attempt. If anything was attempted before
+        // the auth blew up, the running phase already fired onExecuted
+        // and TokensScreen refreshed. Drop the modal.
+        setModal({ kind: "none" });
+        return;
+      }
+      const outcomes: Record<string, BulkOutcome> = { ...pending.outcomesSoFar };
+      for (const t of tokens) {
+        if (!outcomes[t.id] || outcomes[t.id]?.kind !== "pending") {
+          outcomes[t.id] = { kind: "pending" };
+        }
+      }
+      setModal({ kind: "bulkRevokeRunning", tokens, outcomes });
       return;
     }
     // revoke: re-fire and clear modal. If it 401s again the screen will
@@ -280,6 +379,32 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
         // c5a: opens the 4-step rotate ceremony.
         openRotate();
         return;
+      }
+      // c5b: selection + bulk revoke. Order matters here:
+      //   space → toggle cursor row (only if it's an active row)
+      //   a     → toggle all visible-active
+      //   X     → open bulk revoke (only if selection non-empty)
+      //   Esc   → clear selection (only if non-empty, no detail/modal owns input)
+      if (input === " ") {
+        const row = filtered[cursor];
+        if (row && !row.revoked) toggleSelection(row.id);
+        return;
+      }
+      if (input === "a") {
+        toggleSelectAllVisibleActive();
+        return;
+      }
+      if (input === "X") {
+        if (selectedIds.size > 0) openBulkRevoke();
+        return;
+      }
+      if (key.escape) {
+        if (selectedIds.size > 0) {
+          setSelectedIds(new Set());
+          return;
+        }
+        // Fall through — no other Esc handler at the default-state level
+        // today (detail / modal / search own their own Esc).
       }
       if (key.upArrow) {
         setCursor((n) => Math.max(0, n - 1));
@@ -344,7 +469,7 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
         lastRefresh={lastRefresh}
       />
       {state.error ? <ErrorBanner message={`/tokens failed: ${state.error}`} /> : null}
-      <FilterBar status={status} query={query} />
+      <FilterBar status={status} query={query} selectedCount={selectedIds.size} />
       {searchMode ? (
         <SearchInput
           value={searchDraft}
@@ -357,8 +482,13 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
           onCancel={() => setSearchMode(false)}
         />
       ) : null}
-      <TokenTable rows={filtered} cursor={cursor} loading={state.loading} />
-      <HotkeyHint />
+      <TokenTable
+        rows={filtered}
+        cursor={cursor}
+        loading={state.loading}
+        selectedIds={selectedIds}
+      />
+      <HotkeyHint selectedCount={selectedIds.size} />
       {revokeError ? (
         <Box borderStyle="single" borderColor="red" paddingX={1}>
           <Text color="red">revoke failed: {revokeError}</Text>
@@ -422,6 +552,38 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
           onExecuted={() => setRefreshTick((n) => n + 1)}
         />
       ) : null}
+      {modal.kind === "bulkRevokeConfirm" ||
+      modal.kind === "bulkRevokeRunning" ||
+      modal.kind === "bulkRevokeDone" ? (
+        <BulkRevokeFlow
+          client={client}
+          phase={modalToBulkPhase(modal)}
+          onTransition={(next: BulkPhase) => setModal(bulkPhaseToModal(next))}
+          onClose={() => {
+            // c5b: clear any rows we attempted from the selection so the
+            // operator's selection set tracks reality. Anything that
+            // stayed `pending` (e.g. they Esc'd a mid-batch mgmt prompt)
+            // remains selected — re-opening bulk revoke will re-target
+            // them, which is the intended affordance.
+            const attempted = computeAttemptedIds(modal);
+            if (attempted.size > 0) {
+              setSelectedIds((prev) => {
+                const next = new Set(prev);
+                for (const id of attempted) next.delete(id);
+                return next;
+              });
+            }
+            setModal({ kind: "none" });
+          }}
+          onNeedsAuth={(remainingIds, outcomesSoFar) =>
+            setModal({
+              kind: "mgmtPrompt",
+              pending: { kind: "bulkRevoke", remainingIds, outcomesSoFar },
+            })
+          }
+          onExecuted={() => setRefreshTick((n) => n + 1)}
+        />
+      ) : null}
     </Box>
   );
 }
@@ -443,6 +605,41 @@ function rotateStepToModal(step: RotateStep): ModalState {
   if (step.kind === "dryRun")
     return { kind: "rotateDryRun", filters: step.filters, data: step.data };
   return { kind: "rotateReveal", result: step.result };
+}
+
+function modalToBulkPhase(modal: ModalState): BulkPhase {
+  if (modal.kind === "bulkRevokeConfirm")
+    return { kind: "confirm", tokens: modal.tokens };
+  if (modal.kind === "bulkRevokeRunning")
+    return { kind: "running", tokens: modal.tokens, outcomes: modal.outcomes };
+  if (modal.kind === "bulkRevokeDone")
+    return { kind: "done", outcomes: modal.outcomes };
+  throw new Error(`unreachable: modal.kind=${modal.kind}`);
+}
+
+function bulkPhaseToModal(phase: BulkPhase): ModalState {
+  if (phase.kind === "confirm")
+    return { kind: "bulkRevokeConfirm", tokens: phase.tokens };
+  if (phase.kind === "running")
+    return {
+      kind: "bulkRevokeRunning",
+      tokens: phase.tokens,
+      outcomes: phase.outcomes,
+    };
+  return { kind: "bulkRevokeDone", outcomes: phase.outcomes };
+}
+
+function computeAttemptedIds(modal: ModalState): Set<string> {
+  // The set of token ids that the bulk flow already touched (revoked,
+  // already-revoked, or failed). Used to clear the operator's selection
+  // on bulk-flow close so they don't see stale checkmarks.
+  const ids = new Set<string>();
+  if (modal.kind === "bulkRevokeRunning" || modal.kind === "bulkRevokeDone") {
+    for (const [id, outcome] of Object.entries(modal.outcomes)) {
+      if (outcome.kind !== "pending") ids.add(id);
+    }
+  }
+  return ids;
 }
 
 function Header({
@@ -477,15 +674,30 @@ function ErrorBanner({ message }: { message: string }) {
   );
 }
 
-function FilterBar({ status, query }: { status: StatusFilter; query: string }) {
+function FilterBar({
+  status,
+  query,
+  selectedCount,
+}: {
+  status: StatusFilter;
+  query: string;
+  selectedCount: number;
+}) {
   // Persistent filter status line — the discoverability mitigation for
   // the hidden single-key cycle (decision doc, c2 filter focus model).
+  // c5b: surfaces the selection count when non-zero so the operator
+  // sees they have rows armed for bulk revoke even after filter toggles.
   return (
     <Box flexDirection="row" gap={2}>
       <Text color="gray">
         filter: <Text bold color={status === "all" ? "white" : status === "revoked" ? "red" : "cyan"}>{status}</Text>
         {"  "}
         search: <Text bold color="white">{query.length > 0 ? `"${query}"` : "—"}</Text>
+        {selectedCount > 0 ? (
+          <>
+            {"  "}selected: <Text bold color="yellow">{selectedCount}</Text>
+          </>
+        ) : null}
       </Text>
     </Box>
   );
@@ -517,17 +729,31 @@ function SearchInput({
   );
 }
 
-function HotkeyHint() {
+function HotkeyHint({ selectedCount }: { selectedCount: number }) {
   return (
-    <Box>
+    <Box flexDirection="column">
       <Text color="gray">
         <Text color="white">↑↓</Text> move  <Text color="white">Enter</Text> detail  <Text color="white">f</Text> filter  <Text color="white">/</Text> search  <Text color="white">c</Text> clear  <Text color="white">r</Text> refresh  <Text color="white">i</Text> issue  <Text color="red">R</Text> rotate
+      </Text>
+      <Text color="gray">
+        <Text color="white">space</Text> select  <Text color="white">a</Text> all-visible
+        {selectedCount > 0 ? (
+          <>
+            {"  "}<Text color="red" bold>X</Text> <Text color="yellow">revoke·{selectedCount}</Text>{"  "}<Text color="white">Esc</Text> clear
+          </>
+        ) : null}
       </Text>
     </Box>
   );
 }
 
+// c5b: leading `select` column at width 4 — `[x] ` selected, `[ ] `
+// selectable, `    ` (4-space spacer) for revoked rows (4d invariant 1:
+// revoked rows are not selectable, render as blank spacer rather than a
+// disabled checkbox). Glyphs are ASCII (`[x]`) intentionally — unicode
+// checkmark glyphs render unreliably across Windows terminal codepages.
 const COL = {
+  select: 4,
   marker: 2,
   label: 22,
   id: 14,
@@ -541,10 +767,12 @@ function TokenTable({
   rows,
   cursor,
   loading,
+  selectedIds,
 }: {
   rows: TokenRow[];
   cursor: number;
   loading: boolean;
+  selectedIds: Set<string>;
 }) {
   return (
     <Box flexDirection="column" borderStyle="single" borderColor="gray" paddingX={1}>
@@ -554,7 +782,14 @@ function TokenTable({
       ) : rows.length === 0 ? (
         <Text color="gray">no tokens match the current filter</Text>
       ) : (
-        rows.map((r, i) => <TokenLine key={r.id} row={r} active={i === cursor} />)
+        rows.map((r, i) => (
+          <TokenLine
+            key={r.id}
+            row={r}
+            active={i === cursor}
+            selected={selectedIds.has(r.id)}
+          />
+        ))
       )}
     </Box>
   );
@@ -564,6 +799,7 @@ function TokenHeaderRow() {
   return (
     <Box>
       <Text color="gray" dimColor>
+        {" ".padEnd(COL.select)}
         {" ".padEnd(COL.marker)}
         {"LABEL".padEnd(COL.label)}
         {"ID".padEnd(COL.id)}
@@ -590,12 +826,24 @@ function spendSummary(r: TokenRow): string {
   return fmtUsd(r.spendUsd);
 }
 
-function TokenLine({ row, active }: { row: TokenRow; active: boolean }) {
+function TokenLine({
+  row,
+  active,
+  selected,
+}: {
+  row: TokenRow;
+  active: boolean;
+  selected: boolean;
+}) {
   const marker = active ? "> " : "  ";
   const labelColor = row.revoked ? "gray" : active ? "cyan" : "white";
   const overCap = row.capUsd !== undefined && row.spendUsd > row.capUsd;
+  // 4d invariant 1: revoked rows get blank spacer, never a disabled box.
+  const selectGlyph = row.revoked ? "    " : selected ? "[x] " : "[ ] ";
+  const selectColor = row.revoked ? "gray" : selected ? "cyan" : "gray";
   return (
     <Box>
+      <Text color={selectColor} bold={selected}>{selectGlyph}</Text>
       <Text color={active ? "cyan" : "gray"}>{marker}</Text>
       <Text color={labelColor} bold={active}>
         {truncate(row.label, COL.label)}

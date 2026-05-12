@@ -54,6 +54,15 @@ export function HelpOverlay() {
           filter → preview → dryRun (<Text color="yellow">x</Text> arms · <Text color="yellow">y</Text> fires) → reveal. Lowercase = read, capital = destructive.
         </Text>
       </Box>
+      <Box marginTop={1} flexDirection="column">
+        <Text color="gray">Tokens admin (c5b):</Text>
+        <Text>
+          <Text color="yellow">space</Text> toggle row  ·  <Text color="yellow">a</Text> toggle-all-visible  ·  <Text color="red">X</Text> bulk revoke (when N&gt;0)  ·  <Text color="yellow">Esc</Text> clear selection
+        </Text>
+        <Text color="gray" dimColor>
+          Selection persists across filter/search changes. Revoked rows are not selectable. Bulk revoke runs sequential DELETEs; mid-batch auth abandons rest.
+        </Text>
+      </Box>
       <Box marginTop={1}>
         <Text color="gray">press ? or Esc to dismiss</Text>
       </Box>
