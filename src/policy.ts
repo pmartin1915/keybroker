@@ -88,7 +88,10 @@ export interface VerifyConfig {
 const DEFAULT_VERIFY: VerifyConfig = {
   enabled: true,
   on_failure: "block",
-  detectors: ["github_pat", "stripe_live_key"],
+  // Phase 4.2c: aws_access_key added. Layer 2 verification fires only when
+  // the scanner also extracted the paired secret access key within the
+  // proximity window; AKIA-only hits short-circuit to scan_verified=null.
+  detectors: ["github_pat", "stripe_live_key", "aws_access_key"],
 };
 
 /**
@@ -227,12 +230,12 @@ export function verifyConfigFromRaw(v: unknown): VerifyConfig {
   // Warn on unknown detector names in the verify allow-list, same as
   // the Layer 1 resolveDetectors pattern.
   if (Array.isArray(obj.detectors)) {
-    const KNOWN = new Set(["github_pat", "stripe_live_key"]);
+    const KNOWN = new Set(["github_pat", "stripe_live_key", "aws_access_key"]);
     const unknown = (detectors as string[]).filter((d) => !KNOWN.has(d));
     if (unknown.length > 0) {
       console.warn(
         `keybroker: scanner.verify.detectors references unknown verifier(s): ${unknown.join(", ")}. ` +
-          `Known verifiable detectors: github_pat, stripe_live_key.`,
+          `Known verifiable detectors: github_pat, stripe_live_key, aws_access_key.`,
       );
     }
   }

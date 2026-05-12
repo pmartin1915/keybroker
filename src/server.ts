@@ -849,10 +849,15 @@ export async function buildServer(
         let verifyResult: VerifyResult | undefined;
         const verifySecret = scanHit.matched;
         if (verifySecret !== undefined) {
+          // Phase 4.2c: pass the paired secret access key (set only on
+          // aws_access_key hits where the proximity window matched).
+          // For single-evidence detectors `matched_secondary` is undefined
+          // and the dispatcher ignores it.
           verifyResult = await dispatchVerify(
             scanHit.detector,
             verifySecret,
             policy.scanner.verify,
+            scanHit.matched_secondary,
           );
           // fail-allow path: on_failure="allow" AND verifier threw transiently.
           // The request is allowed through rather than blocked.

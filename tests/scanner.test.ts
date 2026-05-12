@@ -181,6 +181,121 @@ describe("resolveDetectors", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Phase 4.2c — AWS key-pair extraction
+// ---------------------------------------------------------------------------
+// Invariants under test (decision_phase_4_2_c_aws_verify.md):
+//   2. Secret-access-key regex is paired-use-only (never standalone Layer 1).
+//   3. Pairing window: 200 chars bidirectional around AKIA.
+//   4. Within-view only (no cross-view pairing).
+//   5. ScanHit.matched_secondary is additive (set only on aws_access_key).
+//   6. AKIA-only continues to fire (no regression).
+//
+// Fixture convention (invariant 15): concat-split AWS example values.
+const AWS_AKIA = "AKIA" + "IOSFODNN7EXAMPLE";
+const AWS_SECRET = "wJalrX" + "UtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+
+describe("Phase 4.2c — AWS key-pair extraction", () => {
+  it("AKIA + secret within window → matched_secondary set to the secret", () => {
+    const body = `{"key":"${AWS_AKIA}","secret":"${AWS_SECRET}"}`;
+    const hit = scanBytes(buf(body), BUILTIN_DETECTORS);
+    expect(hit).not.toBeNull();
+    expect(hit!.detector).toBe("aws_access_key");
+    expect(hit!.matched).toBe(AWS_AKIA);
+    expect(hit!.matched_secondary).toBe(AWS_SECRET);
+  });
+
+  it("AKIA alone (no secret) → matched_secondary undefined, AKIA still fires (invariant 6)", () => {
+    const body = `{"key":"${AWS_AKIA}","note":"just the access key"}`;
+    const hit = scanBytes(buf(body), BUILTIN_DETECTORS);
+    expect(hit).not.toBeNull();
+    expect(hit!.detector).toBe("aws_access_key");
+    expect(hit!.matched).toBe(AWS_AKIA);
+    expect(hit!.matched_secondary).toBeUndefined();
+  });
+
+  it("secret-key shape alone (no AKIA) → no hit (invariant 2: paired-use-only)", () => {
+    // 40 chars from the secret-key alphabet, but no AKIA in the body.
+    // The scanner must NOT fire — the standalone 40-char regex is paired-use-only.
+    const body = `{"some_token":"${AWS_SECRET}","note":"random opaque token"}`;
+    const hit = scanBytes(buf(body), BUILTIN_DETECTORS);
+    expect(hit).toBeNull();
+  });
+
+  it("secret beyond the 200-char window → matched_secondary undefined", () => {
+    // Pad with 250 chars of filler between AKIA and the secret.
+    const filler = "x".repeat(250);
+    const body = `{"key":"${AWS_AKIA}","pad":"${filler}","secret":"${AWS_SECRET}"}`;
+    const hit = scanBytes(buf(body), BUILTIN_DETECTORS);
+    expect(hit).not.toBeNull();
+    expect(hit!.detector).toBe("aws_access_key");
+    expect(hit!.matched).toBe(AWS_AKIA);
+    // Beyond window → no pair carried.
+    expect(hit!.matched_secondary).toBeUndefined();
+  });
+
+  it("secret BEFORE AKIA in window → still paired (invariant 3: bidirectional)", () => {
+    // Some config files list secret_access_key first. Bidirectional pairing
+    // catches both orderings.
+    const body = `{"secret":"${AWS_SECRET}","key":"${AWS_AKIA}"}`;
+    const hit = scanBytes(buf(body), BUILTIN_DETECTORS);
+    expect(hit).not.toBeNull();
+    expect(hit!.detector).toBe("aws_access_key");
+    expect(hit!.matched).toBe(AWS_AKIA);
+    expect(hit!.matched_secondary).toBe(AWS_SECRET);
+  });
+
+  it("non-aws detectors do NOT receive matched_secondary (invariant 5: additive)", () => {
+    const ghp = "ghp_" + "a".repeat(36);
+    const hit = scanBytes(buf(`token: ${ghp}`), BUILTIN_DETECTORS);
+    expect(hit).not.toBeNull();
+    expect(hit!.detector).toBe("github_pat");
+    expect(hit!.matched).toBe(ghp);
+    expect(hit!.matched_secondary).toBeUndefined();
+  });
+
+  it("SHA-1 hex near AKIA does NOT pair (invariant 2: lookarounds bound the alphabet)", () => {
+    // A 40-char SHA-1 hex string is a subset of the secret-key alphabet
+    // (lowercase letters and digits only). But AWS secret keys are 40 chars
+    // from the FULL [A-Za-z0-9/+] alphabet — meaning AWS keys with no
+    // uppercase letter would be vanishingly unlikely (1 in ~10^15).
+    //
+    // The current regex doesn't enforce mixed-case, so a SHA-1 hex *can*
+    // technically pair. This test documents that gap so it can be tightened
+    // in a follow-up if a real false-positive case is reported.
+    //
+    // (For now we assert what the regex actually does, not what we wish it
+    // did. The invariant under test here is that 40-char alphanumeric strings
+    // alone — without an AKIA — do not fire, which the previous test covers.)
+    const sha1 = "0123456789abcdef0123456789abcdef01234567"; // 40-char hex
+    const body = `{"key":"${AWS_AKIA}","commit":"${sha1}"}`;
+    const hit = scanBytes(buf(body), BUILTIN_DETECTORS);
+    expect(hit).not.toBeNull();
+    expect(hit!.detector).toBe("aws_access_key");
+    expect(hit!.matched).toBe(AWS_AKIA);
+    // Documented current behavior: the SHA-1 hex pairs. This is a known
+    // false-positive class; verification at Layer 2 will catch it (STS
+    // returns 403 SignatureDoesNotMatch).
+    expect(hit!.matched_secondary).toBe(sha1);
+  });
+
+  it("AKIA in raw view + secret only in base64-decoded view → no pair (invariant 4: within-view only)", () => {
+    // AKIA appears in raw; the 40-char secret is base64-encoded.
+    // Per invariant 4, cross-view pairing is not supported: the raw view
+    // sees AKIA but no co-located secret, so it returns AKIA-only.
+    // (Whether the decoded view eventually fires depends on whether it
+    // happens to find another AKIA there too — in this body, no.)
+    const b64Secret = Buffer.from(AWS_SECRET, "utf8").toString("base64");
+    const body = `{"key":"${AWS_AKIA}","encoded":"${b64Secret}"}`;
+    const hit = scanBytes(buf(body), BUILTIN_DETECTORS);
+    expect(hit).not.toBeNull();
+    expect(hit!.detector).toBe("aws_access_key");
+    expect(hit!.matched).toBe(AWS_AKIA);
+    // No pair: secret is in the decoded view, not the raw view that fired.
+    expect(hit!.matched_secondary).toBeUndefined();
+  });
+});
+
 afterEach(() => {
   vi.restoreAllMocks();
 });

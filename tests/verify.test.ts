@@ -46,6 +46,7 @@ import { join } from "node:path";
 import {
   verifyGithubPat,
   verifyStripeLiveKey,
+  verifyAwsKeyPair,
   dispatchVerify,
   _resetVerifyCache,
   type VerifyConfig,
@@ -60,6 +61,21 @@ import { SqliteStore } from "../src/store-sqlite.js";
 const GHP_TOKEN = "ghp_" + "a".repeat(36);
 // Stripe live key: "sk_live_" prefix + <24+chars>.
 const SK_LIVE_TOKEN = "sk_live_" + "abcDEF1234567890abcDEF1234";
+// AWS docs example pair (concat-split, invariant 15).
+const AWS_AKIA = "AKIA" + "IOSFODNN7EXAMPLE";
+const AWS_SECRET = "wJalrX" + "UtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+
+// Phase 4.2c — verify config with the AWS detector included.
+const VERIFY_AWS_BLOCK: VerifyConfig = {
+  enabled: true,
+  on_failure: "block",
+  detectors: ["github_pat", "stripe_live_key", "aws_access_key"],
+};
+const VERIFY_AWS_ALLOW: VerifyConfig = {
+  enabled: true,
+  on_failure: "allow",
+  detectors: ["github_pat", "stripe_live_key", "aws_access_key"],
+};
 
 // Default verify configs for convenience.
 const VERIFY_ENABLED_BLOCK: VerifyConfig = {
@@ -349,7 +365,11 @@ describe("dispatchVerify — allow-list", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("13b. aws_access_key (not in default allow-list) returns verified=null", async () => {
+  it("13b. aws_access_key not in this fixture's allow-list returns verified=null", async () => {
+    // NB: Phase 4.2c added aws_access_key to DEFAULT_VERIFY.detectors, but
+    // VERIFY_ENABLED_BLOCK is a hand-crafted test config that excludes it.
+    // This test asserts allow-list filtering still gates the detector
+    // regardless of what the runtime default happens to be.
     mockFetch(200);
     const fetchMock = vi.mocked(global.fetch);
     const r = await dispatchVerify("aws_access_key", "AKIAIOSFODNN7EXAMPLE", VERIFY_ENABLED_BLOCK);
@@ -560,5 +580,189 @@ describe("no secret leak (test 18)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4.2c — AWS verifier + dispatcher pair-handling
+// ---------------------------------------------------------------------------
+describe("verifyAwsKeyPair", () => {
+  it("19a. returns 1 for HTTP 200 (live key pair)", async () => {
+    mockFetch(200);
+    await expect(verifyAwsKeyPair(AWS_AKIA, AWS_SECRET)).resolves.toBe(1);
+  });
+
+  it("19b. returns 0 for HTTP 403 (invalid pair / disabled key)", async () => {
+    mockFetch(403);
+    await expect(verifyAwsKeyPair(AWS_AKIA, AWS_SECRET)).resolves.toBe(0);
+  });
+
+  it("19c. throws on HTTP 503 (transient — dispatcher applies fail-policy)", async () => {
+    mockFetch(503);
+    await expect(verifyAwsKeyPair(AWS_AKIA, AWS_SECRET)).rejects.toThrow(
+      "aws_access_key verify: unexpected HTTP 503",
+    );
+  });
+
+  it("19d. POSTs to https://sts.amazonaws.com/ with GetCallerIdentity body and signed Authorization", async () => {
+    mockFetch(200);
+    const fetchMock = vi.mocked(global.fetch);
+    await verifyAwsKeyPair(AWS_AKIA, AWS_SECRET);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("https://sts.amazonaws.com/");
+    expect((init as RequestInit).method).toBe("POST");
+    const body = (init as RequestInit).body as string;
+    expect(body).toBe("Action=GetCallerIdentity&Version=2011-06-15");
+    const headers = (init as RequestInit).headers as Record<string, string>;
+    expect(headers["Authorization"]).toMatch(/^AWS4-HMAC-SHA256 /);
+    expect(headers["Authorization"]).toContain(`Credential=${AWS_AKIA}/`);
+    expect(headers["X-Amz-Date"]).toMatch(/^\d{8}T\d{6}Z$/);
+  });
+});
+
+describe("dispatchVerify — AWS pair handling", () => {
+  it("19e. AKIA-only (no secondary) → verified=null, NO fetch call (invariant 12)", async () => {
+    mockFetch(200);
+    const fetchMock = vi.mocked(global.fetch);
+    const r = await dispatchVerify("aws_access_key", AWS_AKIA, VERIFY_AWS_BLOCK);
+    expect(r.verified).toBeNull();
+    expect(r.latencyMs).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("19f. AKIA + secret + STS 200 → verified=1", async () => {
+    mockFetch(200);
+    const r = await dispatchVerify(
+      "aws_access_key",
+      AWS_AKIA,
+      VERIFY_AWS_BLOCK,
+      AWS_SECRET,
+    );
+    expect(r.verified).toBe(1);
+    expect(r.latencyMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("19g. AKIA + secret + STS 403 → verified=0 (invalid pair caught by Layer 2)", async () => {
+    mockFetch(403);
+    const r = await dispatchVerify(
+      "aws_access_key",
+      AWS_AKIA,
+      VERIFY_AWS_BLOCK,
+      AWS_SECRET,
+    );
+    expect(r.verified).toBe(0);
+  });
+
+  it("19h. fail-closed: transient + on_failure=block → verified=0", async () => {
+    mockFetch(503);
+    const r = await dispatchVerify(
+      "aws_access_key",
+      AWS_AKIA,
+      VERIFY_AWS_BLOCK,
+      AWS_SECRET,
+    );
+    expect(r.verified).toBe(0);
+    expect(r.allow).toBeFalsy();
+  });
+
+  it("19i. fail-allow: transient + on_failure=allow → allow=true, warning emitted", async () => {
+    mockFetch(503);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const r = await dispatchVerify(
+      "aws_access_key",
+      AWS_AKIA,
+      VERIFY_AWS_ALLOW,
+      AWS_SECRET,
+    );
+    expect(r.allow).toBe(true);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const msg = warnSpy.mock.calls[0]![0] as string;
+    expect(msg).toContain("detector=aws_access_key");
+    // Neither half of the pair must leak.
+    expect(msg).not.toContain(AWS_AKIA);
+    expect(msg).not.toContain(AWS_SECRET);
+  });
+
+  it("19j. cache key mixes the pair: same pair cached, rotating secret busts (invariant 7)", async () => {
+    mockFetch(200);
+    const fetchMock = vi.mocked(global.fetch);
+
+    // First call: AKIA + secret. Should call fetch once.
+    const r1 = await dispatchVerify(
+      "aws_access_key",
+      AWS_AKIA,
+      VERIFY_AWS_BLOCK,
+      AWS_SECRET,
+    );
+    expect(r1.verified).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Second call: same pair. Cache hit — no second fetch.
+    const r2 = await dispatchVerify(
+      "aws_access_key",
+      AWS_AKIA,
+      VERIFY_AWS_BLOCK,
+      AWS_SECRET,
+    );
+    expect(r2.verified).toBe(1);
+    expect(r2.latencyMs).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Third call: same AKIA, ROTATED secret (one char differs).
+    // Cache key is sha256(akia + ":" + secret) so this must miss the cache
+    // and re-call fetch.
+    const rotated = AWS_SECRET.replace(/Y$/, "Z");
+    const r3 = await dispatchVerify(
+      "aws_access_key",
+      AWS_AKIA,
+      VERIFY_AWS_BLOCK,
+      rotated,
+    );
+    expect(r3.verified).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("19k. matched_secondary bytes never appear verbatim in the outbound fetch (only the signed signature is sent)", async () => {
+    mockFetch(200);
+    const fetchMock = vi.mocked(global.fetch);
+    await dispatchVerify(
+      "aws_access_key",
+      AWS_AKIA,
+      VERIFY_AWS_BLOCK,
+      AWS_SECRET,
+    );
+
+    const [, init] = fetchMock.mock.calls[0]!;
+    const allBytes =
+      (init as RequestInit).body +
+      " " +
+      JSON.stringify((init as RequestInit).headers);
+    // The secret access key must NOT appear verbatim — only its
+    // signature-derived HMAC chain output.
+    expect(allBytes).not.toContain(AWS_SECRET);
+    // The access key ID is allowed (it's in the Credential= field per spec).
+    expect(allBytes).toContain(AWS_AKIA);
+  });
+
+  it("19l. AKIA-only cache: nothing is cached when secondary is missing", async () => {
+    mockFetch(200);
+    const fetchMock = vi.mocked(global.fetch);
+
+    // First call: AKIA-only → verified=null, no cache write.
+    await dispatchVerify("aws_access_key", AWS_AKIA, VERIFY_AWS_BLOCK);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // Second call: AKIA + secret. The earlier AKIA-only call must NOT have
+    // poisoned the cache (different identity), so this DOES call fetch.
+    const r = await dispatchVerify(
+      "aws_access_key",
+      AWS_AKIA,
+      VERIFY_AWS_BLOCK,
+      AWS_SECRET,
+    );
+    expect(r.verified).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

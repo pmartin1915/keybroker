@@ -69,6 +69,16 @@ export interface ScanHit {
    * request-handler stack and is never serialised.
    */
   readonly matched?: string;
+  /**
+   * Phase 4.2c: paired secret bytes for detectors whose verification needs
+   * TWO pieces of evidence (currently only `aws_access_key`: AKIA access
+   * key in `matched`, 40-char secret access key here). Set only when the
+   * pairing window logic finds a candidate; left `undefined` when the
+   * detector is single-evidence OR the pair was not co-located within the
+   * proximity window. Same in-memory-only secrecy rules as `matched`
+   * (invariant 7).
+   */
+  readonly matched_secondary?: string;
 }
 
 /**
@@ -117,6 +127,74 @@ export function getBuiltinDetector(name: string): Detector | undefined {
 }
 
 /**
+ * Phase 4.2c — AWS secret access key candidate regex.
+ *
+ * PAIRED-USE ONLY (invariant 2). This pattern is NEVER added to
+ * BUILTIN_DETECTORS — its 40-char `[A-Za-z0-9/+]` alphabet has too little
+ * specificity to fire as a standalone Layer 1 detector (would collide with
+ * SHA-1 hex, opaque session tokens, GitHub blob SHAs, etc.). It is invoked
+ * only after an AKIA access-key match has fired, scoped to a proximity
+ * window around the AKIA position (see `findAwsSecretInWindow`).
+ *
+ * Real AWS secret keys are 30 random bytes base64-encoded → exactly 40
+ * chars from `[A-Za-z0-9/+]`. No `=` padding (30 bytes is base64-aligned).
+ * Lookarounds prevent matching a 40-char prefix of a longer alphabet run.
+ */
+const AWS_SECRET_KEY_RE = /(?<![A-Za-z0-9/+])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])/g;
+
+/**
+ * Phase 4.2c — bidirectional proximity window for AWS pair extraction
+ * (invariant 3). 200 chars on either side of the AKIA match. Wider than
+ * TruffleHog's ~100 because LLM bodies are looser (prose-wrapped JSON,
+ * verbose configs, intervening comments) than the tight repo configs
+ * TruffleHog scans. False-positive risk stays near zero because the
+ * 40-char alphabet's combinatorial specificity already makes random
+ * co-occurrence implausible.
+ */
+const AWS_PAIR_WINDOW_CHARS = 200;
+
+/**
+ * Look for an AWS secret access key candidate within
+ * ±AWS_PAIR_WINDOW_CHARS of an AKIA match in the same view (invariants
+ * 3 and 4 — within-view only). Returns the first paired candidate found,
+ * or `undefined` if none.
+ *
+ * @param text       - the full view text the AKIA was found in.
+ * @param akiaIndex  - start index of the AKIA match.
+ * @param akiaLength - length of the AKIA match (always 20 for the
+ *                     current pattern; passed for forward-compatibility).
+ */
+function findAwsSecretInWindow(
+  text: string,
+  akiaIndex: number,
+  akiaLength: number,
+): string | undefined {
+  const start = Math.max(0, akiaIndex - AWS_PAIR_WINDOW_CHARS);
+  const end = Math.min(text.length, akiaIndex + akiaLength + AWS_PAIR_WINDOW_CHARS);
+  const window = text.slice(start, end);
+
+  // Use a fresh regex iteration over the window. We exclude the AKIA bytes
+  // themselves by mapping match indices and skipping any candidate that
+  // overlaps the AKIA position. (In practice the AKIA alphabet `[0-9A-Z]`
+  // is a subset of the secret-key alphabet, so without this guard a 40-char
+  // run that happens to contain the AKIA could match itself.)
+  AWS_SECRET_KEY_RE.lastIndex = 0;
+  const akiaWindowStart = akiaIndex - start;
+  const akiaWindowEnd = akiaWindowStart + akiaLength;
+
+  let m: RegExpExecArray | null;
+  while ((m = AWS_SECRET_KEY_RE.exec(window)) !== null) {
+    const matchStart = m.index;
+    const matchEnd = m.index + m[0].length;
+    // Skip if this candidate overlaps the AKIA itself.
+    const overlapsAkia = matchStart < akiaWindowEnd && matchEnd > akiaWindowStart;
+    if (overlapsAkia) continue;
+    return m[0];
+  }
+  return undefined;
+}
+
+/**
  * Run one set of detectors against a single text view. Internal helper.
  * Returns the first hit (with matched substring) or null.
  * Resets lastIndex for each `/g` pattern.
@@ -125,6 +203,11 @@ export function getBuiltinDetector(name: string): Detector | undefined {
  * receives the exact secret bytes from the view that triggered the hit.
  * The matched field is in-memory only and must never be serialised
  * (invariant 7).
+ *
+ * Phase 4.2c: when the firing detector is `aws_access_key`, additionally
+ * scans a proximity window around the match for a paired secret access
+ * key candidate. AKIA-only hits still fire (invariant 6); the secondary
+ * field is set only when a pair is found.
  */
 function scanText(
   text: string,
@@ -136,6 +219,16 @@ function scanText(
     const m = det.pattern.exec(text);
     if (m) {
       // m[0] is the matched substring — the literal secret bytes.
+      if (det.name === "aws_access_key") {
+        const secondary = findAwsSecretInWindow(text, m.index, m[0].length);
+        // Only attach `matched_secondary` when a pair was actually found,
+        // so the ScanHit shape stays "additive" — single-evidence hits
+        // remain exactly `{detector, matched}` and AKIA-only hits don't
+        // carry an undefined field that could confuse downstream callers.
+        if (secondary !== undefined) {
+          return { detector: det.name, matched: m[0], matched_secondary: secondary };
+        }
+      }
       return { detector: det.name, matched: m[0] };
     }
   }

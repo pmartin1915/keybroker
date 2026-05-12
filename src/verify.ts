@@ -30,6 +30,8 @@
 
 import { createHash } from "node:crypto";
 
+import { signStsPostRequest } from "./sigv4.js";
+
 // TODO: import VERSION from package.json when a version shim exists.
 // For now, hardcoded to match package.json "version" field.
 const VERSION = "0.1.0";
@@ -54,12 +56,29 @@ export function _resetVerifyCache(): void {
 const CACHE_TTL_MS = 60_000;
 const VERIFY_TIMEOUT_MS = 2_500;
 
-function cacheKey(secret: string): string {
-  return createHash("sha256").update(secret, "utf8").digest("hex");
+/**
+ * Hash the cache identity. For single-secret detectors the input is the
+ * secret itself; for paired detectors (aws_access_key) the input mixes the
+ * access key and the secret access key so that rotating either half busts
+ * the cache entry. See `cacheIdentity`.
+ */
+function cacheKey(identity: string): string {
+  return createHash("sha256").update(identity, "utf8").digest("hex");
 }
 
-function getCached(secret: string): CacheEntry | undefined {
-  const key = cacheKey(secret);
+/**
+ * Phase 4.2c — build the cache-key input for a verify attempt. Single-
+ * secret detectors hash just the secret; aws_access_key mixes both halves
+ * of the pair so that the cached verification is invalidated whenever
+ * either half rotates (invariant 7).
+ */
+function cacheIdentity(secret: string, secondary: string | undefined): string {
+  if (secondary === undefined) return secret;
+  return `${secret}:${secondary}`;
+}
+
+function getCached(identity: string): CacheEntry | undefined {
+  const key = cacheKey(identity);
   const entry = _verifyCache.get(key);
   if (!entry) return undefined;
   if (Date.now() >= entry.expiresAt) {
@@ -69,8 +88,8 @@ function getCached(secret: string): CacheEntry | undefined {
   return entry;
 }
 
-function setCached(secret: string, verified: 0 | 1): void {
-  _verifyCache.set(cacheKey(secret), {
+function setCached(identity: string, verified: 0 | 1): void {
+  _verifyCache.set(cacheKey(identity), {
     verified,
     expiresAt: Date.now() + CACHE_TTL_MS,
   });
@@ -134,6 +153,50 @@ export async function verifyStripeLiveKey(secret: string): Promise<0 | 1> {
   );
 }
 
+/**
+ * Phase 4.2c — verify an AWS access-key / secret-access-key pair via STS
+ * GetCallerIdentity (invariants 8–10).
+ *
+ * Returns:
+ *   - `1` if STS returns 200 (the pair is live and valid).
+ *   - `0` if STS returns 403 (covers InvalidClientTokenId,
+ *     SignatureDoesNotMatch, disabled access key).
+ *   - Throws on any other status or network / timeout error.
+ *
+ * The STS global endpoint (`sts.amazonaws.com`, region us-east-1) accepts
+ * any active IAM credential regardless of caller home region (invariant 8),
+ * so no region discovery is needed.
+ */
+export async function verifyAwsKeyPair(
+  accessKey: string,
+  secretKey: string,
+): Promise<0 | 1> {
+  const body = "Action=GetCallerIdentity&Version=2011-06-15";
+  const signed = signStsPostRequest({
+    accessKeyId: accessKey,
+    secretAccessKey: secretKey,
+    region: "us-east-1",
+    service: "sts",
+    host: "sts.amazonaws.com",
+    body,
+    contentType: "application/x-www-form-urlencoded",
+  });
+
+  const res = await fetch(signed.url, {
+    method: signed.method,
+    headers: signed.headers,
+    body: signed.body,
+    signal: AbortSignal.timeout(VERIFY_TIMEOUT_MS),
+  });
+
+  if (res.status === 200) return 1;
+  if (res.status === 403) return 0;
+
+  throw new Error(
+    `aws_access_key verify: unexpected HTTP ${res.status}`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Dispatcher
 // ---------------------------------------------------------------------------
@@ -177,25 +240,34 @@ export interface VerifyResult {
  * Dispatch a verify call for the given detector and secret bytes.
  *
  * This is the single entry point for server.ts. It:
- *   1. Returns `{ verified: null, latencyMs: null }` if verify is disabled
- *      or the detector is not in the allow-list (invariant 10).
+ *   1. Returns `{ verified: null, latencyMs: null }` if verify is disabled,
+ *      the detector is not in the allow-list, OR the detector requires a
+ *      paired secret and `secondary` is missing (Phase 4.2c invariants
+ *      11–12: AKIA-only hits short-circuit to null with no network call).
  *   2. Checks the in-memory cache (sha256-keyed). Returns cached result if
- *      not expired.
+ *      not expired. For paired detectors the cache key mixes both halves
+ *      (invariant 7) so rotating either invalidates the entry.
  *   3. Calls the appropriate verifier with a 2.5s timeout.
  *   4. On 200 / 401 / 403: caches the result and returns it.
  *   5. On throw (timeout, 5xx, network): does NOT cache; applies on_failure.
  *      - on_failure="block": returns `{ verified: 0, latencyMs }`.
  *      - on_failure="allow": returns `{ verified: null, latencyMs, allow: true }`.
  *
- * @param detector - the detector name from the ScanHit.
- * @param secret   - the matched secret bytes from the view that fired the hit
- *                   (raw or decoded, per Phase 4.2a invariant 10 forward-pin).
- * @param cfg      - the parsed scanner.verify config from policy.json.
+ * @param detector  - the detector name from the ScanHit.
+ * @param secret    - the matched secret bytes from the view that fired the
+ *                    hit (raw or decoded, per Phase 4.2a invariant 10
+ *                    forward-pin). For aws_access_key this is the AKIA.
+ * @param cfg       - the parsed scanner.verify config from policy.json.
+ * @param secondary - Phase 4.2c: paired secret bytes for detectors whose
+ *                    verification needs two pieces of evidence. Currently
+ *                    used only by aws_access_key (the 40-char secret
+ *                    access key). Other detectors must pass undefined.
  */
 export async function dispatchVerify(
   detector: string,
   secret: string,
   cfg: VerifyConfig,
+  secondary?: string,
 ): Promise<VerifyResult> {
   const NULL_RESULT: VerifyResult = { verified: null, latencyMs: null };
 
@@ -203,8 +275,17 @@ export async function dispatchVerify(
   if (!cfg.enabled) return NULL_RESULT;
   if (!cfg.detectors.includes(detector)) return NULL_RESULT;
 
-  // Cache check.
-  const cached = getCached(secret);
+  // Phase 4.2c invariant 12: aws_access_key requires the paired secret.
+  // AKIA-only hits flow through with verified=null (no STS call attempted,
+  // no cache write). The Layer 1 block stands; verification simply didn't
+  // run for lack of evidence.
+  if (detector === "aws_access_key" && secondary === undefined) {
+    return NULL_RESULT;
+  }
+
+  // Cache check. Identity mixes both halves for paired detectors.
+  const identity = cacheIdentity(secret, secondary);
+  const cached = getCached(identity);
   if (cached !== undefined) {
     return { verified: cached.verified, latencyMs: null };
   }
@@ -213,8 +294,7 @@ export async function dispatchVerify(
   const verifier = VERIFIERS[detector];
   if (!verifier) {
     // Detector is in the allow-list but has no registered verifier function.
-    // This shouldn't happen with the two shipped detectors, but guards against
-    // future allow-list entries for unimplemented detectors.
+    // Guards against future allow-list entries for unimplemented detectors.
     return NULL_RESULT;
   }
 
@@ -222,10 +302,10 @@ export async function dispatchVerify(
   let latencyMs: number;
 
   try {
-    const result = await verifier(secret);
+    const result = await verifier(secret, secondary);
     latencyMs = Date.now() - t0;
     // Definitive answer (200 / 401 / 403) — cache it.
-    setCached(secret, result);
+    setCached(identity, result);
     return { verified: result, latencyMs };
   } catch {
     latencyMs = Date.now() - t0;
@@ -249,9 +329,20 @@ export async function dispatchVerify(
   }
 }
 
-// Registered verifiers keyed by detector name.
-const VERIFIERS: Record<string, (secret: string) => Promise<0 | 1>> = {
+/**
+ * Registered verifiers keyed by detector name. Signature accepts an
+ * optional `secondary` so paired detectors can use it; single-evidence
+ * verifiers ignore the second argument.
+ */
+const VERIFIERS: Record<
+  string,
+  (secret: string, secondary?: string) => Promise<0 | 1>
+> = {
   github_pat: verifyGithubPat,
   stripe_live_key: verifyStripeLiveKey,
-  // aws_access_key: deferred (invariant 2 — requires key-pair extraction).
+  // Phase 4.2c: aws_access_key uses the paired secret. The dispatcher
+  // guarantees `secondary` is defined before invoking this verifier (it
+  // short-circuits AKIA-only hits to verified=null above).
+  aws_access_key: (secret, secondary) =>
+    verifyAwsKeyPair(secret, secondary as string),
 };
