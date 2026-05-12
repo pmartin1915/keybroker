@@ -1,8 +1,7 @@
 # Handoff — Phase 4.1 c1 shipped (2026-05-11)
 
 You are the next instance. This session opened Phase 4.1 (TUI) with a
-scaffolding commit. Working tree is clean; commit `<sha-pending>` will be
-on `main` once it lands.
+scaffolding commit. Working tree is clean; commit `0aa6b66` is on `main`.
 
 **State at handoff:**
 - 607 tests pass (+6 from session start: `tests/tui-client.test.ts`).
