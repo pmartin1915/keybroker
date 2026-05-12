@@ -3,6 +3,7 @@ import { Box, Text, useApp, useInput } from "ink";
 import type { BrokerClient } from "./api/client.js";
 import { Dashboard } from "./components/Dashboard.js";
 import { TokensScreen } from "./components/TokensScreen.js";
+import { AuditScreen } from "./components/AuditScreen.js";
 import { PlaceholderScreen } from "./components/PlaceholderScreen.js";
 import { HelpOverlay } from "./components/HelpOverlay.js";
 import { FocusProvider, useFocusCapture } from "./focus.js";
@@ -24,15 +25,14 @@ interface NavItem {
 const NAV: NavItem[] = [
   { id: "dashboard", label: "Dashboard", hotkey: "1", status: "live" },
   { id: "tokens", label: "Tokens", hotkey: "2", status: "live" },
-  { id: "audit", label: "Audit", hotkey: "3", status: "stub" },
+  { id: "audit", label: "Audit", hotkey: "3", status: "live" },
   { id: "forecast", label: "Forecast", hotkey: "4", status: "stub" },
   { id: "policy", label: "Policy", hotkey: "5", status: "stub" },
   { id: "shadow", label: "Shadow AI", hotkey: "6", status: "stub" },
 ];
 
-// c2 lit Tokens; the remaining four are stubs.
-const STUB_LANDING: Record<Exclude<Screen, "dashboard" | "tokens">, string> = {
-  audit: "Phase 4.1 c3",
+// c3 lit Audit; the remaining three are stubs.
+const STUB_LANDING: Record<Exclude<Screen, "dashboard" | "tokens" | "audit">, string> = {
   forecast: "Phase 4.1 c6",
   policy: "Phase 4.1 c6",
   shadow: "Phase 4.1 c6",
@@ -83,10 +83,12 @@ function AppInner({ client }: { client: BrokerClient }) {
           <Dashboard client={client} />
         ) : screen === "tokens" ? (
           <TokensScreen client={client} />
+        ) : screen === "audit" ? (
+          <AuditScreen client={client} />
         ) : (
           <PlaceholderScreen
             title={NAV.find((n) => n.id === screen)?.label ?? screen}
-            shipsIn={STUB_LANDING[screen as Exclude<Screen, "dashboard" | "tokens">]}
+            shipsIn={STUB_LANDING[screen as Exclude<Screen, "dashboard" | "tokens" | "audit">]}
           />
         )}
       </Box>

@@ -22,7 +22,7 @@ export function HelpOverlay() {
       <Box flexDirection="column" marginTop={1}>
         <Text><Text color="yellow">1</Text> Dashboard      <Text color="yellow">4</Text> Forecast (c6)</Text>
         <Text><Text color="yellow">2</Text> Tokens         <Text color="yellow">5</Text> Policy   (c6)</Text>
-        <Text><Text color="yellow">3</Text> Audit    (c3)  <Text color="yellow">6</Text> Shadow AI (c6)</Text>
+        <Text><Text color="yellow">3</Text> Audit          <Text color="yellow">6</Text> Shadow AI (c6)</Text>
       </Box>
       <Box marginTop={1}>
         <Text>
@@ -30,10 +30,11 @@ export function HelpOverlay() {
         </Text>
       </Box>
       <Box marginTop={1} flexDirection="column">
-        <Text color="gray">Tokens screen:</Text>
+        <Text color="gray">Tokens / Audit screens:</Text>
         <Text>
           <Text color="yellow">↑↓</Text> move  <Text color="yellow">Enter</Text> detail  <Text color="yellow">f</Text> filter  <Text color="yellow">/</Text> search  <Text color="yellow">c</Text> clear  <Text color="yellow">Esc</Text> close
         </Text>
+        <Text color="gray" dimColor>Tokens: f cycles status  ·  Audit: f cycles outcome</Text>
       </Box>
       <Box marginTop={1}>
         <Text color="gray">press ? or Esc to dismiss</Text>
