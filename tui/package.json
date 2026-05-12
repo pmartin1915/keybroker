@@ -1,0 +1,22 @@
+{
+  "name": "keybroker-tui",
+  "version": "0.1.0",
+  "description": "Keybroker control-plane TUI (Phase 4.1). Talks to the broker over loopback HTTP; same data layer as the bundled web UI.",
+  "private": true,
+  "type": "module",
+  "main": "src/index.tsx",
+  "scripts": {
+    "start": "tsx src/index.tsx",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ink": "^5.0.1",
+    "ink-text-input": "^6.0.0",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

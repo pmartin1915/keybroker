@@ -1038,6 +1038,51 @@ program
     );
   });
 
+// Phase 4.1 c1 — TUI subcommand. The TUI is a peer package at `tui/` that
+// depends on Ink + React. Loading it lazily keeps `cli.ts` import-time
+// cheap (Ink + Yoga is ~3 MB) and avoids forcing the dev dep on users who
+// only run `keybroker serve`.
+program
+  .command("tui")
+  .description(
+    "Open the terminal dashboard. Expects a broker running on loopback; pass --broker-url or set KEYBROKER_URL to override.",
+  )
+  .option(
+    "--broker-url <url>",
+    "broker base URL (default: http://127.0.0.1:7843, or $KEYBROKER_URL if set)",
+  )
+  .action(async (opts: { brokerUrl?: string }) => {
+    // TUI entry: dynamic, string-variable import. Keeps the broker tsconfig
+    // free of JSX + DOM lib and prevents tsc from following the import
+    // (the tui/ peer package has its own tsconfig). The runtime resolves
+    // through tsx's TSX loader the same way the rest of the .js→.ts
+    // imports in this file do.
+    interface TuiEntry {
+      main(argv: string[]): Promise<number>;
+    }
+    let entry: TuiEntry;
+    try {
+      const tuiEntrySpecifier = "../tui/src/index.js";
+      entry = (await import(tuiEntrySpecifier)) as TuiEntry;
+    } catch (e) {
+      console.error(
+        "keybroker tui: failed to load the TUI peer package.\n" +
+          "  reason: " +
+          (e instanceof Error ? e.message : String(e)) +
+          "\n" +
+          "  hint:   run `npm --prefix tui install` once, then retry.",
+      );
+      process.exitCode = 1;
+      return;
+    }
+    const argv: string[] = [];
+    if (opts.brokerUrl) {
+      argv.push("--broker-url", opts.brokerUrl);
+    }
+    const code = await entry.main(argv);
+    if (code !== 0) process.exitCode = code;
+  });
+
 // Phase 3.8: option types separated from the inline action handlers so
 // the `rotateAll` and `reissueBatch` implementations are testable
 // and the commander signatures stay readable.
