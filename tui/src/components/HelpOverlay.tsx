@@ -20,9 +20,9 @@ export function HelpOverlay() {
     >
       <Text bold color="cyan">Keybindings</Text>
       <Box flexDirection="column" marginTop={1}>
-        <Text><Text color="yellow">1</Text> Dashboard      <Text color="yellow">4</Text> Forecast (c6)</Text>
-        <Text><Text color="yellow">2</Text> Tokens         <Text color="yellow">5</Text> Policy   (c6)</Text>
-        <Text><Text color="yellow">3</Text> Audit          <Text color="yellow">6</Text> Shadow AI (c6)</Text>
+        <Text><Text color="yellow">1</Text> Dashboard      <Text color="yellow">4</Text> Forecast</Text>
+        <Text><Text color="yellow">2</Text> Tokens         <Text color="yellow">5</Text> Policy</Text>
+        <Text><Text color="yellow">3</Text> Audit          <Text color="yellow">6</Text> Shadow AI</Text>
       </Box>
       <Box marginTop={1}>
         <Text>
@@ -61,6 +61,33 @@ export function HelpOverlay() {
         </Text>
         <Text color="gray" dimColor>
           Selection persists across filter/search changes. Revoked rows are not selectable. Bulk revoke runs sequential DELETEs; mid-batch auth abandons rest.
+        </Text>
+      </Box>
+      <Box marginTop={1} flexDirection="column">
+        <Text color="gray">Audit (c6):</Text>
+        <Text>
+          <Text color="yellow">m</Text> toggle calls ↔ admin actions  ·  <Text color="yellow">t</Text> set mgmt token (admin view, when prompted)
+        </Text>
+        <Text color="gray" dimColor>
+          Admin view requires a brkm_… token (same as Tokens admin). Calls view's `f` cycles outcomes; admin view ignores `f`.
+        </Text>
+      </Box>
+      <Box marginTop={1} flexDirection="column">
+        <Text color="gray">Forecast (c6) / Shadow AI (c6):</Text>
+        <Text>
+          Forecast: <Text color="yellow">f</Text> cycle tag bucket  ·  <Text color="yellow">r</Text> refresh
+        </Text>
+        <Text>
+          Shadow AI: <Text color="yellow">↑↓</Text> move  ·  <Text color="yellow">Enter</Text> events  ·  <Text color="yellow">r</Text> refresh
+        </Text>
+        <Text color="gray" dimColor>
+          Forecast renders 14-day burn rate as ASCII tables + bars (no charts). Shadow AI groups egress-blocked rows by detector; matched bytes are never logged.
+        </Text>
+      </Box>
+      <Box marginTop={1} flexDirection="column">
+        <Text color="gray">Policy (c6):</Text>
+        <Text>
+          <Text color="yellow">r</Text> refresh  ·  read-only (editor is post-4.1)
         </Text>
       </Box>
       <Box marginTop={1}>

@@ -381,6 +381,8 @@ describe("BrokerClient (TUI) — rotate surface (Phase 4.1 c5a)", () => {
     expect(client.hasMgmtToken()).toBe(true);
   });
 
+  // c6 tests live below this c5a describe block.
+
   it("sequential revokeProxyToken calls preserve audit ordering (c1 invariant 9 / c4 invariant 10)", async () => {
     const client = new BrokerClient(origin);
     client.setMgmtToken(await mintMgmtJwt());
@@ -407,5 +409,104 @@ describe("BrokerClient (TUI) — rotate surface (Phase 4.1 c5a)", () => {
     // load-bearing audit-ordering pin per the plan — sequence integrity
     // is enforced by adminFetch + the for-await loop, not by /audit shape.
     expect(Array.isArray(ourRevokes)).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Phase 4.1 c6 — forecast / policy / admin-audit client contract.
+// Forecast + policy are loopback reads (no auth). Admin audit requires
+// a mgmt JWT and 401s with MgmtAuthError; same recovery contract as the
+// c4/c5a admin surface.
+// ─────────────────────────────────────────────────────────────────────
+
+describe("BrokerClient (TUI) — read surface (Phase 4.1 c6)", () => {
+  it("fetchTokenForecast returns an array on an empty store", async () => {
+    const client = new BrokerClient(origin);
+    const rows = await client.fetchTokenForecast({ since: "14d", top: 20 });
+    expect(Array.isArray(rows)).toBe(true);
+    for (const r of rows) {
+      expect(typeof r.tokenId).toBe("string");
+      expect(typeof r.label).toBe("string");
+      expect(typeof r.provider).toBe("string");
+      expect(typeof r.slopeUsdPerDay).toBe("number");
+      expect(typeof r.currentUsd).toBe("number");
+    }
+  });
+
+  it("fetchTagForecast accepts each bucket without erroring", async () => {
+    const client = new BrokerClient(origin);
+    for (const bucket of ["team", "project", "env"] as const) {
+      const rows = await client.fetchTagForecast(bucket, { since: "14d", top: 10 });
+      expect(Array.isArray(rows)).toBe(true);
+      for (const r of rows) {
+        expect(typeof r.key).toBe("string");
+        expect(typeof r.slopeUsdPerDay).toBe("number");
+        expect(typeof r.currentUsd).toBe("number");
+      }
+    }
+  });
+
+  it("fetchPolicy returns a PolicySnapshot with the expected shape", async () => {
+    const client = new BrokerClient(origin);
+    const p = await client.fetchPolicy();
+    expect(typeof p.scanner.enabled).toBe("boolean");
+    expect(Array.isArray(p.forbiddenModels)).toBe(true);
+    expect(Array.isArray(p.allowedProviders)).toBe(true);
+    expect(typeof p.tagAllowlist).toBe("object");
+    // detectors is optional — when omitted, scanner runs all built-ins.
+    if (p.scanner.detectors !== undefined) {
+      expect(Array.isArray(p.scanner.detectors)).toBe(true);
+    }
+  });
+});
+
+describe("BrokerClient (TUI) — admin audit (Phase 4.1 c6)", () => {
+  it("fetchAdminAudit throws MgmtAuthError synchronously when no token is set", async () => {
+    const client = new BrokerClient(origin);
+    await expect(client.fetchAdminAudit({ limit: 200 })).rejects.toBeInstanceOf(
+      MgmtAuthError,
+    );
+    expect(client.hasMgmtToken()).toBe(false);
+  });
+
+  it("fetchAdminAudit throws MgmtAuthError on 401 and clears the cached token", async () => {
+    const client = new BrokerClient(origin);
+    client.setMgmtToken("brkm_not_a_real_jwt");
+    expect(client.hasMgmtToken()).toBe(true);
+    await expect(client.fetchAdminAudit({ limit: 200 })).rejects.toBeInstanceOf(
+      MgmtAuthError,
+    );
+    expect(client.hasMgmtToken()).toBe(false);
+  });
+
+  it("fetchAdminAudit with a valid mgmt JWT returns the expected page shape", async () => {
+    const client = new BrokerClient(origin);
+    client.setMgmtToken(await mintMgmtJwt());
+    // Mint a token so admin_audit has at least one row to return.
+    const issued = await client.issueProxyToken({
+      provider: "echo",
+      label: "c6-admin-audit",
+      ttlSeconds: 3600,
+    });
+    const page = await client.fetchAdminAudit({ limit: 50 });
+    expect(Array.isArray(page.rows)).toBe(true);
+    // nextBeforeId is optional — only present when rows.length === limit.
+    if (page.nextBeforeId !== undefined) {
+      expect(typeof page.nextBeforeId).toBe("number");
+    }
+    // The issue action should appear in the feed with the expected fields.
+    const issueRow = page.rows.find(
+      (r) => r.action === "token.issue" && r.targetTokenId === issued.tokenId,
+    );
+    expect(issueRow).toBeDefined();
+    expect(issueRow?.outcome).toBe("ok");
+    // paramsJson is a non-secret summary (store-types invariant 3) — must
+    // never contain JWT bytes. Cheap smoke: the JWT prefix doesn't appear.
+    if (issueRow?.paramsJson) {
+      expect(issueRow.paramsJson.includes("brk_")).toBe(false);
+      expect(issueRow.paramsJson.includes("brkm_")).toBe(false);
+    }
+    // Cleanup
+    await client.revokeProxyToken(issued.tokenId);
   });
 });

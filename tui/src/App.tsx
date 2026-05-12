@@ -4,7 +4,9 @@ import type { BrokerClient } from "./api/client.js";
 import { Dashboard } from "./components/Dashboard.js";
 import { TokensScreen } from "./components/TokensScreen.js";
 import { AuditScreen } from "./components/AuditScreen.js";
-import { PlaceholderScreen } from "./components/PlaceholderScreen.js";
+import { ForecastScreen } from "./components/ForecastScreen.js";
+import { PolicyScreen } from "./components/PolicyScreen.js";
+import { ShadowAIScreen } from "./components/ShadowAIScreen.js";
 import { HelpOverlay } from "./components/HelpOverlay.js";
 import { FocusProvider, useFocusCapture } from "./focus.js";
 
@@ -19,24 +21,17 @@ interface NavItem {
   status: "live" | "stub";
 }
 
-// c1 ships Dashboard live; the other five are stubs that announce when
-// they'll land. Phase 4.1 invariant 5 (focus model): number keys switch
-// screens; q quits; ? shows help. Modals (c4+) will own focus exclusively.
+// All six screens live as of Phase 4.1 c6. Phase 4.1 invariant 5 (focus
+// model): number keys switch screens; q quits; ? shows help. Modals (c4+)
+// own focus exclusively.
 const NAV: NavItem[] = [
   { id: "dashboard", label: "Dashboard", hotkey: "1", status: "live" },
   { id: "tokens", label: "Tokens", hotkey: "2", status: "live" },
   { id: "audit", label: "Audit", hotkey: "3", status: "live" },
-  { id: "forecast", label: "Forecast", hotkey: "4", status: "stub" },
-  { id: "policy", label: "Policy", hotkey: "5", status: "stub" },
-  { id: "shadow", label: "Shadow AI", hotkey: "6", status: "stub" },
+  { id: "forecast", label: "Forecast", hotkey: "4", status: "live" },
+  { id: "policy", label: "Policy", hotkey: "5", status: "live" },
+  { id: "shadow", label: "Shadow AI", hotkey: "6", status: "live" },
 ];
-
-// c3 lit Audit; the remaining three are stubs.
-const STUB_LANDING: Record<Exclude<Screen, "dashboard" | "tokens" | "audit">, string> = {
-  forecast: "Phase 4.1 c6",
-  policy: "Phase 4.1 c6",
-  shadow: "Phase 4.1 c6",
-};
 
 export function App({ client }: { client: BrokerClient }) {
   return (
@@ -85,11 +80,12 @@ function AppInner({ client }: { client: BrokerClient }) {
           <TokensScreen client={client} />
         ) : screen === "audit" ? (
           <AuditScreen client={client} />
+        ) : screen === "forecast" ? (
+          <ForecastScreen client={client} />
+        ) : screen === "policy" ? (
+          <PolicyScreen client={client} />
         ) : (
-          <PlaceholderScreen
-            title={NAV.find((n) => n.id === screen)?.label ?? screen}
-            shipsIn={STUB_LANDING[screen as Exclude<Screen, "dashboard" | "tokens" | "audit">]}
-          />
+          <ShadowAIScreen client={client} />
         )}
       </Box>
       <StatusBar />

@@ -164,6 +164,72 @@ export interface RotateResult {
   expired: Array<{ id: string; label: string }>;
 }
 
+// Phase 4.1 c6: forecast / policy / admin-audit DTOs. Same web parity rule
+// as the rest of this file — types are intentionally redeclared, not
+// imported from web/. The two clients share a contract via the broker's
+// HTTP API.
+export interface TokenForecastRow {
+  tokenId: string;
+  label: string;
+  provider: string;
+  slopeUsdPerDay: number;
+  interceptUsd: number;
+  currentUsd: number;
+  daysUntilCap?: number;
+  projectedCapBreachDate?: string;
+  capUsd?: number;
+  machine?: string;
+  tagTeam?: string;
+  tagProject?: string;
+  tagEnv?: string;
+}
+
+export interface TagForecastRow {
+  key: string;
+  slopeUsdPerDay: number;
+  currentUsd: number;
+}
+
+export interface ScannerConfig {
+  enabled: boolean;
+  detectors?: readonly string[];
+}
+
+export interface PolicySnapshot {
+  forbiddenModels: readonly string[];
+  allowedProviders: readonly string[];
+  tagAllowlist: {
+    team?: readonly string[];
+    project?: readonly string[];
+    env?: readonly string[];
+  };
+  scanner: ScannerConfig;
+}
+
+// Phase 4.1 c6: admin audit feed. Mirrors broker AdminAuditEntry.
+// Actor is always a brkm_… mgmt JWT jti, never a brk_… proxy id
+// (store-types.ts invariant 2). paramsJson is a non-secret summary
+// (invariant 3) — never contains JWT bytes.
+export interface AdminAuditRow {
+  id?: number;
+  ts: string;
+  actorTokenId: string;
+  actorLabel?: string;
+  action: "token.issue" | "token.revoke" | "token.rotate";
+  targetTokenId?: string;
+  targetCount?: number;
+  paramsJson?: string;
+  outcome: "ok" | "failed";
+  reason?: string;
+  sourceIp?: string;
+  userAgent?: string;
+}
+
+export interface AdminAuditPage {
+  rows: AdminAuditRow[];
+  nextBeforeId?: number;
+}
+
 export class BrokerClient {
   readonly baseUrl: string;
   private mgmtToken: string | undefined;
@@ -338,5 +404,50 @@ export class BrokerClient {
     if (opts?.machine) qs.set("machine", opts.machine);
     const tail = qs.toString();
     return this.getJson<AuditRow[]>(`/audit${tail ? `?${tail}` : ""}`);
+  }
+
+  // Phase 4.1 c6: forecast (no auth — loopback read).
+  fetchTokenForecast(opts?: {
+    since?: string;
+    top?: number;
+  }): Promise<TokenForecastRow[]> {
+    const qs = new URLSearchParams();
+    if (opts?.since) qs.set("since", opts.since);
+    if (opts?.top !== undefined) qs.set("top", String(opts.top));
+    const tail = qs.toString();
+    return this.getJson<TokenForecastRow[]>(
+      `/forecast/tokens${tail ? `?${tail}` : ""}`,
+    );
+  }
+
+  fetchTagForecast(
+    bucket: TagBucket,
+    opts?: { since?: string; top?: number },
+  ): Promise<TagForecastRow[]> {
+    const qs = new URLSearchParams({ bucket });
+    if (opts?.since) qs.set("since", opts.since);
+    if (opts?.top !== undefined) qs.set("top", String(opts.top));
+    return this.getJson<TagForecastRow[]>(`/forecast/tags?${qs}`);
+  }
+
+  // Phase 4.1 c6: policy (no auth — loopback read, read-only in c6).
+  fetchPolicy(): Promise<PolicySnapshot> {
+    return this.getJson<PolicySnapshot>("/policy");
+  }
+
+  // Phase 4.1 c6: admin audit feed. Requires mgmt JWT — adminFetch
+  // throws MgmtAuthError on 401 (caller pushes MgmtTokenPrompt).
+  fetchAdminAudit(opts?: {
+    limit?: number;
+    beforeId?: number;
+  }): Promise<AdminAuditPage> {
+    const qs = new URLSearchParams();
+    if (opts?.limit !== undefined) qs.set("limit", String(opts.limit));
+    if (opts?.beforeId !== undefined) qs.set("beforeId", String(opts.beforeId));
+    const tail = qs.toString();
+    return this.adminFetch<AdminAuditPage>(
+      "GET",
+      `/admin/audit${tail ? `?${tail}` : ""}`,
+    );
   }
 }
