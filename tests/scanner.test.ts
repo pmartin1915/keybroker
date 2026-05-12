@@ -60,11 +60,11 @@ describe("scanBytes — aws_access_key", () => {
   it("matches a real-shape AKIA key", () => {
     // 20 chars total: AKIA + 16 of [0-9A-Z]
     const hit = scanBytes(buf("here is a key AKIAIOSFODNN7EXAMPLE in prose"), BUILTIN_DETECTORS);
-    expect(hit).toEqual({ detector: "aws_access_key" });
+    expect(hit).toMatchObject({ detector: "aws_access_key" });
   });
   it("matches even inside a JSON string field", () => {
     const body = JSON.stringify({ messages: [{ role: "user", content: "my key: AKIA1234567890ABCDEF" }] });
-    expect(scanBytes(buf(body), BUILTIN_DETECTORS)).toEqual({ detector: "aws_access_key" });
+    expect(scanBytes(buf(body), BUILTIN_DETECTORS)).toMatchObject({ detector: "aws_access_key" });
   });
   it("does NOT match shorter near-misses", () => {
     expect(scanBytes(buf("AKIA1234"), BUILTIN_DETECTORS)).toBeNull();
@@ -81,11 +81,11 @@ describe("scanBytes — aws_access_key", () => {
 describe("scanBytes — github_pat / github_oauth", () => {
   it("matches a ghp_ classic PAT", () => {
     const tok = "ghp_" + "a".repeat(36);
-    expect(scanBytes(buf(`token: ${tok}`), BUILTIN_DETECTORS)).toEqual({ detector: "github_pat" });
+    expect(scanBytes(buf(`token: ${tok}`), BUILTIN_DETECTORS)).toMatchObject({ detector: "github_pat" });
   });
   it("matches a gho_ OAuth token", () => {
     const tok = "gho_" + "1234567890abcdefABCDEF1234567890abcd";
-    expect(scanBytes(buf(`oauth: ${tok}`), BUILTIN_DETECTORS)).toEqual({ detector: "github_oauth" });
+    expect(scanBytes(buf(`oauth: ${tok}`), BUILTIN_DETECTORS)).toMatchObject({ detector: "github_oauth" });
   });
   it("does NOT match ghp_ with wrong tail length", () => {
     expect(scanBytes(buf("ghp_short"), BUILTIN_DETECTORS)).toBeNull();
@@ -95,7 +95,7 @@ describe("scanBytes — github_pat / github_oauth", () => {
 describe("scanBytes — slack_bot_token", () => {
   it("matches an xoxb- shape", () => {
     const tok = "xoxb-1234567890-1234567890-" + "A".repeat(24);
-    expect(scanBytes(buf(`slack=${tok}`), BUILTIN_DETECTORS)).toEqual({ detector: "slack_bot_token" });
+    expect(scanBytes(buf(`slack=${tok}`), BUILTIN_DETECTORS)).toMatchObject({ detector: "slack_bot_token" });
   });
   it("does NOT match xoxb- without the trailing alnum block", () => {
     expect(scanBytes(buf("xoxb-1234567890-1234567890-"), BUILTIN_DETECTORS)).toBeNull();
@@ -105,7 +105,7 @@ describe("scanBytes — slack_bot_token", () => {
 describe("scanBytes — stripe_live_key", () => {
   it("matches sk_live_ shape", () => {
     const tok = "sk_live_" + "abcDEF1234567890abcDEF1234";
-    expect(scanBytes(buf(tok), BUILTIN_DETECTORS)).toEqual({ detector: "stripe_live_key" });
+    expect(scanBytes(buf(tok), BUILTIN_DETECTORS)).toMatchObject({ detector: "stripe_live_key" });
   });
   it("does NOT match sk_test_ (we deliberately ignore non-live keys)", () => {
     expect(scanBytes(buf("sk_test_" + "a".repeat(24)), BUILTIN_DETECTORS)).toBeNull();
@@ -116,7 +116,7 @@ describe("scanBytes — short-circuits", () => {
   it("returns the FIRST detector to match when multiple secrets are present", () => {
     const both = "AKIAIOSFODNN7EXAMPLE then ghp_" + "a".repeat(36);
     // aws_access_key is earlier in BUILTIN_DETECTORS than github_pat, so it wins
-    expect(scanBytes(buf(both), BUILTIN_DETECTORS)).toEqual({ detector: "aws_access_key" });
+    expect(scanBytes(buf(both), BUILTIN_DETECTORS)).toMatchObject({ detector: "aws_access_key" });
   });
   it("only the requested subset participates", () => {
     const only = resolveDetectors(true, ["github_pat"]);
@@ -125,13 +125,17 @@ describe("scanBytes — short-circuits", () => {
   });
 });
 
-describe("scanBytes — does not leak the matched substring", () => {
-  it("ScanHit shape carries only the detector name (no `match`/`text` field)", () => {
+describe("scanBytes — ScanHit shape (Phase 4.2b: matched field is present in-memory)", () => {
+  it("ScanHit carries detector name and the in-memory matched bytes (for Layer 2 verify forward-pin)", () => {
     const hit = scanBytes(buf("AKIAIOSFODNN7EXAMPLE"), BUILTIN_DETECTORS);
     expect(hit).not.toBeNull();
-    // The exported type guarantees no `match` field, but assert at runtime
-    // too so a future contributor adding one trips this test.
-    expect(Object.keys(hit!)).toEqual(["detector"]);
+    // Phase 4.2b: ScanHit now includes `matched` so the Layer 2 verifier can receive
+    // the exact secret bytes. This field is in-memory only and must never be persisted.
+    expect(hit).toMatchObject({ detector: "aws_access_key" });
+    expect(hit!.matched).toBe("AKIAIOSFODNN7EXAMPLE");
+    // Guard that no OTHER unexpected fields appeared beyond detector + matched.
+    const keys = Object.keys(hit!).sort();
+    expect(keys).toEqual(["detector", "matched"]);
   });
 });
 
@@ -145,8 +149,8 @@ describe("scanBytes — pattern lastIndex hygiene", () => {
       pattern: /AKIA[0-9A-Z]{16}/g,
       description: "test",
     };
-    expect(scanBytes(buf("AKIAIOSFODNN7EXAMPLE"), [det])).toEqual({ detector: "test_g" });
-    expect(scanBytes(buf("AKIAIOSFODNN7EXAMPLE"), [det])).toEqual({ detector: "test_g" });
+    expect(scanBytes(buf("AKIAIOSFODNN7EXAMPLE"), [det])).toMatchObject({ detector: "test_g" });
+    expect(scanBytes(buf("AKIAIOSFODNN7EXAMPLE"), [det])).toMatchObject({ detector: "test_g" });
   });
 });
 

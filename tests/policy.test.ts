@@ -124,7 +124,10 @@ function emptyPolicy(over: Partial<Policy> = {}): Policy {
     forbiddenModels: [],
     allowedProviders: [],
     tagAllowlist: {},
-    scanner: { enabled: true },
+    scanner: {
+      enabled: true,
+      verify: { enabled: true, on_failure: "block", detectors: ["github_pat", "stripe_live_key"] },
+    },
     ...over,
   };
 }

@@ -209,7 +209,7 @@ describe("scanBytes — Layer 1.5 (decode-then-scan)", () => {
     // Wrap in a realistic-looking body
     const body = `{"messages":[{"role":"user","content":"my credentials: ${encoded}"}]}`;
     const hit = scanBytes(buf(body), BUILTIN_DETECTORS);
-    expect(hit).toEqual({ detector: "aws_access_key" });
+    expect(hit).toMatchObject({ detector: "aws_access_key" });
   });
 
   // Test 2: URL-encoded GitHub PAT → block
@@ -219,7 +219,7 @@ describe("scanBytes — Layer 1.5 (decode-then-scan)", () => {
     const encoded = [...token].map((c) => "%" + c.charCodeAt(0).toString(16).padStart(2, "0")).join("");
     const body = `{"prompt":"use ${encoded} for auth"}`;
     const hit = scanBytes(buf(body), BUILTIN_DETECTORS);
-    expect(hit).toEqual({ detector: "github_pat" });
+    expect(hit).toMatchObject({ detector: "github_pat" });
   });
 
   // Test 3: JSON-string-escaped Stripe key → block
@@ -235,7 +235,7 @@ describe("scanBytes — Layer 1.5 (decode-then-scan)", () => {
     // First check: raw scan might find it if the quotes are transparent to the regex
     // The regex /\bsk_live_[0-9A-Za-z]{24,99}\b/g should match the raw string too
     // Let's use the explicit escape scenario with \\n inserted to force decoder path
-    expect(hit).toEqual({ detector: "stripe_live_key" });
+    expect(hit).toMatchObject({ detector: "stripe_live_key" });
   });
 
   // Test 3b: Stripe key inside a fully-escaped JSON string (forces decoder path)
@@ -247,7 +247,7 @@ describe("scanBytes — Layer 1.5 (decode-then-scan)", () => {
     const escaped = "\\u0073k_live_abcDEF1234567890abcDEF1234";
     const body = `{"message":"${escaped}"}`;
     const hit = scanBytes(buf(body), BUILTIN_DETECTORS);
-    expect(hit).toEqual({ detector: "stripe_live_key" });
+    expect(hit).toMatchObject({ detector: "stripe_live_key" });
   });
 
   // Test 4: Nested encoding negative test (base64 of base64) → NO block
@@ -288,7 +288,7 @@ describe("scanBytes — Layer 1.5 (decode-then-scan)", () => {
     const body = "context: %ZZ AKIAIOSFODNN7EXAMPLE more text";
     const hit = scanBytes(buf(body), BUILTIN_DETECTORS);
     // Raw scan hits first — the decoder failure is irrelevant
-    expect(hit).toEqual({ detector: "aws_access_key" });
+    expect(hit).toMatchObject({ detector: "aws_access_key" });
   });
 
   // Test 6b: malformed urlencode only (no raw key) — decoder fails, no block
@@ -303,12 +303,12 @@ describe("scanBytes — Layer 1.5 (decode-then-scan)", () => {
   // Test 7: all existing Phase 3.6 plaintext paths unchanged
   it("still catches a plaintext AWS key in a JSON body (Phase 3.6 regression)", () => {
     const body = JSON.stringify({ messages: [{ role: "user", content: "AKIAIOSFODNN7EXAMPLE" }] });
-    expect(scanBytes(buf(body), BUILTIN_DETECTORS)).toEqual({ detector: "aws_access_key" });
+    expect(scanBytes(buf(body), BUILTIN_DETECTORS)).toMatchObject({ detector: "aws_access_key" });
   });
 
   it("still catches a plaintext GitHub PAT (Phase 3.6 regression)", () => {
     const token = "ghp_" + "a".repeat(36);
-    expect(scanBytes(buf(`token ${token}`), BUILTIN_DETECTORS)).toEqual({ detector: "github_pat" });
+    expect(scanBytes(buf(`token ${token}`), BUILTIN_DETECTORS)).toMatchObject({ detector: "github_pat" });
   });
 
   // Test 8: empty/undefined buffer still returns null
@@ -320,15 +320,20 @@ describe("scanBytes — Layer 1.5 (decode-then-scan)", () => {
     expect(scanBytes(Buffer.alloc(0), BUILTIN_DETECTORS)).toBeNull();
   });
 
-  // Test 9: ScanHit from decoded view has no extra fields (no leak of decoded view path)
-  it("ScanHit from a decoded-view hit contains ONLY { detector } (no matched substring, invariant 3 & 6)", () => {
+  // Test 9: ScanHit from decoded view — Phase 4.2b: matched field carries the decoded bytes
+  it("ScanHit from a decoded-view hit carries the decoded matched bytes (forward-pin for Layer 2 verify)", () => {
     const awsKey = "AKIAIOSFODNN7EXAMPLE";
     const encoded = Buffer.from(awsKey, "utf8").toString("base64");
     const hit = scanBytes(buf(encoded), BUILTIN_DETECTORS);
     expect(hit).not.toBeNull();
-    // Invariant 3: no matched substring. Invariant 6: no "matched in decoded view" field.
-    expect(Object.keys(hit!)).toEqual(["detector"]);
-    expect(hit).toEqual({ detector: "aws_access_key" });
+    // Phase 4.2b invariant 6: the verifier must receive the decoded bytes (awsKey),
+    // NOT the base64 string. `matched` carries the decoded secret from the view that fired.
+    expect(hit).toMatchObject({ detector: "aws_access_key" });
+    // The matched field holds the decoded text (the actual AKIA key), not the base64.
+    expect(hit!.matched).toBe(awsKey);
+    // Guard: only detector and matched — no "view" field or other leaks.
+    const keys = Object.keys(hit!).sort();
+    expect(keys).toEqual(["detector", "matched"]);
   });
 
   // Bonus: first-hit-wins across views — raw scan wins over decoded scan
@@ -348,6 +353,6 @@ describe("scanBytes — Layer 1.5 (decode-then-scan)", () => {
     // aws_access_key is NOT in the raw body — only github_pat is raw.
     // So raw scan yields github_pat. That is the first hit and is returned.
     const hit = scanBytes(buf(body), BUILTIN_DETECTORS);
-    expect(hit).toEqual({ detector: "github_pat" });
+    expect(hit).toMatchObject({ detector: "github_pat" });
   });
 });

@@ -70,6 +70,8 @@ interface CallRow {
   ttft_ms: number | null;
   tpot_ms_avg: number | null;
   output_tokens: number | null;
+  scan_verified: number | null;
+  scan_verify_latency_ms: number | null;
 }
 
 // Phase 4.0 c4e: snake_case mirror of AdminAuditEntry for SQLite row reads.
@@ -132,7 +134,9 @@ CREATE TABLE IF NOT EXISTS calls (
   actual_cost_usd REAL,
   tag_team TEXT,
   tag_project TEXT,
-  tag_env TEXT
+  tag_env TEXT,
+  scan_verified INTEGER,
+  scan_verify_latency_ms INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS calls_token_id_idx ON calls(token_id);
@@ -281,14 +285,15 @@ export class SqliteStore implements StoreLike {
       revoke: this.db.prepare(`UPDATE tokens SET revoked = 1 WHERE id = ?`),
       insertCall: this.db.prepare(
         `INSERT INTO calls
-           (ts, token_id, label, provider, method, path, status, duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine, estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env, ttft_ms, tpot_ms_avg, output_tokens)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (ts, token_id, label, provider, method, path, status, duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine, estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env, ttft_ms, tpot_ms_avg, output_tokens, scan_verified, scan_verify_latency_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       selectCalls: this.db.prepare(
         `SELECT ts, token_id, label, provider, method, path, status,
                 duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
                 estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env,
-                ttft_ms, tpot_ms_avg, output_tokens
+                ttft_ms, tpot_ms_avg, output_tokens,
+                scan_verified, scan_verify_latency_ms
          FROM calls
          ORDER BY id DESC
          LIMIT ?`,
@@ -297,7 +302,8 @@ export class SqliteStore implements StoreLike {
         `SELECT ts, token_id, label, provider, method, path, status,
                 duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
                 estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env,
-                ttft_ms, tpot_ms_avg, output_tokens
+                ttft_ms, tpot_ms_avg, output_tokens,
+                scan_verified, scan_verify_latency_ms
          FROM calls
          WHERE token_id = ?
          ORDER BY id DESC
@@ -307,7 +313,8 @@ export class SqliteStore implements StoreLike {
         `SELECT ts, token_id, label, provider, method, path, status,
                 duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
                 estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env,
-                ttft_ms, tpot_ms_avg, output_tokens
+                ttft_ms, tpot_ms_avg, output_tokens,
+                scan_verified, scan_verify_latency_ms
          FROM calls
          WHERE machine = ?
          ORDER BY id DESC
@@ -317,7 +324,8 @@ export class SqliteStore implements StoreLike {
         `SELECT ts, token_id, label, provider, method, path, status,
                 duration_ms, req_bytes, resp_bytes, outcome, reason, requested_model, machine,
                 estimated_cost_usd, actual_cost_usd, tag_team, tag_project, tag_env,
-                ttft_ms, tpot_ms_avg, output_tokens
+                ttft_ms, tpot_ms_avg, output_tokens,
+                scan_verified, scan_verify_latency_ms
          FROM calls
          WHERE token_id = ? AND machine = ?
          ORDER BY id DESC
@@ -628,6 +636,8 @@ export class SqliteStore implements StoreLike {
       entry.ttftMs ?? null,
       entry.tpotMsAvg ?? null,
       entry.outputTokens ?? null,
+      entry.scanVerified ?? null,
+      entry.scanVerifyLatencyMs ?? null,
     );
   }
 
@@ -797,6 +807,11 @@ export class SqliteStore implements StoreLike {
     addColumnIfMissing(db, "calls", "ttft_ms", "REAL");
     addColumnIfMissing(db, "calls", "tpot_ms_avg", "REAL");
     addColumnIfMissing(db, "calls", "output_tokens", "INTEGER");
+    // Phase 4.2b: Layer 2 verification columns.
+    // scan_verified: NULL=unchecked, 0=invalid, 1=valid.
+    // scan_verify_latency_ms: wall-clock ms for the verify call.
+    addColumnIfMissing(db, "calls", "scan_verified", "INTEGER");
+    addColumnIfMissing(db, "calls", "scan_verify_latency_ms", "INTEGER");
     // Indexes for the Phase 2.3 filters. Created post-ALTER so the
     // referenced columns are guaranteed to exist on pre-2.3 DBs that
     // have just been migrated.
@@ -946,6 +961,8 @@ function rowToCall(row: CallRow): CallLogEntry {
   if (row.ttft_ms !== null) entry.ttftMs = row.ttft_ms;
   if (row.tpot_ms_avg !== null) entry.tpotMsAvg = row.tpot_ms_avg;
   if (row.output_tokens !== null) entry.outputTokens = row.output_tokens;
+  if (row.scan_verified !== null) entry.scanVerified = row.scan_verified as 0 | 1;
+  if (row.scan_verify_latency_ms !== null) entry.scanVerifyLatencyMs = row.scan_verify_latency_ms;
   return entry;
 }
 

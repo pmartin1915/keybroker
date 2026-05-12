@@ -92,4 +92,22 @@ export interface CallLogEntry {
   ttftMs?: number;
   tpotMsAvg?: number;
   outputTokens?: number;
+  /**
+   * Phase 4.2b: Layer 2 verification result.
+   *   - `undefined` / `null` = verification did not run (detector not in
+   *     allow-list, verify disabled, or on_failure="allow" with transient
+   *     error). Maps to NULL in the audit row.
+   *   - `0` = upstream said the secret is invalid (regex hit was correct
+   *     but the key is already revoked / was never valid).
+   *   - `1` = upstream confirmed the secret is live (active data exfiltration
+   *     attempt confirmed).
+   * NEVER carries the matched bytes. Only 0 / 1 / undefined.
+   */
+  scanVerified?: 0 | 1;
+  /**
+   * Phase 4.2b: wall-clock ms for the Layer 2 verify call. `undefined` when
+   * no verify call was made. Useful for tuning per-detector timeouts after
+   * operators have real data from production traffic.
+   */
+  scanVerifyLatencyMs?: number;
 }

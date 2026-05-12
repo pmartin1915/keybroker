@@ -52,6 +52,46 @@ export interface TagAllowlist {
 export type TagKey = "team" | "project" | "env";
 
 /**
+ * Phase 4.2b — Layer 2 verification configuration.
+ *
+ * Lives under `scanner.verify` in policy.json. Controls whether the broker
+ * makes a live upstream API call to confirm a regex-matched secret is
+ * actually valid. Verification is fail-CLOSED by default (invariant 4):
+ * a timeout or upstream error blocks the request unless the operator opts
+ * to `on_failure: "allow"`.
+ *
+ * IMPORTANT: verification is a live API call and has side effects on the
+ * upstream — see the README for the operator-facing caveat.
+ */
+export interface VerifyConfig {
+  /**
+   * Master switch for Layer 2 verification. Defaults to true.
+   * Set to false to disable verification entirely (audit rows will have
+   * scan_verified = NULL on all hits).
+   */
+  readonly enabled: boolean;
+  /**
+   * What to do when the verifier throws (timeout, 5xx, network error).
+   * - "block" (default): treat as verified=0, block the request.
+   * - "allow": treat as a transient failure, forward the request.
+   * Does NOT affect definitive 401/403 responses — those always block.
+   */
+  readonly on_failure: "block" | "allow";
+  /**
+   * Allow-list of detector names to verify. Detectors not in this list
+   * produce scan_verified=NULL on hit. Unknown names are logged and ignored.
+   * Default: ["github_pat", "stripe_live_key"].
+   */
+  readonly detectors: readonly string[];
+}
+
+const DEFAULT_VERIFY: VerifyConfig = {
+  enabled: true,
+  on_failure: "block",
+  detectors: ["github_pat", "stripe_live_key"],
+};
+
+/**
  * Phase 3.6 — inline scanner configuration.
  *
  * Default posture is **on with all built-in detectors**: if `policy.json`
@@ -60,6 +100,8 @@ export type TagKey = "team" | "project" | "env";
  * with `"scanner": { "enabled": false }`. This matches the plan's
  * strategic positioning — egress-blocked is a first-class outcome that
  * should be on by default, not buried behind opt-in.
+ *
+ * Phase 4.2b adds the `verify` sub-block (see VerifyConfig above).
  */
 export interface ScannerConfig {
   /** Master switch. Defaults to true. */
@@ -70,6 +112,8 @@ export interface ScannerConfig {
    * time so a typo can't take the whole scanner offline.
    */
   readonly detectors?: readonly string[];
+  /** Phase 4.2b: Layer 2 verification config. Defaults to verify-enabled, fail-closed. */
+  readonly verify: VerifyConfig;
 }
 
 export interface Policy {
@@ -79,7 +123,7 @@ export interface Policy {
   scanner: ScannerConfig;
 }
 
-const DEFAULT_SCANNER: ScannerConfig = { enabled: true };
+const DEFAULT_SCANNER: ScannerConfig = { enabled: true, verify: DEFAULT_VERIFY };
 
 const EMPTY: Policy = {
   forbiddenModels: [],
@@ -157,9 +201,42 @@ function scannerConfigFromRaw(v: unknown): ScannerConfig {
   // to "all built-ins" at the resolver, but we preserve the array shape
   // so a future "explicit empty = nothing" semantic could land without
   // a normalize change.
+  const verify = verifyConfigFromRaw(obj.verify);
   return detectors === undefined
-    ? { enabled }
-    : { enabled, detectors };
+    ? { enabled, verify }
+    : { enabled, detectors, verify };
+}
+
+/**
+ * Phase 4.2b: parse the `scanner.verify` sub-block from policy.json.
+ * Fail-OPEN on missing / malformed: default is verify-enabled with
+ * fail-CLOSED. This is deliberate — a typo in the verify block should not
+ * silently disable the Layer 2 check. Operators who want to disable
+ * verification must set `"enabled": false` explicitly.
+ */
+export function verifyConfigFromRaw(v: unknown): VerifyConfig {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return DEFAULT_VERIFY;
+  const obj = v as Record<string, unknown>;
+  const enabled = typeof obj.enabled === "boolean" ? obj.enabled : true;
+  const onFailure =
+    obj.on_failure === "allow" ? "allow" as const : "block" as const;
+  // detectors: if absent or malformed, use the default allow-list.
+  const detectors = Array.isArray(obj.detectors)
+    ? stringArray(obj.detectors)
+    : DEFAULT_VERIFY.detectors;
+  // Warn on unknown detector names in the verify allow-list, same as
+  // the Layer 1 resolveDetectors pattern.
+  if (Array.isArray(obj.detectors)) {
+    const KNOWN = new Set(["github_pat", "stripe_live_key"]);
+    const unknown = (detectors as string[]).filter((d) => !KNOWN.has(d));
+    if (unknown.length > 0) {
+      console.warn(
+        `keybroker: scanner.verify.detectors references unknown verifier(s): ${unknown.join(", ")}. ` +
+          `Known verifiable detectors: github_pat, stripe_live_key.`,
+      );
+    }
+  }
+  return { enabled, on_failure: onFailure, detectors };
 }
 
 function stringArray(v: unknown): readonly string[] {

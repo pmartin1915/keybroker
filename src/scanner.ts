@@ -58,6 +58,17 @@ export interface Detector {
 /** Outcome of a scan. */
 export interface ScanHit {
   readonly detector: string;
+  /**
+   * Phase 4.2b: the matched secret bytes extracted from the view that fired
+   * (raw or decoded). Stays in-memory only — MUST NEVER appear in audit rows,
+   * logs, or 403 responses (invariant 7). Used exclusively to pass the exact
+   * secret to the Layer 2 verifier so it receives the decoded token, not a
+   * base64-encoded wrapper (invariant 6 forward-pin from Phase 4.2a).
+   *
+   * Note: the entire ScanHit object is ephemeral — it lives only on the
+   * request-handler stack and is never serialised.
+   */
+  readonly matched?: string;
 }
 
 /**
@@ -107,7 +118,13 @@ export function getBuiltinDetector(name: string): Detector | undefined {
 
 /**
  * Run one set of detectors against a single text view. Internal helper.
- * Returns the first hit or null. Resets lastIndex for each `/g` pattern.
+ * Returns the first hit (with matched substring) or null.
+ * Resets lastIndex for each `/g` pattern.
+ *
+ * Phase 4.2b: captures the matched substring so the Layer 2 verifier
+ * receives the exact secret bytes from the view that triggered the hit.
+ * The matched field is in-memory only and must never be serialised
+ * (invariant 7).
  */
 function scanText(
   text: string,
@@ -116,8 +133,10 @@ function scanText(
   for (const det of detectors) {
     // Reset lastIndex so a `/g` regex doesn't carry state across calls.
     det.pattern.lastIndex = 0;
-    if (det.pattern.test(text)) {
-      return { detector: det.name };
+    const m = det.pattern.exec(text);
+    if (m) {
+      // m[0] is the matched substring — the literal secret bytes.
+      return { detector: det.name, matched: m[0] };
     }
   }
   return null;

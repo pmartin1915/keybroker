@@ -38,6 +38,7 @@ import {
 } from "./policy.js";
 import { matchesAny } from "./glob-match.js";
 import { resolveDetectors, scanBytes } from "./scanner.js";
+import { dispatchVerify, type VerifyResult } from "./verify.js";
 import {
   estimateOutputCostUsd,
   actualCostUsd as actualCostUsdFor,
@@ -839,16 +840,53 @@ export async function buildServer(
       );
       const scanHit = scanBytes(bodyBuf, scannerDetectors);
       if (scanHit) {
-        return blockedEgress(reply, scanHit.detector, {
-          tokenId,
-          label: claims.lbl,
-          provider,
-          method: req.method,
-          path: upstreamPath,
-          started,
-          reqBytes: bodyBuf?.byteLength ?? 0,
-          ...auditAttribution,
-        }, store);
+        // Phase 4.2b: Layer 2 verification. Dispatch only when:
+        //   - policy.scanner.verify.enabled is true, AND
+        //   - the hit detector is in verify.detectors.
+        // The verifier receives the matched secret bytes from the view that
+        // fired the hit (raw or decoded — Phase 4.2a invariant 10 forward-pin).
+        // SECURITY: scanHit.matched stays on the stack only; never persisted.
+        let verifyResult: VerifyResult | undefined;
+        const verifySecret = scanHit.matched;
+        if (verifySecret !== undefined) {
+          verifyResult = await dispatchVerify(
+            scanHit.detector,
+            verifySecret,
+            policy.scanner.verify,
+          );
+          // fail-allow path: on_failure="allow" AND verifier threw transiently.
+          // The request is allowed through rather than blocked.
+          if (verifyResult.allow) {
+            // Do not call blockedEgress. Fall through to the rest of the
+            // request handling. We do not log a blocked entry — this outcome
+            // is intentional by the operator.
+            // (No early return here; execution continues below.)
+          } else {
+            return blockedEgress(reply, scanHit.detector, {
+              tokenId,
+              label: claims.lbl,
+              provider,
+              method: req.method,
+              path: upstreamPath,
+              started,
+              reqBytes: bodyBuf?.byteLength ?? 0,
+              ...auditAttribution,
+            }, store, verifyResult);
+          }
+        } else {
+          // No matched substring (shouldn't happen with current scanner, but
+          // guard defensively). Block without verify.
+          return blockedEgress(reply, scanHit.detector, {
+            tokenId,
+            label: claims.lbl,
+            provider,
+            method: req.method,
+            path: upstreamPath,
+            started,
+            reqBytes: bodyBuf?.byteLength ?? 0,
+            ...auditAttribution,
+          }, store, undefined);
+        }
       }
 
       // Combined model gate:
@@ -1491,6 +1529,10 @@ function blockedEgress(
     claims?: BrokerClaims;
   },
   store: StoreLike,
+  // Phase 4.2b: optional verify result. When present, scan_verified and
+  // scan_verify_latency_ms are written to the audit row. When absent (verify
+  // did not run), both columns stay NULL.
+  verifyResult?: VerifyResult,
 ) {
   const entry: CallLogEntry = {
     ts: new Date().toISOString(),
@@ -1508,6 +1550,14 @@ function blockedEgress(
   };
   if (ctx.machine !== undefined) entry.machine = ctx.machine;
   applyTagAttribution(entry, ctx.claims);
+  // Persist verify fields only when a definitive 0 or 1 result was obtained.
+  // NULL (verify not run, or fail-allow) is represented by absence.
+  if (verifyResult !== undefined && verifyResult.verified !== null) {
+    entry.scanVerified = verifyResult.verified;
+  }
+  if (verifyResult?.latencyMs !== null && verifyResult?.latencyMs !== undefined) {
+    entry.scanVerifyLatencyMs = verifyResult.latencyMs;
+  }
   store.appendCall(entry);
   return reply.status(403).send({ error: "egress_blocked", detector });
 }
