@@ -232,6 +232,16 @@ export async function dispatchVerify(
     // Transient failure: do NOT cache (invariant 5 rationale: caching transient
     // failures could lock out the operator during a brief upstream outage).
     if (cfg.on_failure === "allow") {
+      // Operator-surprising path: a regex hit was forwarded because the
+      // verifier failed transiently AND policy is fail-allow. The audit
+      // row that follows carries scan_verified=null (no scan info), so
+      // this stderr line is the only signal the operator gets.
+      // No secret bytes — only detector name and latency.
+      console.warn(
+        `keybroker: scanner.verify detector=${detector} failed transiently; ` +
+          `on_failure=allow → forwarding request. ` +
+          `latency_ms=${latencyMs}`,
+      );
       return { verified: null, latencyMs, allow: true };
     }
     // Default: fail-CLOSED (invariant 4).

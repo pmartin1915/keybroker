@@ -293,6 +293,33 @@ describe("dispatchVerify — fail-policy", () => {
     expect(r.latencyMs).toBeGreaterThanOrEqual(0);
   });
 
+  it("12c. fail-allow + transient throw emits a console.warn with detector and latency, NO secret bytes", async () => {
+    mockFetch(503);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const r = await dispatchVerify("github_pat", GHP_TOKEN, VERIFY_ENABLED_ALLOW);
+    expect(r.allow).toBe(true);
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    const msg = warnSpy.mock.calls[0]![0] as string;
+    expect(msg).toContain("keybroker: scanner.verify");
+    expect(msg).toContain("detector=github_pat");
+    expect(msg).toContain("on_failure=allow");
+    expect(msg).toContain("latency_ms=");
+    // Secret bytes must NEVER appear in the warning.
+    expect(msg).not.toContain("ghp_");
+    expect(msg).not.toContain(GHP_TOKEN);
+  });
+
+  it("12d. fail-closed + transient throw does NOT warn (no operator-surprising forward)", async () => {
+    mockFetch(503);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const r = await dispatchVerify("github_pat", GHP_TOKEN, VERIFY_ENABLED_BLOCK);
+    expect(r.verified).toBe(0);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
   it("12b. fail-allow does not apply to definitive 401: returns verified=0 regardless", async () => {
     // 401 is a definitive "invalid key" answer — caches and returns 0.
     // on_failure only applies to transient errors (throw path).
