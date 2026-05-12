@@ -5,13 +5,18 @@ import {
   MgmtAuthError,
   type BrokerClient,
   type IssueTokenResponse,
+  type RotateFilters,
+  type RotatePreview,
+  type RotateDryRun,
+  type RotateResult,
   type TokenRow,
 } from "../api/client.js";
 import { useFocusCapture } from "../focus.js";
 import { MgmtTokenPrompt } from "./MgmtTokenPrompt.js";
 import { IssueTokenForm, IssuedReveal } from "./IssueTokenForm.js";
+import { RotateTokensFlow, type RotateStep, type RotateResumeAt } from "./RotateTokensFlow.js";
 
-// Phase 4.1 c2 / c4 — Tokens screen.
+// Phase 4.1 c2 / c4 / c5a — Tokens screen.
 //
 // Filter focus model (locked in memory/decision_phase_4_1_c1.md "c2
 // filter focus model"):
@@ -23,25 +28,35 @@ import { IssueTokenForm, IssuedReveal } from "./IssueTokenForm.js";
 //   Enter      open selected row's detail panel
 //   Esc        close detail panel
 //   i          (c4) issue new token — prompts for mgmt JWT if needed
+//   R          (c5a) rotate matched tokens — 4-step ceremony
 //
 // Detail-panel hotkeys (c4):
 //   x          revoke this token (inline two-step y/n confirm)
 //
-// Modal stack (c4): single tagged-union state machine. The auth-recovery
-// flow (issue/revoke → 401 → mgmt prompt → resume) is encoded by the
-// `pending` field on the mgmtPrompt modal. Rotate (c5) extends this
-// shape; if the stack starts nesting we upgrade to a useReducer-based
-// modal stack (c1 invariant 10 escape hatch).
+// Modal stack (c4 + c5a): single tagged-union state machine, 8 variants.
+// The auth-recovery flow (issue/revoke/rotate → 401 → mgmt prompt →
+// resume) is encoded by the `pending` field on the mgmtPrompt modal.
+// Rotate's three resumeAt cases collapse to filter-step re-entry (the
+// fleet may have shifted between arm and re-auth — re-walk is correct).
+// If the stack starts nesting in c5b/c6 we upgrade to a useReducer-based
+// modal stack (c1 invariant 10 escape hatch). At 8 variants today the
+// union still reads cleaner than a reducer (c4 invariant 1's threshold
+// is implicitly about nested/stacked modals, not sequential ones).
 
 type PendingAction =
   | { kind: "issue" }
-  | { kind: "revoke"; tokenId: string; label: string };
+  | { kind: "revoke"; tokenId: string; label: string }
+  | { kind: "rotate"; filters: RotateFilters; resumeAt: RotateResumeAt };
 
 type ModalState =
   | { kind: "none" }
   | { kind: "mgmtPrompt"; reason?: string; pending: PendingAction }
   | { kind: "issue" }
-  | { kind: "issueReveal"; response: IssueTokenResponse };
+  | { kind: "issueReveal"; response: IssueTokenResponse }
+  | { kind: "rotateFilter"; initial: RotateFilters }
+  | { kind: "rotatePreview"; filters: RotateFilters; data: RotatePreview }
+  | { kind: "rotateDryRun"; filters: RotateFilters; data: RotateDryRun }
+  | { kind: "rotateReveal"; result: RotateResult };
 
 type StatusFilter = "active" | "revoked" | "all";
 const STATUS_CYCLE: StatusFilter[] = ["active", "revoked", "all"];
@@ -174,6 +189,19 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
     setModal({ kind: "issue" });
   };
 
+  const openRotate = () => {
+    if (!client.hasMgmtToken()) {
+      // No filters collected yet — resumeAt is irrelevant for this case;
+      // onAuthConfirmed routes to filter step on filters=={} regardless.
+      setModal({
+        kind: "mgmtPrompt",
+        pending: { kind: "rotate", filters: {}, resumeAt: "preview" },
+      });
+      return;
+    }
+    setModal({ kind: "rotateFilter", initial: {} });
+  };
+
   const performRevoke = async (tokenId: string, label: string) => {
     setRevokeError(null);
     try {
@@ -199,6 +227,17 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
   const onAuthConfirmed = (pending: PendingAction) => {
     if (pending.kind === "issue") {
       setModal({ kind: "issue" });
+      return;
+    }
+    if (pending.kind === "rotate") {
+      // c5a: all three resumeAt cases collapse to filter-step re-entry.
+      // Filters were already typed (unless this was an initial open with
+      // no token — filters=={} — in which case the operator hasn't picked
+      // a target yet). The fleet may have shifted between arm and re-auth;
+      // forcing a re-walk is the correct ceremony, not a footgun
+      // shortcut. The resumeAt field is preserved on the pending shape
+      // for future-proofing / telemetry.
+      setModal({ kind: "rotateFilter", initial: pending.filters });
       return;
     }
     // revoke: re-fire and clear modal. If it 401s again the screen will
@@ -234,6 +273,12 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
       }
       if (input === "i") {
         openIssue();
+        return;
+      }
+      if (input === "R") {
+        // Capital R — destructive sibling of lowercase r (refresh).
+        // c5a: opens the 4-step rotate ceremony.
+        openRotate();
         return;
       }
       if (key.upArrow) {
@@ -359,8 +404,45 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
           onDismiss={() => setModal({ kind: "none" })}
         />
       ) : null}
+      {modal.kind === "rotateFilter" ||
+      modal.kind === "rotatePreview" ||
+      modal.kind === "rotateDryRun" ||
+      modal.kind === "rotateReveal" ? (
+        <RotateTokensFlow
+          client={client}
+          step={modalToRotateStep(modal)}
+          onTransition={(next: RotateStep) => setModal(rotateStepToModal(next))}
+          onClose={() => setModal({ kind: "none" })}
+          onNeedsAuth={(filters, resumeAt) =>
+            setModal({
+              kind: "mgmtPrompt",
+              pending: { kind: "rotate", filters, resumeAt },
+            })
+          }
+          onExecuted={() => setRefreshTick((n) => n + 1)}
+        />
+      ) : null}
     </Box>
   );
+}
+
+function modalToRotateStep(modal: ModalState): RotateStep {
+  if (modal.kind === "rotateFilter") return { kind: "filter", initial: modal.initial };
+  if (modal.kind === "rotatePreview")
+    return { kind: "preview", filters: modal.filters, data: modal.data };
+  if (modal.kind === "rotateDryRun")
+    return { kind: "dryRun", filters: modal.filters, data: modal.data };
+  if (modal.kind === "rotateReveal") return { kind: "reveal", result: modal.result };
+  throw new Error(`unreachable: modal.kind=${modal.kind}`);
+}
+
+function rotateStepToModal(step: RotateStep): ModalState {
+  if (step.kind === "filter") return { kind: "rotateFilter", initial: step.initial };
+  if (step.kind === "preview")
+    return { kind: "rotatePreview", filters: step.filters, data: step.data };
+  if (step.kind === "dryRun")
+    return { kind: "rotateDryRun", filters: step.filters, data: step.data };
+  return { kind: "rotateReveal", result: step.result };
 }
 
 function Header({
@@ -439,7 +521,7 @@ function HotkeyHint() {
   return (
     <Box>
       <Text color="gray">
-        <Text color="white">↑↓</Text> move  <Text color="white">Enter</Text> detail  <Text color="white">f</Text> filter  <Text color="white">/</Text> search  <Text color="white">c</Text> clear  <Text color="white">r</Text> refresh  <Text color="white">i</Text> issue
+        <Text color="white">↑↓</Text> move  <Text color="white">Enter</Text> detail  <Text color="white">f</Text> filter  <Text color="white">/</Text> search  <Text color="white">c</Text> clear  <Text color="white">r</Text> refresh  <Text color="white">i</Text> issue  <Text color="red">R</Text> rotate
       </Text>
     </Box>
   );

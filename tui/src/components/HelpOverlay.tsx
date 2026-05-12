@@ -45,6 +45,15 @@ export function HelpOverlay() {
           A `brkm_…` mgmt token is prompted on first admin action and cached for this TUI process only.
         </Text>
       </Box>
+      <Box marginTop={1} flexDirection="column">
+        <Text color="gray">Tokens admin (c5a):</Text>
+        <Text>
+          <Text color="red">R</Text> rotate matched (4-step ceremony)
+        </Text>
+        <Text color="gray" dimColor>
+          filter → preview → dryRun (<Text color="yellow">x</Text> arms · <Text color="yellow">y</Text> fires) → reveal. Lowercase = read, capital = destructive.
+        </Text>
+      </Box>
       <Box marginTop={1}>
         <Text color="gray">press ? or Esc to dismiss</Text>
       </Box>

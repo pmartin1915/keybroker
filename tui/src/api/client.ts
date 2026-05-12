@@ -117,6 +117,53 @@ export interface RevokeTokenResponse {
   alreadyRevoked?: boolean;
 }
 
+// Phase 4.1 c5a: rotate-all DTOs. Mirror web/'s RotateFilters /
+// RotatePreview / RotateDryRun / RotateResult — same endpoint
+// (POST /admin/tokens/rotate), same flag semantics, same wire shape.
+// Kept intentionally redeclared, not imported from web/.
+export interface RotateFilters {
+  team?: string;
+  project?: string;
+  env?: string;
+  machine?: string;
+  provider?: string;
+}
+
+export interface RotatePreview {
+  filters: RotateFilters;
+  preview: {
+    total: number;
+    byMachine: Record<string, number>;
+    byTeam: Record<string, number>;
+    byProject: Record<string, number>;
+    byEnv: Record<string, number>;
+  };
+}
+
+export interface RotateDryRun {
+  filters: RotateFilters;
+  plan: Array<{
+    oldId: string;
+    newId: string;
+    label: string;
+    noModelsClaim: boolean;
+  }>;
+  expired: Array<{ id: string; label: string }>;
+}
+
+export interface RotateResult {
+  filters: RotateFilters;
+  revoked: number;
+  reissued: Array<{
+    oldId: string;
+    newId: string;
+    label: string;
+    jwt: string;
+    noModelsClaim: boolean;
+  }>;
+  expired: Array<{ id: string; label: string }>;
+}
+
 export class BrokerClient {
   readonly baseUrl: string;
   private mgmtToken: string | undefined;
@@ -238,6 +285,30 @@ export class BrokerClient {
       "DELETE",
       `/admin/tokens/${encodeURIComponent(id)}`,
     );
+  }
+
+  // Phase 4.1 c5a: rotate-all. Three modes off one endpoint via flags.
+  // Empty filters surface as Error (broker returns 400 `no_filters`); the
+  // client-side gate in RotateTokensFlow keeps it from being a routine
+  // round-trip. MgmtAuthError on 401 (handled by adminFetch).
+  rotatePreview(filters: RotateFilters): Promise<RotatePreview> {
+    return this.adminFetch<RotatePreview>("POST", "/admin/tokens/rotate", {
+      filters,
+      preview: true,
+    });
+  }
+
+  rotateDryRun(filters: RotateFilters): Promise<RotateDryRun> {
+    return this.adminFetch<RotateDryRun>("POST", "/admin/tokens/rotate", {
+      filters,
+      dryRun: true,
+    });
+  }
+
+  rotateExecute(filters: RotateFilters): Promise<RotateResult> {
+    return this.adminFetch<RotateResult>("POST", "/admin/tokens/rotate", {
+      filters,
+    });
   }
 
   fetchHealth(): Promise<HealthResponse> {
