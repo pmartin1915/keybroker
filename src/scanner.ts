@@ -1,10 +1,16 @@
 /**
- * Phase 3.6 — inline secret scanning, Layer 1 (regex).
+ * Phase 3.6 / 4.2a — inline secret scanning, Layer 1 + Layer 1.5 (regex +
+ * decode-then-scan).
  *
  * The scanner runs against the request body buffer BEFORE upstream is
  * dialled. A hit terminates the request with HTTP 403 and the audit row
  * records `outcome: "egress_blocked"` with `reason: "<detector_name>"`.
  * This is the broker's headline differentiator: not redact, BLOCK.
+ *
+ * Phase 4.2a adds Layer 1.5: the raw buffer is first scanned as-is, then
+ * each of three decoded views (base64, urlencode, json-string-unescape) is
+ * scanned in declared order. First detector hit on any view wins. The
+ * ScanHit shape and the call site signature are unchanged.
  *
  * Design constraints:
  *   - **Detector names only — never the matched substring.** The matched
@@ -20,10 +26,21 @@
  *   - **First-hit short-circuits.** We don't need an exhaustive list —
  *     one detected secret is enough to block. Bounds the worst-case
  *     latency on adversarial bodies.
+ *   - **Max one layer of decoding.** Decoded views are scanned once; the
+ *     decoders themselves do not recurse. Nested encoding (base64 of
+ *     base64) is never a block trigger on its own.
+ *   - **Fail-open on decode errors.** A view that cannot be decoded is
+ *     silently skipped; the remaining views and the raw scan are
+ *     unaffected.
+ *   - **No "matched in decoded view" audit field.** The single terminal
+ *     outcome is the detector name — surfacing the path would leak
+ *     attacker-helpful information.
  *
- * Layer 2 (TruffleHog verification) and Layer 3 (Presidio / SLM PII)
- * live in Phase 4.2 and run as separate processes.
+ * Layer 2 (TruffleHog verification) lives in Phase 4.2b.
+ * Layer 3 (PII) has been dropped from Phase 4.2.
  */
+
+import { DECODERS } from "./decode.js";
 
 /** A single secret pattern. */
 export interface Detector {
@@ -89,8 +106,31 @@ export function getBuiltinDetector(name: string): Detector | undefined {
 }
 
 /**
+ * Run one set of detectors against a single text view. Internal helper.
+ * Returns the first hit or null. Resets lastIndex for each `/g` pattern.
+ */
+function scanText(
+  text: string,
+  detectors: readonly Detector[],
+): ScanHit | null {
+  for (const det of detectors) {
+    // Reset lastIndex so a `/g` regex doesn't carry state across calls.
+    det.pattern.lastIndex = 0;
+    if (det.pattern.test(text)) {
+      return { detector: det.name };
+    }
+  }
+  return null;
+}
+
+/**
  * Scan a buffer for the first matching detector. Returns the hit (by
  * detector name) or null if nothing matched.
+ *
+ * Phase 4.2a — Layer 1.5 extension: after scanning the raw buffer, each
+ * decoder in DECODERS is applied (base64, urlencode, json-string-unescape)
+ * and the resulting decoded view is scanned with the same detector list.
+ * First hit on any view wins. Decode errors are skipped silently (fail-open).
  *
  * The buffer is interpreted as UTF-8 — this matches the broker's body
  * shape: every supported provider sends JSON, which is UTF-8 by spec.
@@ -102,6 +142,9 @@ export function getBuiltinDetector(name: string): Detector | undefined {
  * The detectors are scanned in order — first hit wins. Each pattern is
  * given a fresh string slice (no shared exec state across detectors).
  *
+ * The call site signature is unchanged from Phase 3.6 (invariant in
+ * decision_phase_4_2_a_decoding.md).
+ *
  * @param buf - request body bytes. Pass an empty buffer for "nothing to scan".
  * @param detectors - which detectors to apply (typically `BUILTIN_DETECTORS`
  *                    filtered by policy).
@@ -112,14 +155,28 @@ export function scanBytes(
 ): ScanHit | null {
   if (!buf || buf.byteLength === 0) return null;
   if (detectors.length === 0) return null;
-  const text = buf.toString("utf8");
-  for (const det of detectors) {
-    // Reset lastIndex so a `/g` regex doesn't carry state across calls.
-    det.pattern.lastIndex = 0;
-    if (det.pattern.test(text)) {
-      return { detector: det.name };
+
+  // Layer 1: raw buffer scan.
+  const rawText = buf.toString("utf8");
+  const rawHit = scanText(rawText, detectors);
+  if (rawHit) return rawHit;
+
+  // Layer 1.5: decoded views, in declared decoder order (first-hit-wins).
+  // Max one layer of decoding — decoders themselves do not recurse.
+  for (const decoder of DECODERS) {
+    let decoded: Buffer | null;
+    try {
+      decoded = decoder.fn(buf);
+    } catch {
+      // Unexpected decode error — fail-open (invariant 5), skip view.
+      continue;
     }
+    if (!decoded || decoded.byteLength === 0) continue;
+    const decodedText = decoded.toString("utf8");
+    const hit = scanText(decodedText, detectors);
+    if (hit) return hit;
   }
+
   return null;
 }
 
