@@ -15,7 +15,7 @@ Working tree clean, **not pushed**. One commit since the prior handoff
 
 | Commit | What |
 |---|---|
-| `68ee802` | **feat(scanner): Phase 4.2a — decode-then-scan Layer 1.5.** New `src/decode.ts` (3 pure decoders), `scanBytes` extended to scan raw + each decoded view, 37 new tests. |
+| `771ac70` | **feat(scanner): Phase 4.2a — decode-then-scan Layer 1.5.** New `src/decode.ts` (3 pure decoders), `scanBytes` extended to scan raw + each decoded view, 37 new tests. |
 
 509 → 546 tests, typecheck clean, main bundle unchanged (broker-side only).
 
@@ -148,7 +148,7 @@ Sonnet-implement pass.
 
 ## State of related repos
 
-- **keybroker:** clean at `68ee802`. 546 tests pass.
+- **keybroker:** clean at `771ac70`. 546 tests pass.
 - **claude-budget-dispatcher:** unchanged this session. The Phase 3.2
   c4 broker routing change in `provider.mjs` is still opt-in; flipping
   `KEYBROKER_ROUTE` default-on is a one-line dispatcher change whenever
@@ -160,7 +160,7 @@ Sonnet-implement pass.
 
 ```sh
 # verify Phase 4.2a is in
-git log --oneline -3   # 68ee802, 9acfa0e, 76d2855
+git log --oneline -4   # 35ebac4, 771ac70, 9acfa0e, 76d2855
 
 # run just the new tests
 npx vitest run tests/decode.test.ts
@@ -189,7 +189,7 @@ npm test
 ## Final state
 
 - `origin/main` (remote): `9acfa0e` (last push was the prior handoff).
-- Local `main`: `68ee802` (4.2a feature commit, **unpushed**).
+- Local `main` = `origin/main`: `35ebac4` (handoff) atop `771ac70` (4.2a feature). **Pushed.**
 - 546 tests, typecheck clean, main bundle 224 KB (web unchanged).
 - Phase 4.2a: **shipped, awaiting push.**
 - Phase 4.2b: **next strict action.** Opus should lock invariants
