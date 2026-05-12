@@ -36,6 +36,15 @@ export function HelpOverlay() {
         </Text>
         <Text color="gray" dimColor>Tokens: f cycles status  ·  Audit: f cycles outcome</Text>
       </Box>
+      <Box marginTop={1} flexDirection="column">
+        <Text color="gray">Tokens admin (c4):</Text>
+        <Text>
+          <Text color="yellow">i</Text> issue token  ·  detail panel: <Text color="yellow">x</Text> revoke (<Text color="yellow">y</Text> confirm / <Text color="yellow">n</Text> cancel)
+        </Text>
+        <Text color="gray" dimColor>
+          A `brkm_…` mgmt token is prompted on first admin action and cached for this TUI process only.
+        </Text>
+      </Box>
       <Box marginTop={1}>
         <Text color="gray">press ? or Esc to dismiss</Text>
       </Box>

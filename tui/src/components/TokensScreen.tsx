@@ -1,10 +1,17 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import TextInput from "ink-text-input";
-import { type BrokerClient, type TokenRow } from "../api/client.js";
+import {
+  MgmtAuthError,
+  type BrokerClient,
+  type IssueTokenResponse,
+  type TokenRow,
+} from "../api/client.js";
 import { useFocusCapture } from "../focus.js";
+import { MgmtTokenPrompt } from "./MgmtTokenPrompt.js";
+import { IssueTokenForm, IssuedReveal } from "./IssueTokenForm.js";
 
-// Phase 4.1 c2 — Tokens screen (read-only filterable list).
+// Phase 4.1 c2 / c4 — Tokens screen.
 //
 // Filter focus model (locked in memory/decision_phase_4_1_c1.md "c2
 // filter focus model"):
@@ -15,8 +22,26 @@ import { useFocusCapture } from "../focus.js";
 //   up/down    move row cursor
 //   Enter      open selected row's detail panel
 //   Esc        close detail panel
+//   i          (c4) issue new token — prompts for mgmt JWT if needed
 //
-// Row affordances (revoke/issue/rotate) and multi-select land in c4/c5.
+// Detail-panel hotkeys (c4):
+//   x          revoke this token (inline two-step y/n confirm)
+//
+// Modal stack (c4): single tagged-union state machine. The auth-recovery
+// flow (issue/revoke → 401 → mgmt prompt → resume) is encoded by the
+// `pending` field on the mgmtPrompt modal. Rotate (c5) extends this
+// shape; if the stack starts nesting we upgrade to a useReducer-based
+// modal stack (c1 invariant 10 escape hatch).
+
+type PendingAction =
+  | { kind: "issue" }
+  | { kind: "revoke"; tokenId: string; label: string };
+
+type ModalState =
+  | { kind: "none" }
+  | { kind: "mgmtPrompt"; reason?: string; pending: PendingAction }
+  | { kind: "issue" }
+  | { kind: "issueReveal"; response: IssueTokenResponse };
 
 type StatusFilter = "active" | "revoked" | "all";
 const STATUS_CYCLE: StatusFilter[] = ["active", "revoked", "all"];
@@ -69,15 +94,19 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
   const [searchDraft, setSearchDraft] = useState("");
   const [cursor, setCursor] = useState(0);
   const [detailOpen, setDetailOpen] = useState(false);
+  const [modal, setModal] = useState<ModalState>({ kind: "none" });
+  const [revokeConfirming, setRevokeConfirming] = useState(false);
+  const [revokeError, setRevokeError] = useState<string | null>(null);
   const focus = useFocusCapture();
 
-  // The /-search input owns stdin while open. Same gate detail-open
-  // uses — Esc must reach the detail handler without being eaten
-  // by App-level hotkeys.
+  // The /-search input, detail panel, and any modal own stdin while
+  // active. Esc must reach the right handler — gating useInputs via
+  // isActive flags is the only way Ink lets us swallow events.
+  const modalOpen = modal.kind !== "none";
   useEffect(() => {
-    focus.setCapture(searchMode || detailOpen);
+    focus.setCapture(searchMode || detailOpen || modalOpen);
     return () => focus.setCapture(false);
-  }, [searchMode, detailOpen, focus]);
+  }, [searchMode, detailOpen, modalOpen, focus]);
 
   useEffect(() => {
     let cancelled = false;
@@ -129,8 +158,57 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
     if (cursor >= filtered.length) setCursor(Math.max(0, filtered.length - 1));
   }, [filtered.length, cursor]);
 
-  // Hotkeys for the screen itself. Disabled while search-mode or
-  // detail-overlay owns input.
+  // ── Admin actions ────────────────────────────────────────────────
+  //
+  // Auth-recovery contract (c4 web parity): if any admin call throws
+  // MgmtAuthError, push a MgmtTokenPrompt with the pending action stored
+  // on it. The prompt's onConfirmed re-fires the pending action — form
+  // state for `issue` is dropped intentionally (user re-fills after
+  // auth), `revoke` carries its target id so the user doesn't have to
+  // re-navigate to the row.
+  const openIssue = () => {
+    if (!client.hasMgmtToken()) {
+      setModal({ kind: "mgmtPrompt", pending: { kind: "issue" } });
+      return;
+    }
+    setModal({ kind: "issue" });
+  };
+
+  const performRevoke = async (tokenId: string, label: string) => {
+    setRevokeError(null);
+    try {
+      await client.revokeProxyToken(tokenId);
+      // Refresh the list so the row flips to REVOKED visually and close
+      // the detail panel — the row's affordance is no longer meaningful.
+      setRefreshTick((n) => n + 1);
+      setDetailOpen(false);
+    } catch (e) {
+      if (e instanceof MgmtAuthError) {
+        setDetailOpen(false);
+        setModal({
+          kind: "mgmtPrompt",
+          reason: e.message,
+          pending: { kind: "revoke", tokenId, label },
+        });
+        return;
+      }
+      setRevokeError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const onAuthConfirmed = (pending: PendingAction) => {
+    if (pending.kind === "issue") {
+      setModal({ kind: "issue" });
+      return;
+    }
+    // revoke: re-fire and clear modal. If it 401s again the screen will
+    // re-push the prompt; the user's only escape is Esc-cancelling.
+    setModal({ kind: "none" });
+    void performRevoke(pending.tokenId, pending.label);
+  };
+
+  // Hotkeys for the screen itself. Disabled while search-mode, detail-
+  // overlay, or any modal owns input.
   useInput(
     (input, key) => {
       if (input === "/") {
@@ -154,6 +232,10 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
         setRefreshTick((n) => n + 1);
         return;
       }
+      if (input === "i") {
+        openIssue();
+        return;
+      }
       if (key.upArrow) {
         setCursor((n) => Math.max(0, n - 1));
         return;
@@ -164,18 +246,46 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
       }
       if (key.return && filtered.length > 0) {
         setDetailOpen(true);
+        setRevokeConfirming(false);
+        setRevokeError(null);
         return;
       }
     },
-    { isActive: !searchMode && !detailOpen },
+    { isActive: !searchMode && !detailOpen && !modalOpen },
   );
 
-  // Detail overlay: Esc closes. Capture is on, so App-level nav is gated.
+  // Detail overlay: Esc closes, x triggers two-step revoke. Confirm with
+  // y, cancel with n / Esc. Disabled while a modal owns input (auth
+  // prompt over detail panel) so Esc bubbles to the modal handler.
   useInput(
-    (_input, key) => {
-      if (key.escape) setDetailOpen(false);
+    (input, key) => {
+      if (revokeConfirming) {
+        if (input === "y") {
+          const row = filtered[cursor];
+          if (row && !row.revoked) {
+            setRevokeConfirming(false);
+            void performRevoke(row.id, row.label);
+          }
+          return;
+        }
+        if (input === "n" || key.escape) {
+          setRevokeConfirming(false);
+          return;
+        }
+        return;
+      }
+      if (key.escape) {
+        setDetailOpen(false);
+        setRevokeError(null);
+        return;
+      }
+      if (input === "x") {
+        const row = filtered[cursor];
+        if (row && !row.revoked) setRevokeConfirming(true);
+        return;
+      }
     },
-    { isActive: detailOpen },
+    { isActive: detailOpen && !modalOpen },
   );
 
   const selectedRow = filtered[cursor];
@@ -204,7 +314,51 @@ export function TokensScreen({ client }: { client: BrokerClient }) {
       ) : null}
       <TokenTable rows={filtered} cursor={cursor} loading={state.loading} />
       <HotkeyHint />
-      {detailOpen && selectedRow ? <TokenDetail row={selectedRow} /> : null}
+      {revokeError ? (
+        <Box borderStyle="single" borderColor="red" paddingX={1}>
+          <Text color="red">revoke failed: {revokeError}</Text>
+        </Box>
+      ) : null}
+      {detailOpen && selectedRow ? (
+        <TokenDetail
+          row={selectedRow}
+          confirming={revokeConfirming}
+          modalOpen={modalOpen}
+        />
+      ) : null}
+      {modal.kind === "mgmtPrompt" ? (
+        <MgmtTokenPrompt
+          client={client}
+          initialReason={modal.reason}
+          onConfirmed={() => onAuthConfirmed(modal.pending)}
+          onCancel={() => setModal({ kind: "none" })}
+        />
+      ) : null}
+      {modal.kind === "issue" ? (
+        <IssueTokenForm
+          client={client}
+          onCancel={() => setModal({ kind: "none" })}
+          onIssued={(response) => {
+            setModal({ kind: "issueReveal", response });
+            // Refresh the list so the new token appears once the operator
+            // dismisses the reveal.
+            setRefreshTick((n) => n + 1);
+          }}
+          onNeedsAuth={(reason) =>
+            setModal({
+              kind: "mgmtPrompt",
+              reason,
+              pending: { kind: "issue" },
+            })
+          }
+        />
+      ) : null}
+      {modal.kind === "issueReveal" ? (
+        <IssuedReveal
+          response={modal.response}
+          onDismiss={() => setModal({ kind: "none" })}
+        />
+      ) : null}
     </Box>
   );
 }
@@ -285,7 +439,7 @@ function HotkeyHint() {
   return (
     <Box>
       <Text color="gray">
-        <Text color="white">↑↓</Text> move  <Text color="white">Enter</Text> detail  <Text color="white">f</Text> filter  <Text color="white">/</Text> search  <Text color="white">c</Text> clear  <Text color="white">r</Text> refresh
+        <Text color="white">↑↓</Text> move  <Text color="white">Enter</Text> detail  <Text color="white">f</Text> filter  <Text color="white">/</Text> search  <Text color="white">c</Text> clear  <Text color="white">r</Text> refresh  <Text color="white">i</Text> issue
       </Text>
     </Box>
   );
@@ -375,10 +529,20 @@ function TokenLine({ row, active }: { row: TokenRow; active: boolean }) {
   );
 }
 
-function TokenDetail({ row }: { row: TokenRow }) {
+function TokenDetail({
+  row,
+  confirming,
+  modalOpen,
+}: {
+  row: TokenRow;
+  confirming: boolean;
+  modalOpen: boolean;
+}) {
   // Mirrors HelpOverlay's render-below-the-fold pattern (Ink 5 has no
   // portal). Capture is on, so global hotkeys are gated; Esc closes.
-  // Read-only — revoke affordance lands in c4 with the mgmt JWT modal.
+  // c4 added inline two-step revoke: `x` arms `confirming`, `y`
+  // confirms / `n` / `Esc` cancels. Auth recovery happens at the
+  // screen level by pushing a mgmt-prompt modal on MgmtAuthError.
   return (
     <Box
       flexDirection="column"
@@ -420,9 +584,32 @@ function TokenDetail({ row }: { row: TokenRow }) {
         <DetailLine label="Expires" value={fmtExpiry(row.expiresAt)} />
         <DetailLine label="Created" value={new Date(row.createdAt).toLocaleString()} />
       </Box>
-      <Box marginTop={1}>
-        <Text color="gray">Esc to close · revoke lands in Phase 4.1 c4</Text>
-      </Box>
+      {row.revoked ? null : modalOpen ? (
+        <Box marginTop={1}>
+          <Text color="gray" dimColor>(action paused — handle mgmt prompt first)</Text>
+        </Box>
+      ) : confirming ? (
+        <Box
+          marginTop={1}
+          borderStyle="single"
+          borderColor="red"
+          paddingX={1}
+          flexDirection="column"
+        >
+          <Text color="red">
+            Revoke <Text bold>{row.label}</Text>? Immediate, cannot be undone.
+          </Text>
+          <Text color="gray">
+            <Text color="red" bold>y</Text> confirm  <Text color="white" bold>n</Text> / <Text color="white" bold>Esc</Text> cancel
+          </Text>
+        </Box>
+      ) : (
+        <Box marginTop={1}>
+          <Text color="gray">
+            <Text color="white">Esc</Text> close  <Text color="red">x</Text> revoke
+          </Text>
+        </Box>
+      )}
     </Box>
   );
 }
