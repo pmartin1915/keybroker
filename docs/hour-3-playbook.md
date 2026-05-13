@@ -99,6 +99,22 @@ back-and-forth on security findings is how 2026-style brand damage
 happens — see the LiteLLM CVE-2026-42208 thread for the negative
 example.
 
+**Expected high-likelihood takedown** (per PAL adversarial-commenter
+audit, 2026-05-13): some variant of *"HS256-only signing plus
+loopback-only transport equals fundamentally insecure for a security
+tool."* This is the most-upvoted hostile comment any of the three
+drafts is likely to draw. Do **not** pre-emptively rewrite the drafts
+to defuse it — the experiment is testing whether real operators raise
+it. Canned response if it surfaces: *"Single-tenant appliance —
+the broker holds both ends of the signing key, so asymmetric signing
+adds no security in this threat model; loopback-only is the deployment
+shape, not a TLS oversight. If you need RS256 / multi-tenant /
+network-exposed, this project isn't shaped for it."* Reply once, do
+not debate further. If multiple distinct operator-shaped accounts
+raise this independently, that *is* deploy-blocking signal and the
+invest path includes RS256 in scope; one or two hostile non-operator
+voices is not.
+
 **Reply shape:** ≤3 sentences. Answer the question, link to the
 specific file/doc if relevant, no marketing voice.
 
