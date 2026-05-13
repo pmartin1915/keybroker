@@ -1,0 +1,22 @@
+# gitleaks ignore — only explicit fingerprints, never blanket directories.
+#
+# Each line is a SHA1 fingerprint emitted by `gitleaks detect`. Adding a
+# fingerprint here suppresses ONLY that exact commit:file:rule:line —
+# a different synthetic secret in the same file would still get flagged.
+#
+# All entries below are synthetic test fixtures: the scanner's own test
+# suite needs real-shape patterns to verify Layer 1 regex detection.
+# None are credentials that ever existed on any real account.
+
+# tests/decode.test.ts:247 — JSON-escaped synthetic Stripe key
+# ("sk_live_..." used to force the JSON-string-unescape decoder path)
+771ac70ad0d028af938135d8ba4cf395de2de94c:tests/decode.test.ts:stripe-access-token:247
+
+# tests/scanner.test.ts:66 — synthetic AKIA1234567890ABCDEF (placeholder pattern)
+151552ea765752e6c6b4bb6c39082a10ea6beed3:tests/scanner.test.ts:generic-api-key:66
+
+# tests/scanner.test.ts:97 — synthetic Slack xoxb token constructed via "A".repeat(24)
+151552ea765752e6c6b4bb6c39082a10ea6beed3:tests/scanner.test.ts:slack-bot-token:97
+
+# tests/scanner.test.ts:101 — synthetic Slack xoxb shape (negative test fixture)
+151552ea765752e6c6b4bb6c39082a10ea6beed3:tests/scanner.test.ts:slack-bot-token:101
