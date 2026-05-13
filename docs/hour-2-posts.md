@@ -40,19 +40,20 @@ that look like API keys, holds the real upstream key locally, and logs every
 call with attribution (machine, token label, duration, cost).
 
 The piece I'm trying to validate is the **two-layer scanner**: Layer 1 is
-regex + base64/url/hex decoding (so `echo $TOKEN | base64` doesn't bypass it);
-Layer 1.5 retries against decoded payloads; Layer 2 calls GitHub
-`/user`, Stripe `/v1/balance`, or AWS STS `GetCallerIdentity` to confirm the
-secret is **active**, then writes `verified=1` to the audit row before
-blocking. False positives stay `verified=null` and don't pollute the alert
-stream.
+regex against the raw request body; Layer 1.5 re-runs that regex against
+decoded views (base64, URL-encoding, JSON-string-unescape) so an encoded
+secret in a prompt doesn't slip through; Layer 2 calls GitHub `/user`,
+Stripe `/v1/balance`, or AWS STS `GetCallerIdentity` to confirm the secret
+is **active**, then writes `verified=1` to the audit row before blocking.
+False positives stay `verified=null` and don't pollute the alert stream.
 
 [screenshot: Web UI Audit screen — verified=1 row on a GitHub PAT]
 
 Pre-1.0, single-tenant, HS256 only, no rate limiter, no SOC2. Built as an
 appliance for one team / one homelab, not a SaaS. Master key lives in your OS
-keychain (Wincred / macOS Keychain / libsecret). 630 tests, 120 covering the
-scan+verify layers.
+keychain via keytar (Wincred / macOS Keychain / libsecret); headless Linux
+servers without a session bus fall back to a 0600 file at
+`$KEYBROKER_KEYCHAIN_PATH`. 630 tests, 120 covering the scan+verify layers.
 
 Repo (MIT): https://github.com/pmartin1915/keybroker
 
@@ -62,7 +63,7 @@ Happy to answer deployment questions.
 
 ## Variant 2 — r/devops
 
-**Title:** OSS alternative to LiteLLM with built-in verified secret scanning (LiteLLM gates this behind Enterprise)
+**Title:** OSS self-hosted LLM proxy with built-in verified secret scanning — a one-binary alternative to LiteLLM Enterprise
 
 **Body:**
 
@@ -71,27 +72,34 @@ verified secret detection in the free build. I've been watching the
 LiteLLM security incident pattern (March 2026 supply-chain compromise,
 CVE-2026-42208 pre-auth SQLi exploited within 36 hours, the guardrail
 logging leak) and decided to take a different approach: smaller surface,
-self-hosted appliance, one binary.
+self-hosted appliance, one binary, loopback-only by default.
 
 What's in the free OSS build:
 
 - Drop-in `OPENAI_BASE_URL` proxy. Your code doesn't change.
 - Scoped JWT-style tokens (`brk_…`) with path/method scopes, max-calls,
   TTL, and machine attribution.
-- **Layer 1.5 scanner** — regex + decode (base64 / url / hex) so an
-  encoded secret in a prompt doesn't bypass detection.
+- **Layer 1.5 scanner** — regex against decoded views of the request
+  body (base64, URL-encoding, JSON-string-unescape) so an encoded
+  secret in a prompt doesn't bypass detection.
 - **Layer 2 live verification** — on a Layer 1 hit, the proxy calls
-  GitHub / Stripe / AWS STS to confirm the credential is active before
-  blocking. Audit log distinguishes `verified=1` from `verified=null`
-  (regex match, not confirmed live), so your incident-response stream
-  isn't full of false positives.
+  GitHub `/user`, Stripe `/v1/balance`, or AWS STS `GetCallerIdentity`
+  to confirm the credential is active before blocking. Audit log
+  distinguishes `verified=1` from `verified=null` (regex match, not
+  confirmed live), so your incident-response stream isn't full of
+  false positives. Trade-off: verification is a live call from the
+  broker's egress IP using the leaked credential, so it shows up on the
+  upstream provider's audit log (GitHub login activity, Stripe rate
+  counters, AWS CloudTrail). Operators must accept this — fail-closed
+  default with a policy.json opt-out.
 - SQLite-backed call log with cost attribution and FinOps forecasting.
 - Web UI + TUI + CLI for the admin surface. Management JWTs (`brkm_…`)
   are signed with a separate secret so leaking an issue-token never
-  confers admin rights.
+  confers admin rights (also HS256 — same caveat as issue tokens).
 
 Honest scope: pre-1.0, single-tenant, HS256-only signing, no rate
-limiter, no SOC2 / SSO / RBAC. Built as a one-team appliance, not a
+limiter, no SOC2 / SSO / RBAC, no transport auth on the broker itself
+(loopback-only by convention). Built as a one-team appliance, not a
 multi-tenant SaaS. If you need any of those things, this isn't ready.
 
 If you just want regex-only scanning, LiteLLM Enterprise covers it. If
@@ -123,24 +131,42 @@ May 2026 — TruffleHog verifies but isn't LLM-aware; LiteLLM is
 LLM-aware but its secret detection is regex-only and Enterprise-gated.
 
 ```
-$ npx tsx src/cli.ts logs -n 3 --machine perry-pc
-2026-05-12T18:42:11Z  BLOCKED  403  POST    openai/v1/chat/completions  12ms   token=brk_a1b2  machine=perry-pc  scan:github_pat verified=1
-2026-05-12T18:41:58Z  OK       200  POST    openai/v1/chat/completions  812ms  token=brk_a1b2  machine=perry-pc
-2026-05-12T18:41:42Z  BLOCKED  403  POST    anthropic/v1/messages       9ms    token=brk_a1b2  machine=perry-pc  scan:aws_key   verified=null
+$ sqlite3 ~/.keybroker/keybroker.db <<'SQL'
+SELECT ts, scan_detector, scan_verified, provider, path
+FROM calls
+WHERE scan_blocked = 1
+ORDER BY ts DESC LIMIT 5;
+SQL
+2026-05-12T18:42:11Z|github_pat|1|openai|/v1/chat/completions
+2026-05-12T18:41:42Z|aws_key||anthropic|/v1/messages
+2026-05-12T18:33:07Z|stripe_live_key|1|openai|/v1/chat/completions
 ```
 
-(The CLI rendering above adds the `scan:` suffix manually — by default
-`logs` omits the scan column. The Web UI Audit screen surfaces it
-directly.)
+(`scan_verified = 1` is the GitHub PAT that came back live from
+`/user`. The middle row is regex-only — the AKIA had no paired
+secret-key in the prompt, so STS wasn't called and `scan_verified` is
+NULL. The CLI's `logs` command surfaces the detector name in its
+`reason` column today but not the verify column — query the SQLite
+file directly if you want both.)
+
+Trade-off worth knowing about: verification is a live call from the
+broker's egress IP using the leaked credential. GitHub's `/user`
+records on the key owner's audit log; Stripe `/v1/balance` counts
+against rate limits; AWS STS shows up in CloudTrail. Fail-closed by
+default, policy.json opt-out.
 
 Stack: Node + Fastify, SQLite (WAL), undici streaming with TTFT/TPOT
-telemetry, dual typecheck (strict TS), 630 tests. Master key in OS
-keychain. Web UI + TUI + CLI. Layer 2 verifier is ~150 LoC of
-home-rolled SigV4 — no AWS SDK dep.
+telemetry, dual typecheck (strict TS). Master key in OS keychain via
+keytar (with a 0600 file fallback for headless servers). Web UI + TUI
++ CLI. Layer 2 verifier is ~170 LoC of home-rolled SigV4 — no AWS SDK
+dep.
 
-Honest limits: pre-1.0, single-tenant, HS256-only, no rate limiter, no
-SOC2. Designed as an appliance, not a SaaS. If you want multi-tenant or
-enterprise auth this isn't ready.
+Honest limits: pre-1.0, single-tenant, HS256-only signing (same for
+the separate management JWT — leaking either secret = full
+compromise of that surface), no rate limiter, no transport auth on
+the broker itself (loopback-only by default), no SOC2. Designed as an
+appliance, not a SaaS. If you want multi-tenant or enterprise auth
+this isn't ready.
 
 MIT, single repo, no managed-service play: https://github.com/pmartin1915/keybroker
 

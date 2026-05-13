@@ -8,18 +8,22 @@ exists so the user can run it without re-deriving the rules.
 
 ## Pre-flight (10 min, before any posting)
 
-- [ ] Decide the snippet question raised in `hour-2-posts.md`: drop the
-      HN terminal snippet and lean on the Web UI screenshot only, OR
-      add a `--with-scan` flag to `logs` so the real terminal output
-      matches the post.
+- [x] Snippet decision (post-Cowork audit, 2026-05-13): HN draft now
+      uses an inline `sqlite3` query against the local store instead
+      of a CLI flag. No code change required pre-post.
 - [ ] Capture the Web UI Audit screenshot (verified=1 row on a real
       provider). Use a throwaway test account, not personal creds.
+- [ ] **After the screenshot:** revoke the throwaway PAT on the
+      upstream provider immediately. Scrub the screenshot for any
+      identifying strings (username, email, repo path, machine name,
+      token labels that name a real project). Crop tight.
 - [ ] Cross-check the post drafts against current `npm test` output
-      one more time. If anything has shipped since 2026-05-12 that
+      one more time. If anything has shipped since 2026-05-13 that
       changes the headline numbers (test count, layer count), update
       the drafts.
 - [ ] Confirm the GitHub repo is public, README is the un-staled
-      version (commit 68020f9), and the LICENSE file is MIT.
+      version (commit 68020f9 + 2026-05-13 audit corrections), and
+      the LICENSE file is MIT.
 
 ---
 
@@ -50,6 +54,15 @@ report, *fix it before Day 2*. Don't post the same flaw three times.
 Reply only to **operator-shaped** comments. The test: would a real
 deployer ask this?
 
+**What counts as an operator-shaped account** (calibration before
+the decision-threshold math kicks in): post history in
+self-hosted/devops/security/SRE spaces in the last 90 days, a real
+GitHub or domain link in profile, account age ≥7 days. Throwaway
+accounts and accounts whose entire post history is one subreddit's
+generic-tech discussion do not count, even if the question is
+shaped right. Apply the same test before counting a reply as
+deploy_intent.
+
 **REPLY to:**
 - Deployment questions ("does this run on k8s," "what about
   docker-compose," "how do you handle TLS")
@@ -75,6 +88,16 @@ deployer ask this?
 - Off-topic threads (someone hijacking for their own project)
 - Comments about pricing, business model, or "are you going to get
   acquired" — POSITIONING.md says this experiment is not testing those
+
+**Public security findings get a special protocol.** If a comment
+describes a real vulnerability (an actual exploit path, a missing
+mitigation, a CVE-shaped finding), do *not* debate it in public.
+Reply briefly: thank them, ask them to DM or file via the GitHub
+issue tracker as a security report, do not confirm or deny in the
+thread. Then file privately and patch on a normal cycle. Public
+back-and-forth on security findings is how 2026-style brand damage
+happens — see the LiteLLM CVE-2026-42208 thread for the negative
+example.
 
 **Reply shape:** ≤3 sentences. Answer the question, link to the
 specific file/doc if relevant, no marketing voice.
@@ -119,6 +142,19 @@ Translation of the POSITIONING.md table into a mechanical rule:
 | ≥3 | Worth a slice of attention. Start the 1-week sprint: RS256, basic auth on broker, one good Docker compose example. Reach out to deploy-intent commenters by DM, offer help, try to land 1 lighthouse user. |
 | 1–2 | Mixed signal. Park it. Repo stays public as portfolio + slow-burn OSS. Revisit after BoardBound has revenue. |
 | 0 | Wedge isn't pulling. Stop spending time on it. The build wasn't wasted — it's a serious portfolio piece. Commit the decision doc, archive the experiment branch if you made one, return to BoardBound. |
+
+**Footnote on the 0 row:** the metric is operator-shaped engagement,
+not vanity totals. 100 upvotes with only "cool project" comments
+counts as 0 in this framework. Upvote count *alone* never moves the
+needle — if it did, the experiment would be measuring "is the
+headline catchy," not "do operators want this."
+
+**How to log the decision.** Hour 3 ends with a commit to this repo:
+subject `validation: decision = <invest|park|shelve>`, body has the
++7d tally across the three venues (operator-shaped replies and
+deploy-intent counts per venue) and a one-paragraph rationale. Tag
+the commit `validation-2026-05` so future-you can find it. Update
+the MEMORY.md pointer to reflect the outcome.
 
 **Hard rule from POSITIONING.md (restated):** no decision to invest
 more time until the week of data is in. The temptation will be to start
