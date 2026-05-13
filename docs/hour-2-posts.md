@@ -70,9 +70,11 @@ Happy to answer deployment questions.
 LiteLLM users — heads up there's an OSS LLM-proxy alternative shipping
 verified secret detection in the free build. I've been watching the
 LiteLLM security incident pattern (March 2026 supply-chain compromise,
-CVE-2026-42208 pre-auth SQLi exploited within 36 hours, the guardrail
-logging leak) and decided to take a different approach: smaller surface,
-self-hosted appliance, one binary, loopback-only by default.
+CVE-2026-42208 pre-auth SQLi exploited within 36 hours and added to
+the CISA KEV catalog with federal-network remediation mandate by
+May 11, the guardrail logging leak) and decided to take a different
+approach: smaller surface, self-hosted appliance, one binary,
+loopback-only by default.
 
 What's in the free OSS build:
 
@@ -129,6 +131,16 @@ prompt instead of at scan time on a repo. The intersection of "LLM
 gateway" and "verified secret detection" is empty on the market as of
 May 2026 — TruffleHog verifies but isn't LLM-aware; LiteLLM is
 LLM-aware but its secret detection is regex-only and Enterprise-gated.
+
+Why verify-before-block hasn't existed at proxy time before: human-facing
+chat demands sub-second streaming, and a live HTTP call to the issuer
+blows the latency budget. Agentic workflows flip both sides of that.
+They tolerate per-call latency (an agent doing 30 tool calls doesn't
+notice an extra 200ms on the one with a credential in it), and they
+can't tolerate false-positive blocks — a regex hit that nukes a
+multi-step plan is worse than the leak. So the cost of verification
+finally makes sense if the request was going to a model that an agent
+is driving anyway.
 
 ```
 $ sqlite3 ~/.keybroker/keybroker.db <<'SQL'

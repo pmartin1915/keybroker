@@ -66,6 +66,24 @@ Cowork can search the repo. Point it at this prompt:
 
 ## Audit B — Gemini Deep Research (external claims, no files needed)
 
+**Status: complete, 2026-05-13.** Verdict: **wedge claim empirically
+validated.** Quote: "the intersection of 'self-hosted LLM gateway' and
+'verified secret detection' remains entirely empty, save for the
+specific architecture proposed by Keybroker." All three LiteLLM
+incidents confirmed with dates (March 18 telemetry leak, March 24
+PyPI supply-chain via TeamPCP / v1.82.7+v1.82.8, April 24
+CVE-2026-42208 SQLi + CISA KEV mandate by May 11 2026). Four new
+market entrants surveyed (Aegis, Bifrost, OpenClaw PRISM, Radware LLM
+Firewall) — none verify. New optional facts: Portkey acquired by Palo
+Alto Networks April 2026; Lakera acquired by Check Point late 2025.
+The "Operator's Dilemma" framing (verify-before-block trades latency
+for accuracy, agentic workflows make the trade favorable) was added
+to V3 in commit following this update; the CISA KEV detail was added
+to V2. Full report: `C:\Users\perry\Downloads\Keybroker Positioning
+Audit_ Secret Detection.md`.
+
+The original prompt is retained below for reference:
+
 This one verifies claims about the *outside world* that POSITIONING.md
 makes. Self-contained prompt — no repo access needed:
 
