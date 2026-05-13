@@ -114,7 +114,9 @@ Tokens are HS256 JWTs (`jose`). The broker verifies the signature, then re-check
 
 ## Control plane
 
-Phase 4.0 (in progress) replaces the original `Prototype.html` with a bundled Vite + React 18 app under `web/`, served by the broker at `/ui`. The first commit ships the Dashboard wired to real `/health` and `/metrics/spend` data; Tokens / Audit / Forecast / Policy / Shadow AI screens land in follow-up commits.
+The broker ships with two operator surfaces:
+
+**Web UI** — a bundled Vite + React 18 app under `web/`, served at `/ui`. All six screens are live: Dashboard, Tokens, Audit, Forecast, Policy, Shadow AI. Read-only screens are open on loopback; write actions (issue / revoke / rotate / bulk-revoke) require a one-time management JWT (`brkm_…` prefix, separate signing secret, sessionStorage-only, two-step reveal).
 
 ```sh
 # from the repo root
@@ -132,7 +134,12 @@ npm run serve         # terminal 1: broker on :7843
 npm run web:dev       # terminal 2: Vite dev server proxies /health, /metrics, /forecast to the broker
 ```
 
-The original synthetic prototype is still in `Prototype.html` for reference; it will be deleted when Phase 4.0 reaches feature parity.
+**TUI** — an Ink-based terminal UI under `tui/`, for operators who live in `tmux`. Same six screens; same loopback-only trust posture; same one-time management JWT prompt for write actions. Hotkey vocabulary: lowercase = read (filter / search), uppercase = destructive (Revoke / Rotate). `f` cycles filter pills, `/` enters search, `r` refreshes.
+
+```sh
+npm --prefix tui install
+npm --prefix tui run dev      # broker must be running on :7843
+```
 
 ## Adding a provider
 
@@ -154,20 +161,21 @@ Then `keybroker secret add <name>` and `keybroker token issue --provider <name>`
 
 ## What this is **not**
 
-This is a **prototype** that demonstrates the developer experience. It is **not** production-ready. Specifically:
+This is a **pre-1.0 single-tenant appliance** that demonstrates the developer experience. It is **not** SaaS-ready. Specifically:
 
-- **Master key in plaintext on disk** at `~/.keybroker/config.json`. A real product would use OS keychain (macOS Keychain / Windows DPAPI / `libsecret`) or a KMS. (Phase 1.3)
-- **No authentication on the broker itself.** Anyone who can hit the loopback port can call `secret add` via the CLI (because it reads the same config file). Bind only to `127.0.0.1` (the default), or put the broker behind mTLS.
-- **No streaming proxy.** Responses are buffered in memory before being returned. Streaming completions, file uploads, and large payloads will not work well. (Phase 1.1 — not yet started)
-- **HS256 JWTs.** Symmetric — the same secret signs and verifies. Real deployments should use RS256/EdDSA so verifier-only services can't forge tokens. (Phase 4)
-- **No per-second rate limiting.** `--max-calls` is a lifetime counter, not a rate limit. No burst protection. (Phase 4)
-- **Single tenant.** No orgs, no users, no RBAC. (Phase 4)
+- **No SSO / RBAC / multi-tenancy.** Single operator. No orgs, no users, no role separation beyond the read/write split provided by the management JWT.
+- **HS256 JWTs only.** Symmetric — the same secret signs and verifies. Real deployments wanting verifier-only services should wait for RS256/EdDSA.
+- **No per-second rate limiting.** `--max-calls` is a lifetime counter, not a rate limit. No burst protection.
+- **No SOC2 / audit certification.** The audit log is local SQLite; export is JSONL. There's no compliance attestation.
+- **Live secret verification has operator-visible side effects.** Layer 2 verify makes real API calls from the broker's IP using the leaked credential — this creates a record on the upstream provider's side (GitHub audit log, Stripe API logs, AWS CloudTrail). Read the Layer 2 row above before enabling.
 
-If you ship this to production as-is, you will have a bad time.
+If you ship this to a multi-team production environment as-is, you will have a bad time. If you run it as a single-operator appliance on `127.0.0.1` in front of a developer fleet, it does what it says.
 
 **What is already solid:**
+- 630 tests, dual typecheck (root + `web/` + `tui/`), GitHub Actions CI on Node 22 / Ubuntu + Windows
+- Master key in OS keychain (Wincred / macOS Keychain / `libsecret`) with a file-backed fallback for headless server contexts (Phase 1.3 ✅)
 - SQLite backend with atomic transactions (Phase 1.2 ✅)
-- 236 tests, typecheck clean, GitHub Actions CI on Node 22 / Ubuntu + Windows (Phase 1.4 ✅)
+- Streaming proxy with per-call TTFT + TPOT latency telemetry (Phase 3.7 ✅)
 - Per-token model allowlists with glob matching (Phase 2.1 ✅)
 - Dollar spend caps with pre-flight estimates and post-call reconciliation (Phase 2.2 ✅)
 - Per-machine token attribution and bulk revoke-by-machine (Phase 2.3 ✅)
@@ -176,6 +184,9 @@ If you ship this to production as-is, you will have a bad time.
 - Token tag attribution end-to-end (team / project / env) (Phase 3.3 ✅)
 - Tag-bucketed spend aggregation (`/metrics/spend`, `keybroker metrics spend`) (Phase 3.4 ✅)
 - Linear-regression burn forecast (`/forecast/tokens`, `/forecast/tags`, `keybroker forecast`) (Phase 3.5 ✅)
+- Egress secret scanner with decoder layer (base64 / URL-encode / JSON-string-unescape) and Layer 2 live verification for `github_pat`, `stripe_live_key`, and AWS access-key/secret-key pairs via SigV4-signed STS — 120 tests across the scanner / decode / verify / sigv4 modules (Phases 3.6, 4.2a, 4.2b, 4.2c ✅)
+- Bundled Vite + React web UI at `/ui` and an Ink TUI under `tui/`, both with one-time management-JWT prompts for write actions (Phases 4.0, 4.1 ✅)
+- SQLite `admin_audit` table recording issue / revoke / rotate / bulk-revoke events with summary `params_json` (no secret-bearing bytes) (Phase 4.0 c4e ✅)
 
 ## Roadmap
 
