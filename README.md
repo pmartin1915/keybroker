@@ -81,6 +81,12 @@ curl -X POST http://127.0.0.1:8787/echo/v1/anything \
 
 The echo upstream's response will show you exactly what the broker forwarded, including the swapped `Authorization: Bearer fake` header.
 
+## Deploying as a daemon
+
+The Quickstart runs the broker through `npx tsx` for fast iteration. For a real install on a Linux host, [`examples/systemd/keybroker.service`](./examples/systemd/keybroker.service) is a paste-and-go unit file with a dedicated `keybroker` system user and the usual hardening flags (`PrivateTmp`, `ProtectSystem=strict`, `NoNewPrivileges`). The file header lists the `useradd` / `install` / `systemctl enable` sequence end-to-end. Run `npm run build` first so `dist/cli.js` exists for the unit's `ExecStart` to point at.
+
+The broker binds `127.0.0.1` by design — if you need remote access, put something authenticated in front of it rather than rebinding. [`examples/nginx-front.conf`](./examples/nginx-front.conf) is the smallest thing that works: TLS termination plus your choice of HTTP basic auth (small team behind WireGuard) or mTLS client certs (per-developer, revocable). The brk_ token enforcement still happens inside the broker; the nginx layer is what protects the `/admin/*` management surface and the `/ui` bundle, which don't require a brk_ token to reach.
+
 ## What's enforced per token
 
 | Constraint        | How                                                                |
