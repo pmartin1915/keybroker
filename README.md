@@ -2,6 +2,10 @@
 
 > Replace shared API keys with short-lived, scoped, attributable tokens — without changing your application code.
 
+Plus an inline **verified secret scanner** on every outbound prompt: regex-detects API keys (`ghp_`, `sk_live_`, AWS, Slack) leaking out in chat content, then calls the real upstream provider to confirm the credential is actually live before blocking — so a `scan_verified=1` row in your audit log means a real active leak, not a regex false-positive. The intersection of "self-hosted LLM proxy" and "verified secret detection" is empty on the market today; keybroker is the smallest thing that fills it.
+
+One static binary, SQLite-backed, runs on `127.0.0.1` in front of a developer fleet. Pre-1.0, single-tenant — see [What this is **not**](#what-this-is-not) before you ship it anywhere.
+
 ## The problem
 
 Your team has an OpenAI API key. It lives in a `.env` file, in CI, on three laptops, and at least one ex-employee's machine. You can't tell who made which call. You can't easily revoke it without breaking everyone. You can't say "this contractor can only call `chat/completions`, max 100 times, for the next hour."

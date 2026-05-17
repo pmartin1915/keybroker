@@ -1,0 +1,67 @@
+# /etc/systemd/system/keybroker.service
+#
+# Run keybroker as a long-lived system daemon. Designed for a single
+# operator running on a private host (homelab box, EC2 t4g.nano, etc.).
+# Loopback-only by default; front with nginx + TLS + auth if you need
+# remote access (see examples/nginx-front.conf).
+#
+# Install:
+#   sudo useradd --system --create-home --home-dir /var/lib/keybroker keybroker
+#   sudo install -m 755 -o root -g root \
+#       /path/to/keybroker/dist/cli.js /opt/keybroker/cli.js
+#   sudo cp examples/systemd/keybroker.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo -u keybroker -- node /opt/keybroker/cli.js init   # one-time
+#   sudo -u keybroker -- env KEYBROKER_SECRET='sk-...' \
+#       node /opt/keybroker/cli.js secret add openai
+#   sudo systemctl enable --now keybroker.service
+#
+# Health check:
+#   curl http://127.0.0.1:7843/health
+#
+# Logs:
+#   journalctl -u keybroker -f
+#   sudo -u keybroker -- node /opt/keybroker/cli.js logs -n 20
+
+[Unit]
+Description=keybroker — local LLM key broker and egress scanner
+Documentation=https://github.com/pmartin1915/keybroker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=keybroker
+Group=keybroker
+WorkingDirectory=/var/lib/keybroker
+Environment=NODE_ENV=production
+# Override the listen port / store location here if you don't want defaults.
+# Environment=KEYBROKER_PORT=7843
+# Environment=KEYBROKER_HOME=/var/lib/keybroker/.keybroker
+ExecStart=/usr/bin/node /opt/keybroker/cli.js serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+
+# Hardening — adjust to taste. These are conservative defaults for a
+# single-tenant appliance; loosen if you bind-mount a different store path.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/keybroker
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# Network: needs egress to upstream providers (api.openai.com etc.) +
+# bind on loopback. Don't add IPAddressDeny=any without explicit allow
+# rules — you'll black-hole the proxy.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
