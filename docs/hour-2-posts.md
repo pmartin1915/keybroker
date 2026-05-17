@@ -9,8 +9,8 @@ three audiences. Headline pattern: *result + mechanism + honest scope*.
       `verified=1` next to a real provider name (GitHub / Stripe / AWS). The
       CLI's `logs` command doesn't render the verified column by default, so
       the UI is the cleanest source. (Alternative: a SQLite `SELECT
-      ts, scan_blocked, scan_verified, scan_detector FROM calls WHERE
-      scan_verified = 1 LIMIT 5;` against `~/.keybroker/keybroker.db`.)
+      ts, reason, scan_verified FROM calls WHERE scan_verified = 1 LIMIT 5;`
+      against `~/.keybroker/store.db`.)
 - [ ] Stage the snippet for the HN post: a 4–6 line terminal block. Real, not
       faked. Use a throwaway PAT against a test account.
 - [ ] Post one venue per day across three days. Cross-posting in the same
@@ -51,9 +51,10 @@ False positives stay `verified=null` and don't pollute the alert stream.
 
 Pre-1.0, single-tenant, HS256 only, no rate limiter, no SOC2. Built as an
 appliance for one team / one homelab, not a SaaS. Master key lives in your OS
-keychain via keytar (Wincred / macOS Keychain / libsecret); headless Linux
-servers without a session bus fall back to a 0600 file at
-`$KEYBROKER_KEYCHAIN_PATH`. 630 tests, 120 covering the scan+verify layers.
+keychain via keytar (Wincred / macOS Keychain / libsecret) by default; set
+`$KEYBROKER_KEYCHAIN_PATH` to opt into a 0600 JSON file instead, which is
+the right shape for headless Linux servers without a session-bus libsecret.
+630 tests, 120 covering the scan+verify layers.
 
 Repo (MIT): https://github.com/pmartin1915/keybroker
 
@@ -143,14 +144,14 @@ finally makes sense if the request was going to a model that an agent
 is driving anyway.
 
 ```
-$ sqlite3 ~/.keybroker/keybroker.db <<'SQL'
-SELECT ts, scan_detector, scan_verified, provider, path
+$ sqlite3 ~/.keybroker/store.db <<'SQL'
+SELECT ts, reason, scan_verified, provider, path
 FROM calls
-WHERE scan_blocked = 1
+WHERE outcome = 'egress_blocked'
 ORDER BY ts DESC LIMIT 5;
 SQL
 2026-05-12T18:42:11Z|github_pat|1|openai|/v1/chat/completions
-2026-05-12T18:41:42Z|aws_key||anthropic|/v1/messages
+2026-05-12T18:41:42Z|aws_access_key||anthropic|/v1/messages
 2026-05-12T18:33:07Z|stripe_live_key|1|openai|/v1/chat/completions
 ```
 
@@ -169,9 +170,10 @@ default, policy.json opt-out.
 
 Stack: Node + Fastify, SQLite (WAL), undici streaming with TTFT/TPOT
 telemetry, dual typecheck (strict TS). Master key in OS keychain via
-keytar (with a 0600 file fallback for headless servers). Web UI + TUI
-+ CLI. Layer 2 verifier is ~170 LoC of home-rolled SigV4 — no AWS SDK
-dep.
+keytar; opt into a 0600 file-backed keychain by setting
+`KEYBROKER_KEYCHAIN_PATH` (right shape for headless servers). Web UI
++ TUI + CLI. Layer 2 verifier is ~170 LoC of home-rolled SigV4 — no
+AWS SDK dep.
 
 Honest limits: pre-1.0, single-tenant, HS256-only signing (same for
 the separate management JWT — leaking either secret = full
