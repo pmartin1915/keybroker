@@ -26,15 +26,25 @@ leak from a regex false-positive in your audit log."*
 
 ## Pre-recording setup (outside the cast)
 
+**CRITICAL — isolate the demo from your real broker.** Without
+`KEYBROKER_HOME` AND `KEYBROKER_KEYCHAIN_PATH` set, `init` writes the
+master key to your OS keychain under the global service name
+`"keybroker"` — overwriting your real broker's master key and
+permanently breaking decryption of any upstream secrets you'd already
+stored. The two env vars together pin the demo to a tmp dir for
+both SQLite/config and the keychain.
+
 ```sh
-# Clean slate so the recording doesn't fight stale state.
-rm -rf ~/.keybroker/
+# Isolated demo home — your real ~/.keybroker is untouched.
+export KEYBROKER_HOME=/tmp/keybroker-demo
+export KEYBROKER_KEYCHAIN_PATH=/tmp/keybroker-demo/keychain.json
+export KEYBROKER_PORT=7843   # the default; set explicitly so it's visible in the recording
+
+# Wipe just the demo dir (NOT ~/.keybroker — that's your real one).
+rm -rf "$KEYBROKER_HOME"
 cd /path/to/keybroker
 npm install >/dev/null
 npm run build >/dev/null
-
-# Pick a port that isn't already taken if you've been hacking.
-export KEYBROKER_PORT=7843
 
 # Pre-create a fake-but-syntactically-valid ghp_ string. GitHub PATs
 # are ghp_ + 36 base62 chars. This one is fake; substitute any random
@@ -44,6 +54,12 @@ export FAKE_LEAKED_PAT='ghp_0000000000000000000000000000000000aa'
 # Start asciinema with a sensible idle limit so the cast is tight.
 asciinema rec --idle-time-limit 2 --title "keybroker verified scanner demo" demo.cast
 ```
+
+The recording itself doesn't show the env-var exports (they're pre-set
+in the parent shell that launches `asciinema rec`). If you want them
+on-screen for transparency, move them inside the cast — but keep the
+`KEYBROKER_HOME` / `KEYBROKER_KEYCHAIN_PATH` lines, not just the
+`rm -rf`.
 
 ## The script (~60s, one terminal)
 
@@ -120,7 +136,9 @@ npx tsx src/cli.ts logs -n 3
 # scan_verified isn't surfaced in the default logs format — go to the
 # audit table for the verification result. 0 = detected but inactive,
 # 1 = detected and live, NULL = detected but not eligible for verify.
-sqlite3 ~/.keybroker/store.db \
+# (Path uses $KEYBROKER_HOME from the pre-setup; defaults to
+# ~/.keybroker/store.db when KEYBROKER_HOME is unset.)
+sqlite3 "$KEYBROKER_HOME/store.db" \
   "SELECT ts, outcome, reason, scan_verified FROM calls ORDER BY ts DESC LIMIT 3;"
 ```
 
@@ -134,6 +152,15 @@ echo "→ open http://127.0.0.1:7843/ui/  (Audit tab)"
 ## Post-recording
 
 ```sh
+# Stop the broker (it's running in the background from the cast).
+# Find the PID by port and kill it:
+kill $(lsof -t -i:7843) 2>/dev/null || true
+
+# Tear down the isolated demo state — your real ~/.keybroker is
+# untouched.
+rm -rf "$KEYBROKER_HOME"
+unset KEYBROKER_HOME KEYBROKER_KEYCHAIN_PATH KEYBROKER_PORT FAKE_LEAKED_PAT
+
 # Upload to asciinema.org or self-host (it's just JSON):
 asciinema upload demo.cast
 
