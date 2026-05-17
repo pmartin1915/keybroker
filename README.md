@@ -22,7 +22,7 @@ export OPENAI_API_KEY=sk-real-secret-shared-by-everyone
 
 # after
 export OPENAI_API_KEY=brk_eyJhbGciOi...   # short-lived, scoped, attributable
-export OPENAI_BASE_URL=http://127.0.0.1:8787/openai
+export OPENAI_BASE_URL=http://127.0.0.1:7843/openai
 ```
 
 The broker validates the token, decrements its quota, swaps the header for the real upstream key, forwards the request, logs the call, and returns the response. The application code doesn't know it's there.
@@ -52,11 +52,11 @@ npx tsx src/cli.ts token issue \
 
 # 4. start the proxy
 npx tsx src/cli.ts serve
-# keybroker listening on http://127.0.0.1:8787
+# keybroker listening on http://127.0.0.1:7843
 
 # 5. point your app at it
 export OPENAI_API_KEY=brk_eyJ...
-export OPENAI_BASE_URL=http://127.0.0.1:8787/openai
+export OPENAI_BASE_URL=http://127.0.0.1:7843/openai
 # ... your existing code works unchanged
 
 # 6. see who called what
@@ -74,7 +74,7 @@ node examples/echo-upstream.mjs &           # listen on :9999
 KEYBROKER_SECRET='fake' npx tsx src/cli.ts secret add echo
 TOKEN=$(npx tsx src/cli.ts token issue --provider echo --scope '*' --max-calls 5 --ttl 600 --label demo 2>/dev/null)
 npx tsx src/cli.ts serve &
-curl -X POST http://127.0.0.1:8787/echo/v1/anything \
+curl -X POST http://127.0.0.1:7843/echo/v1/anything \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"hello":"world"}'
 ```

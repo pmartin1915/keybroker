@@ -122,12 +122,12 @@ program
       await kc.set(KC_MGMT_SECRET, mgmtSecret);
       writeFileSync(
         configPath,
-        JSON.stringify({ port: 8787, host: "127.0.0.1" }, null, 2),
+        JSON.stringify({ port: 7843, host: "127.0.0.1" }, null, 2),
         { mode: 0o600 },
       );
       console.log(`initialized: ${configPath}`);
       console.log(`data dir:    ${dir}`);
-      console.log(`port:        8787 (override with KEYBROKER_PORT)`);
+      console.log(`port:        7843 (override with KEYBROKER_PORT)`);
       console.log(
         `secrets:     stored in OS keychain under service "keybroker" (accounts: ${KC_MASTER_KEY}, ${KC_JWT_SECRET}, ${KC_MGMT_SECRET}).`,
       );
@@ -160,7 +160,7 @@ async function initMigrateKeys(): Promise<void> {
   await kc.set(KC_JWT_SECRET, raw.jwtSecret);
   // Strip the secrets from disk; preserve port/host.
   const stripped = JSON.stringify(
-    { port: raw.port ?? 8787, host: raw.host ?? "127.0.0.1" },
+    { port: raw.port ?? 7843, host: raw.host ?? "127.0.0.1" },
     null,
     2,
   );

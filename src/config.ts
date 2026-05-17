@@ -126,7 +126,7 @@ export async function loadConfig(
     logsPath: join(dir, "calls.log.jsonl"),
     configPath,
     policyPath: join(dir, "policy.json"),
-    port: raw.port ?? Number(process.env.KEYBROKER_PORT ?? 8787),
+    port: raw.port ?? Number(process.env.KEYBROKER_PORT ?? 7843),
     host: raw.host ?? process.env.KEYBROKER_HOST ?? "127.0.0.1",
     masterKeyHex,
     jwtSecret,
