@@ -5,23 +5,59 @@
 # Loopback-only by default; front with nginx + TLS + auth if you need
 # remote access (see examples/nginx-front.conf).
 #
-# Install:
+# Prerequisites (Debian/Ubuntu — adjust package names for other distros):
+#   sudo apt-get update
+#   sudo apt-get install -y nodejs npm libsecret-1-dev
+# `libsecret-1-dev` is required even if you plan to use the file-backed
+# keychain (KEYBROKER_KEYCHAIN_PATH). keytar dlopens libsecret at module
+# import time, so a missing library crashes the broker at startup before
+# the backend selection runs. Node 20+ is required (see package.json
+# engines field).
+#
+# Install — build on the target host. keytar ships a native binding that
+# must match the target's arch + libc; copying node_modules from a
+# Windows/macOS dev machine will not work.
+#
 #   sudo useradd --system --create-home --home-dir /var/lib/keybroker keybroker
-#   sudo install -m 755 -o root -g root \
-#       /path/to/keybroker/dist/cli.js /opt/keybroker/cli.js
+#   git clone https://github.com/pmartin1915/keybroker.git /tmp/keybroker-build
+#   cd /tmp/keybroker-build
+#   npm ci
+#   npm run build
+#   sudo mkdir -p /opt/keybroker
+#   sudo cp -r dist node_modules package.json /opt/keybroker/
+#   sudo chown -R root:root /opt/keybroker
 #   sudo cp examples/systemd/keybroker.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
-#   sudo -u keybroker -- node /opt/keybroker/cli.js init   # one-time
+#   sudo -u keybroker -- node /opt/keybroker/dist/cli.js init      # one-time
 #   sudo -u keybroker -- env KEYBROKER_SECRET='sk-...' \
-#       node /opt/keybroker/cli.js secret add openai
+#       node /opt/keybroker/dist/cli.js secret add openai
 #   sudo systemctl enable --now keybroker.service
+#
+# Why all three of dist/, node_modules/, package.json: the build is
+# transpile-only (not bundled, see scripts/build.mjs), so dist/cli.js
+# resolves ./config.js etc. from its sibling files and third-party deps
+# from node_modules/. package.json's `"type": "module"` tells Node to
+# treat the .js files as ESM rather than CommonJS.
 #
 # Health check:
 #   curl http://127.0.0.1:7843/health
 #
 # Logs:
 #   journalctl -u keybroker -f
-#   sudo -u keybroker -- node /opt/keybroker/cli.js logs -n 20
+#   sudo -u keybroker -- node /opt/keybroker/dist/cli.js logs -n 20
+#
+# This unit's shape has been reviewed but not yet booted on a real Linux
+# host. Run `systemd-analyze verify keybroker.service` before enabling.
+# Known-likely first-boot issues to expect:
+#   - `MemoryDenyWriteExecute=true` (below) conflicts with V8's JIT. If
+#     Node fails at startup with an allocation error, either drop the
+#     flag or add `--jitless` to ExecStart (the latter costs noticeable
+#     throughput; for a single-operator broker it's usually acceptable).
+#   - keytar's native binding path differs slightly across glibc /
+#     musl-based distros; on Alpine you'll need `libsecret` rather than
+#     `libsecret-1-dev` and likely a `apk add build-base python3` for
+#     the npm rebuild.
+# File issues at https://github.com/pmartin1915/keybroker/issues.
 
 [Unit]
 Description=keybroker — local LLM key broker and egress scanner
@@ -38,7 +74,7 @@ Environment=NODE_ENV=production
 # Override the listen port / store location here if you don't want defaults.
 # Environment=KEYBROKER_PORT=7843
 # Environment=KEYBROKER_HOME=/var/lib/keybroker/.keybroker
-ExecStart=/usr/bin/node /opt/keybroker/cli.js serve
+ExecStart=/usr/bin/node /opt/keybroker/dist/cli.js serve
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=15s
