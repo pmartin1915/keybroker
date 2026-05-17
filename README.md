@@ -113,7 +113,7 @@ The broker binds `127.0.0.1` by design — if you need remote access, put someth
 ```
 your app  ──Authorization: Bearer brk_xxx──►  keybroker  ──Authorization: Bearer sk-real──►  OpenAI
                                                   │
-                                                  ├─ store: ~/.keybroker/store.sqlite
+                                                  ├─ store: ~/.keybroker/store.db
                                                   │   secrets: AES-256-GCM @ master key
                                                   │   tokens: scopes, quota, spend, expiry, revoked-flag, machine, tags
                                                   │
