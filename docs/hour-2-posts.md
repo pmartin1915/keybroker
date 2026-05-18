@@ -5,6 +5,11 @@ three audiences. Headline pattern: *result + mechanism + honest scope*.
 
 ## Before posting checklist
 
+- [x] Asciinema cast recorded and uploaded (2026-05-18):
+      https://asciinema.org/a/xGIIqfLVngSKHt8e — shows the
+      `scan_verified=0` case (detected + verified-inactive) with a
+      syntactically-valid-but-inactive fake PAT. The screenshot item
+      below still needs capturing for the `verified=1` headline shot.
 - [ ] Capture one screenshot of the **Web UI Audit screen** showing a row with
       `verified=1` next to a real provider name (GitHub / Stripe / AWS). The
       CLI's `logs` command doesn't render the verified column by default, so
@@ -48,6 +53,11 @@ is **active**, then writes `verified=1` to the audit row before blocking.
 False positives stay `verified=null` and don't pollute the alert stream.
 
 [screenshot: Web UI Audit screen — verified=1 row on a GitHub PAT]
+
+60-second cast of the same flow (init → token → leaked-PAT prompt → 403 +
+audit row): https://asciinema.org/a/xGIIqfLVngSKHt8e. The cast uses an
+inactive fake PAT so the audit row shows `scan_verified=0`; a real leak
+would show `=1`, which is what the screenshot above will show.
 
 Pre-1.0, single-tenant, HS256 only, no rate limiter, no SOC2. Built as an
 appliance for one team / one homelab, not a SaaS. Master key lives in your OS
@@ -109,6 +119,11 @@ If you just want regex-only scanning, LiteLLM Enterprise covers it. If
 you want verified scanning in OSS, this is the only thing I'm aware of
 that ships it.
 
+60-second cast of the scan + Layer 2 verify pipeline against a fake
+GitHub PAT (returns `scan_verified=0` because the PAT is inactive on
+purpose; a live leak would return `=1`):
+https://asciinema.org/a/xGIIqfLVngSKHt8e
+
 Repo (MIT): https://github.com/pmartin1915/keybroker
 
 ---
@@ -161,6 +176,10 @@ secret-key in the prompt, so STS wasn't called and `scan_verified` is
 NULL. The CLI's `logs` command surfaces the detector name in its
 `reason` column today but not the verify column — query the SQLite
 file directly if you want both.)
+
+60-second asciinema cast of the same flow (with a syntactically valid
+but inactive fake PAT, so the audit row shows `scan_verified=0`
+instead of `=1`): https://asciinema.org/a/xGIIqfLVngSKHt8e
 
 Trade-off worth knowing about: verification is a live call from the
 broker's egress IP using the leaked credential. GitHub's `/user`

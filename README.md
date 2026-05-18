@@ -27,6 +27,12 @@ export OPENAI_BASE_URL=http://127.0.0.1:7843/openai
 
 The broker validates the token, decrements its quota, swaps the header for the real upstream key, forwards the request, logs the call, and returns the response. The application code doesn't know it's there.
 
+## Demo
+
+[![asciicast](https://asciinema.org/a/xGIIqfLVngSKHt8e.svg)](https://asciinema.org/a/xGIIqfLVngSKHt8e)
+
+60-second cast: `init` → store an upstream secret → issue a scoped `brk_` token → start the proxy → POST a request whose body contains a leaked `ghp_…` PAT → broker returns 403 `egress_blocked` with detector `github_pat`, and the audit row records `scan_verified=0`. The fake PAT in the cast is syntactically valid but inactive on purpose; a real leaked-and-live PAT would show `scan_verified=1` — that's the row that separates an active leak from a regex false-positive in your audit log.
+
 ## Quickstart
 
 ```sh
