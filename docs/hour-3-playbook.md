@@ -41,6 +41,11 @@ finish on the highest-stakes one):**
 | 2 (next day) | r/devops | 9–11am | SRE-shaped audience reads at the start of their workday |
 | 3 (next day) | Show HN | 6–8am | HN front page churn is highest US-morning when EU is wrapping; a post that gets <3 upvotes in 30 min is effectively dead, so timing matters most here |
 
+**Hard rule:** if Day 1 cannot start before Wednesday, defer the
+whole run to the following Monday. A Wed start lands Day 3 on Friday,
+which is historically a weaker Show HN day, and the +24h window then
+overlaps the weekend when the operator-shaped audience is offline.
+
 **Hard rule:** if Day 1 surfaces a factual error or a critical bug
 report, *fix it before Day 2*. Don't post the same flaw three times.
 
@@ -122,8 +127,9 @@ specific file/doc if relevant, no marketing voice.
 
 ## What to track during the 7-day window
 
-Keep this section in a private note (not committed). At +24h and +7d
-per post, log:
+Keep this section in `docs/.tracking.local.md` — that path is in
+`.gitignore` so `git add docs/` cannot leak the tally. At +24h and
++7d per post, log:
 
 ```
 venue: r/selfhosted
