@@ -1,16 +1,204 @@
 # Roadmap
 
-The current state (v0.1) is a working prototype that demos the developer
-experience. Everything below is what it would take to turn this into
-something a real fleet — specifically `claude-budget-dispatcher` — can rely
-on.
-
-Phases are ordered by what unblocks what. Do not skip ahead. Each phase has
-a concrete "done when…" so you know when to move on instead of polishing.
+> **Current cadence (May 2026):** the project is in a deliberate feature
+> freeze pending the outcome of the validation experiment defined in
+> `docs/POSITIONING.md`. Pro-tier work (RS256, broker authentication,
+> Docker Compose, rate limiting) is blocked until the +7d post-experiment
+> decision lands. The "Where we are" section below supersedes the
+> phased v0.1 plan reproduced under "Implementation history."
 
 ---
 
-## Phase 1 — Production minimums
+## Where we are — 2026-05-21
+
+### Shipped through Phase 4.x
+
+Everything below is in `main` and verified by `npm test` (630 / 630):
+
+- **Phase 1** — production minimums: streaming proxy, SQLite store, master
+  key in OS keychain via keytar (file-backed fallback for headless), CI
+  on Node 22 / Ubuntu + Windows.
+- **Phase 2** — Money Rule features: per-token model allowlists with glob
+  matching, dollar spend caps with pre-flight + post-call reconciliation,
+  per-machine attribution, fleet policy with hot reload.
+- **Phase 3** — dispatcher integration primitives: machine identity
+  normalization (`normalizeMachine`), broker routing in `provider.mjs`,
+  tag-bucketed spend aggregation, linear-regression burn forecast,
+  scanner with decoder layer (base64 / URL / JSON-string-unescape) and
+  Layer 2 verification for `github_pat`, `stripe_live_key`, and AWS
+  access-key pairs (home-rolled SigV4 STS), per-call TTFT + TPOT latency
+  telemetry, rotate-with-TTL.
+- **Phase 4.0** — bundled Vite + React web UI at `/ui` with one-time
+  management-JWT prompts for write actions and an `admin_audit` log.
+- **Phase 4.1** — Ink TUI under `tui/` with fleet-write screens (issue,
+  rotate, bulk revoke) and read-only screens (forecast, policy,
+  shadow AI).
+- **Phase 4.2** — Layer 2 verify shipped (a/b/c): decode-then-scan,
+  `github_pat` + `stripe_live_key` upstream calls, AWS STS verifier with
+  home-rolled SigV4 (~150 LoC, no `@aws-sdk` dependency).
+
+Operator-onramp polish (May 14–17, post-Phase-4.2c): default port unified
+on 7843, asciinema cast isolated via `KEYBROKER_HOME` +
+`KEYBROKER_KEYCHAIN_PATH`, README architecture diagram corrected
+(`store.db` not `store.sqlite`), `SECURITY.md` added, gitleaks audit
+clean, `examples/systemd` and `examples/nginx-front` shipped, README
+"Deploying as a daemon" section added.
+
+### The validation experiment (in flight)
+
+Hours 1 and 2 of the 3-hour experiment defined in `docs/POSITIONING.md`
+(factual README cleanup + three post drafts at `docs/hour-2-posts.md`)
+are **audit-complete** across three independent reviews:
+
+- **Cowork** (Claude, file-grounded factual): corrections applied in
+  `290bc1a`. Two minor playbook polish items (`5(f)` tracking-template
+  location, `5(g)` Wed-or-later defer-to-Monday) closed 2026-05-21.
+- **Gemini Deep Research** (external market): corrections applied in
+  `6d352e9`. Verdict: the intersection of "self-hosted LLM gateway" and
+  "verified secret detection" is empirically empty as of May 2026.
+- **PAL adversarial-commenter** (gemini-2.5-flash via `mcp__pal__chat`):
+  identified HS256 takedown as the highest-likelihood hostile critique.
+  Pre-emptive fixes rejected; canned reply pre-staged in `8a92650`.
+
+Hour 3 (operator-led posting + +7d observation) is **live**:
+
+| Date | Event | +7d decision window closes |
+|---|---|---|
+| 2026-05-18 Mon | r/selfhosted megathread + r/devops weekly self-promo thread | 2026-05-25 |
+| 2026-05-19 Tue | Show HN (Variant 3 of `docs/hour-2-posts.md`) | 2026-05-26 |
+| **on or after 2026-05-26** | **Decision commit due, tagged `validation-2026-05`** | — |
+
+The Reddit pivot to megathreads (not top-level posts) was forced by
+subreddit age rules — r/selfhosted requires 3-month-old repos for new-
+project submissions, r/devops routes all self-promotion to a weekly
+thread. Show HN is the only true standalone venue; decision criteria
+should weight Show HN signal heavier than megathread-comment signal even
+though the playbook's "≥3 sum across all three" rule wasn't formally
+updated for the pivot.
+
+The decision rule (sum of `operator_shaped_replies + deploy_intent` across
+all three venues, per `docs/hour-3-playbook.md` §"Decision framework"):
+
+| Sum | Decision |
+|---|---|
+| **≥3** | **Invest** — 1-week sprint, scope below |
+| **1–2** | **Park** — repo public as portfolio + slow-burn OSS |
+| **0** | **Shelve** — codebase stays as portfolio artifact |
+
+"Operator-shaped" is defined precisely in `docs/hour-3-playbook.md`
+§"What counts as an operator-shaped account" — post history in
+self-hosted / devops / security / SRE spaces in the last 90 days, real
+GitHub or domain link in profile, account age ≥7 days. Generic "cool
+project" comments do not count, even at high upvote volume.
+
+### Operator-only follow-ups currently open
+
+None block the decision commit, but flagged across prior handoffs:
+
+- **`systemd-analyze verify examples/systemd/keybroker.service`** on a
+  Linux host. Unit shape looks correct (Type/User/Group/ExecStart/
+  hardening flags) but hasn't been booted.
+- **Add `libsecret-1-dev` to systemd unit install header.** On a fresh
+  Ubuntu install, following the unit's install instructions verbatim
+  produces a broker that fails at start — `src/keychain.ts:1` dlopens
+  libsecret at module-init time even when `KEYBROKER_KEYCHAIN_PATH` is
+  set. See trap memory `keytar_libsecret_load`.
+- **Web UI `scan_verified=1` screenshot.** Complementary to the
+  asciinema cast (https://asciinema.org/a/xGIIqfLVngSKHt8e), not a
+  substitute. The cast shows `scan_verified=0` against an inactive
+  `ghp_`; the screenshot should show a `verified=1` row from a
+  throwaway account, with the PAT revoked + identifying strings
+  scrubbed per `docs/hour-3-playbook.md` pre-flight.
+- **Dispatcher → keybroker dogfooding flip.** Sequence: start broker
+  daemon → confirm `/health` returns 200 → add `keybroker:
+  {enabled: true, ...}` block to dispatcher `local.json` (not
+  `budget.json`; see trap memory `dispatcher_broker_routing_setup`).
+
+### If the decision is "invest" — 1-week sprint scope
+
+Bounded scope from `docs/POSITIONING.md`. One week of evening effort.
+No scope creep mid-sprint.
+
+1. **RS256 signing for management JWTs.** Asymmetric signing so a
+   verifier-only service can validate tokens without holding the signing
+   key. Default stays HS256 for the single-box appliance shape; RS256
+   opt-in via `--signing-algo rs256`. Closes the most likely hostile
+   critique per PAL audit ("HS256-only is fundamentally insecure for a
+   security tool"). The canned single-tenant defense at
+   `docs/hour-3-playbook.md` §"Expected high-likelihood takedown" still
+   stands for default deployments; RS256 removes the architectural
+   blocker for multi-broker fleets.
+2. **Broker basic auth.** `--admin-user` / `--admin-pass` pair so the
+   broker can bind beyond `127.0.0.1` without leaving `/admin/*`
+   unauthenticated. Loopback default unchanged; basic auth is opt-in
+   for LAN deployments.
+3. **One good `examples/docker-compose.yml`.** Broker container,
+   mounted volume for `~/.keybroker`, env-var keychain config,
+   healthcheck endpoint. Companion `docs/docker.md` walkthrough.
+   Lifts the "where's the Dockerfile" objection the hour-2 posts
+   pre-emptively concede.
+4. **Lighthouse user outreach.** DM operator-shaped commenters from the
+   validation experiment. Offer help. Target: one team running
+   keybroker for real, willing to be quoted in README.
+
+After the sprint: one lighthouse lands → 12-month side-income shape per
+`POSITIONING.md` §"If the answer is yes." Nothing lands → quietly park.
+
+### If the decision is "park"
+
+- One-line README update noting the experiment ran and the outcome.
+- No scheduled feature work; issues/PRs handled best-effort.
+- Memory `project_validation_experiment_state` updated with outcome.
+- Revisit after BoardBound (the operator's primary project) hits its
+  next monetization milestone.
+
+### If the decision is "shelve"
+
+- Same as park, plus optionally `gh repo archive`.
+- Codebase remains a portfolio artifact — Layer 2 verify + scanner +
+  web UI + TUI + FinOps with forecasting is real systems work and
+  a senior security / platform engineering hiring signal on its own.
+
+### Anti-roadmap (current)
+
+This supersedes the historical anti-roadmap at the bottom of the file
+(which is preserved verbatim under "Implementation history").
+
+- **No pre-emptive Pro-tier work.** The hard rule from POSITIONING.md.
+  The temptation to "start building so we're ready if invest hits" is
+  the exact failure mode the freeze exists to prevent.
+- **No headline or draft rewrites mid-experiment.** Even if early signal
+  is weak. The experiment is testing a held-steady message across three
+  venues; rewriting on the fly destroys the signal it's trying to
+  measure.
+- **No multi-tenant / orgs / RBAC / SSO.** One operator's fleet.
+- **No JIT elevation via Slack, no GHA OIDC, no Datadog/S3 audit
+  shipping.** All anti-roadmap from v0.1 still applies.
+- **No new handoff files for trivial follow-ups.** Roll micro-fixes
+  into commit bodies. A handoff is appropriate when there's a distinct
+  artifact set and a known unfinished item that needs operator
+  presence.
+
+---
+
+## Implementation history
+
+The phased plan below was written for v0.1 before any of Phases 1–4
+shipped. It is preserved as the original implementation roadmap; the
+"Where we are" section above is the authoritative current statement of
+direction. Phase ✅ markers indicate what landed; the "Phase 4 —
+Hardening" block here is *not* the same as the Phase 4.0 / 4.1 / 4.2
+that actually shipped (web UI + TUI + Layer 2 verify) — those original
+"Phase 4 — Hardening" items overlap heavily with the invest-path
+1-week sprint scope above.
+
+Phases were originally ordered by what unblocks what. Each had a
+concrete "done when…" so the author would know when to move on instead
+of polishing.
+
+---
+
+## Phase 1 — Production minimums  ✅ shipped
 
 **Goal:** make the broker safe to leave running, without changing what it
 does. None of these are new features; they're the table stakes the
@@ -77,7 +265,7 @@ green. After this point you can use it personally without flinching.
 
 ---
 
-## Phase 2 — The Money Rule features
+## Phase 2 — The Money Rule features  ✅ shipped
 
 **Goal:** make the broker enforce the rules `~/.claude/CLAUDE.md` already
 says you live by. This is what justifies the dispatcher integration: the
@@ -177,7 +365,7 @@ worth folding into the dispatcher.
 
 ---
 
-## Phase 3 — Fold into `claude-budget-dispatcher`
+## Phase 3 — Fold into `claude-budget-dispatcher`  ✅ primitives shipped (dogfooding flip pending — operator-only)
 
 **Goal:** `claude-budget-dispatcher` stops handling raw provider keys.
 Every outbound call goes through keybroker. The Money Rule is enforced
@@ -252,7 +440,13 @@ fleet did today.
 
 ---
 
-## Phase 4 — Hardening (post-integration)
+## Phase 4 — Hardening (post-integration)  ⏸ deferred — overlaps invest-path 1-week sprint scope above
+
+> **Note:** the "Phase 4.x" that actually shipped (4.0 web UI / 4.1 TUI /
+> 4.2 Layer 2 verify) is a different, later-numbered phase that the v0.1
+> plan didn't anticipate. The items below remain as written from the
+> v0.1 plan; RS256, rate limits, and streaming spend kill are now
+> rolled into the invest-path sprint scope under "Where we are" above.
 
 Only worth doing once the dispatcher is on the broker and you've felt the
 rough edges in production. Don't pre-build these.
@@ -275,7 +469,7 @@ rough edges in production. Don't pre-build these.
 
 ---
 
-## Phase 5 — Distribution
+## Phase 5 — Distribution  ⏸ deferred — only if lighthouse user lands post-invest
 
 Only relevant if you ever decide to publish this for other people. None of
 this is needed for personal-fleet use.
