@@ -146,18 +146,67 @@ After the sprint: one lighthouse lands → 12-month side-income shape per
 
 ### If the decision is "park"
 
-- One-line README update noting the experiment ran and the outcome.
-- No scheduled feature work; issues/PRs handled best-effort.
-- Memory `project_validation_experiment_state` updated with outcome.
-- Revisit after BoardBound (the operator's primary project) hits its
-  next monetization milestone.
+Park means the commercial bet didn't land but the code stays alive
+as a personal tool + portfolio artifact. Mechanical post-decision
+actions, all bounded:
+
+- **README banner.** Add a `> **Project status (May 2026):**
+  validation experiment closed; project is in maintenance mode +
+  personal-tool use. Issues and PRs handled best-effort.` line
+  directly under the H1.
+- **Dispatcher dogfooding flip.** Wire `claude-budget-dispatcher` to
+  route through the broker per trap memory
+  `dispatcher_broker_routing_setup`. Start daemon, confirm `/health`,
+  add the `keybroker` block to dispatcher `local.json`. ~30 min of
+  work. Converts the project from "demo" to "thing I actually use
+  every day on my own fleet" — which is both the most honest pitch
+  and a real test of whether any of the lurking bugs matter.
+- **One technical blog post.** Pick *one* of: (1) "Home-rolling SigV4
+  STS in ~150 LoC instead of pulling in @aws-sdk," (2) "Decode-then-
+  scan: why Layer 1 secret detection is trivially bypassed by base64,"
+  (3) "Fleet ops in a terminal: building an Ink TUI for an LLM
+  proxy." Reuse the existing asciinema cast
+  (https://asciinema.org/a/xGIIqfLVngSKHt8e) where it fits. One post,
+  one weekend, not three.
+- **Memory update.** `project_validation_experiment_state` rewritten
+  to reflect outcome; the freeze-watch role of that memory ends.
+- **Revisit trigger.** Either BoardBound (operator's primary project)
+  hits its next monetization milestone, *or* an unsolicited operator
+  raises a real deployment question on the repo (issue / discussion /
+  email). Whichever comes first. If neither has happened by
+  2026-11-30, transition to shelve.
 
 ### If the decision is "shelve"
 
-- Same as park, plus optionally `gh repo archive`.
-- Codebase remains a portfolio artifact — Layer 2 verify + scanner +
-  web UI + TUI + FinOps with forecasting is real systems work and
-  a senior security / platform engineering hiring signal on its own.
+Shelve means even the personal-tool premise didn't hold up — the
+project is closed out as a portfolio artifact, no future investment
+planned. Mechanical actions:
+
+- **README banner.** Stronger version of the park banner:
+  `> **Project status (May 2026):** validation experiment closed;
+  this repository is archived as a portfolio artifact. Not under
+  active development. The code works as documented for the operator's
+  own use.`
+- **One technical blog post anyway.** Same scope as park — pick one
+  of the three topics above. The post is durable output regardless
+  of project status, and the writing solidifies the systems work for
+  the operator's own portfolio.
+- **Defer `gh repo archive` by 30 days.** Archive locks the repo
+  read-only, which kills drive-by issue / PR / star activity. Wait
+  through one cycle of post-shelve discoverability before locking.
+  Set a calendar reminder for 2026-06-25 (or T+30 from the actual
+  shelve commit date) to revisit the archive decision.
+- **No dispatcher dogfooding flip.** Skipping the wire-up is the
+  honest reflection of "this project is done"; running unrelated
+  side software on the BoardBound fleet adds operational risk for no
+  matching upside.
+- **Memory cleanup.** `project_validation_experiment_state` rewritten
+  to reflect shelve outcome; Phase-4.x decision memories
+  (`decision_phase_4_*`) retained as historical context but their
+  freeze-watch role ends. Codebase keeps the portfolio value of Layer
+  2 verify + scanner + web UI + TUI + FinOps forecasting + home-rolled
+  SigV4 — all real systems work, all reviewable evidence of senior
+  security / platform engineering capability.
 
 ### Anti-roadmap (current)
 
