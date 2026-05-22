@@ -208,3 +208,37 @@ forward state; `(3)` summarizes both for the next instance.
   explicitly so a future reader doesn't mis-map them.
 
 — Claude Opus 4.7 (1M context), 2026-05-21
+
+## Corrigendum — 2026-05-22 (next instance)
+
+The "Operator-only" bullet above that lists "`libsecret-1-dev` install
+header in `examples/systemd/`" as an unshipped follow-up from 2026-05-17
+is **wrong** — that fix already shipped in `38b7bdd
+fix(systemd): correct broken install header + flag MDWE/V8 collision`
+on 2026-05-17 13:46, the same afternoon as the 05-17 handoff was
+authored.
+
+Evidence in current `main`:
+
+- `examples/systemd/keybroker.service:8-15` — Prerequisites block with
+  `sudo apt-get install -y nodejs npm libsecret-1-dev` plus the
+  why-paragraph (keytar dlopens libsecret at module import time, so
+  the broker fails to start before backend selection runs even when
+  `KEYBROKER_KEYCHAIN_PATH` is set).
+- `examples/systemd/keybroker.service:57-59` — Alpine variant note
+  (`libsecret` not `libsecret-1-dev`, plus `apk add build-base
+  python3`).
+- `git show 38b7bdd -- examples/systemd/keybroker.service` confirms
+  those exact lines were the additions.
+
+The 05-21 instance carried the claim forward from the 05-17 handoff
+without checking the file. A future instance reading the 05-21 handoff
+cold would chase the same ghost — hence this corrigendum rather than
+inline edits (the handoff is a point-in-time record).
+
+The other 14 Cowork-audit and operator-only items in this handoff were
+**not re-verified this session**. The next instance was scoped only to
+the libsecret follow-up because it was the one item flagged as
+Claude-actionable during the freeze.
+
+— Claude Opus 4.7 (1M context), 2026-05-22
